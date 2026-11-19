@@ -66,6 +66,20 @@ Bot ek saath **3 tokens tak** hold kar sakta hai (`MAX_POSITIONS`), har ek mein 
 
 **Gas ka asar ($50 pe):** backtest aur bot dono abhi ki gas price use karte hain. Gas ~1 gwei ho to ek $20 trade ka round trip ~$1.2 (~6%) padta hai, jo 3% cost limit se zyada hai, isliye bot trade nahi karta (backtest bhi 0 trades dikhata hai). Gas 0.2–0.4 gwei ho tab trades hote hain. Zyada capital ho to gas ka hissa chhota ho jata hai.
 
+## MEV arbitrage (flash swaps + Flashbots bundles)
+Trading ke saath bot har block (12 sec) ek MEV arbitrage scanner bhi chalata hai:
+- Jin tokens ke 2 ya zyada WETH pools hain (Uniswap v3 ke fee tiers, Uniswap v2, SushiSwap), un sabki price ek hi RPC call mein padhi jaati hai.
+- Agar ek token ek pool mein sasta aur doosre mein mehenga hai (dono pool fees ke baad bhi), to math se best size nikalta hai, phir asli contract ko `eth_call` mein chala ke exact profit check karta hai.
+- **Armed** ho to private **Flashbots bundle** bhejta hai: sasta khareedo, mehenga becho, ek hi transaction mein. Ye flash swap hai, yaani apna capital nahi lagta (USDC use nahi hota). Profit ETH mein wallet mein aata hai.
+- Bundle sirf tab land hota hai jab wo abhi bhi profitable ho. Warna builder use chhod deta hai aur kuch nahi katta. Contract (`contracts/FlashArb.sol`) bhi revert kar deta hai agar profit gas + builder tip cover na kare.
+- **Sirf arbitrage.** Bot kabhi kisi ka front-run ya sandwich nahi karta.
+
+Shuru mein ye **paper mode** mein hai: scan aur simulate karta hai, bhejta kuch nahi. Dashboard pe **"Arm MEV"** dabao, `MEV` type karo. Pehli baar bot ka apna contract deploy hota hai (ek baar, ~$1–3 gas). Wallet ka main **Disarm** button MEV ko bhi band karta hai.
+
+**Sach:** MEV duniya ki sabse competitive cheez hai. Professional searchers ke paas apne nodes aur builders ke saath setup hota hai, wo gaps milliseconds mein le jaate hain. Ghar ke Mac se jeet kam milegi, shayad bilkul nahi. Dashboard dikhata hai kitne blocks scan hue, is ghante sabse bada price gap kitna tha, kitne simulate hue aur kitne profitable the.
+
+Settings: `MEV=off` (scanner band), `MEV_BUILDER_TIP_PCT=0.5` (after-gas profit ka kitna hissa builder ko bid), `MEV_MIN_NET_USD=0.05`, `MEV_MIN_POOL_WETH=2`, `MEV_BUILDERS=...`. Contract badlo to `npm run build:contract` (solc 0.8.26 chahiye).
+
 ## Commands
 ```bash
 npm run service:status      # chal raha hai ya nahi
@@ -75,6 +89,7 @@ npm run service:uninstall   # bot band karke LaunchAgent hatao
 npm run scan                # token universe + safety checks dobara chalao (read-only)
 npm run backtest            # strategy ko history pe chalao
 npm run fork-test           # live path ka test, mainnet fork pe nakli paise se
+npm run mev-fork-test       # MEV arbitrage ka test: fork pe price gap banao, bot pakadta hai ya nahi
 ```
 
 ## GitHub (private repo)
@@ -96,6 +111,7 @@ git add -A && git commit -m "kya badla" && git push
   - `MAX_ROUNDTRIP_TAX_PCT` (default 0.02)
   - `LONGTAIL_MAX_ALLOC_PCT` (default 0.5)
 - **Gas:** `GAS_TOPUP` (`on`/`off`), `GAS_TOPUP_BELOW_ETH`, `GAS_TOPUP_USD`, `GAS_TOPUP_MAX_PER_DAY`
+- **MEV:** `MEV` (`on`/`off`), `MEV_BUILDER_TIP_PCT`, `MEV_MIN_NET_USD`, `MEV_MIN_POOL_WETH`, `MEV_MAX_SIMS_PER_BLOCK`, `MEV_BUILDERS`
 - **Baaki:** `LOOP_SECONDS`, `PAPER_START_USD`, `HISTORY_DAYS`
 
 Galat value hogi to bot start hi nahi hoga (safety ke liye). Koi bhi setting badalne ke baad `npm run service:restart` chalao.
@@ -117,6 +133,8 @@ Galat value hogi to bot start hi nahi hoga (safety ke liye). Koi bhi setting bad
 | `src/tokens.ts` | token lists se candidates |
 | `src/safety.ts` | honeypot / hidden-tax simulation |
 | `src/market.ts` | pool discovery, prices, history |
-| `src/executor.ts` | paper aur live swaps, gas top-up |
+| `src/executor.ts` | paper aur live swaps, gas top-up, contract deploy, MEV ke saath nonce gate |
+| `src/mev/` | MEV arbitrage: pools dhundhna (`pools.ts`), har block scan + simulate (`searcher.ts`), Flashbots bundles (`bundles.ts`) |
+| `contracts/FlashArb.sol` | flash-swap arbitrage contract (sirf owner chala sakta hai, kuch hold nahi karta) |
 | `src/server.ts` + `public/` | localhost dashboard |
 | `data/` | state, trades, logs, price history, token universe |

@@ -7,6 +7,8 @@ RPC_URL="$(grep -E '^RPC_URL=' .env | head -1 | cut -d= -f2-)"
 ANVIL="${ANVIL:-$(command -v anvil || echo "$HOME/.foundry/bin/anvil")}"
 TMP="$(mktemp -d)"
 PORT=8546
+TEST="${1:-cli-forktest}"
+case "$TEST" in cli-forktest|cli-mev-forktest) ;; *) echo "unknown test $TEST"; exit 1;; esac
 ANVIL_PID=""
 # (the temp dir only holds a throwaway fork-only key and test state; macOS cleans its temp folder)
 cleanup() { [ -n "$ANVIL_PID" ] && kill "$ANVIL_PID" 2>/dev/null || true; }
@@ -27,4 +29,4 @@ chmod 600 "$TMP/test.key"
 
 RPC_URL=http://127.0.0.1:$PORT SEND_RPC_URL=http://127.0.0.1:$PORT FORK_MODE=1 \
 WALLET_KEY_FILE="$TMP/test.key" DATA_DIR="$TMP/data" LOOP_SECONDS=5 \
-  node dist/cli-forktest.js
+  node "${DIST:-dist}/${TEST}.js"

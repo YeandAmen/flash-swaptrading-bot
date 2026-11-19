@@ -179,6 +179,29 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     <div class="note">Like intelligent-trading-bot: 21 engineered features per token-hour → logistic-regression model predicting “+1R before −1R within 48h”, re-trained every 3 days on past data only and tested on data it never saw. AUC 0.50 = coin flip. In <b>auto</b> mode the AI only drives buys if it beats the rules out of sample; otherwise the rules stay in charge. Re-trains every 6 hours.</div>
   </section>
 
+  <section class="card">
+    <h2>MEV arbitrage · flash swaps + Flashbots bundles <span id="mevMode"></span></h2>
+    <div class="sub" id="mevStatus" style="margin:-4px 0 10px">Starting…</div>
+    <div class="stats">
+      <div class="stat"><div class="l">Blocks scanned</div><div class="v" id="mevBlocks">–</div></div>
+      <div class="stat"><div class="l" title="The most profitable arbitrage found this hour (exact on-chain simulation, before gas), next to the gas it would cost">Best chance this hour</div><div class="v" id="mevGap">–</div></div>
+      <div class="stat"><div class="l">Simulated / profitable</div><div class="v" id="mevSims">–</div></div>
+      <div class="stat"><div class="l">Bundles sent / landed</div><div class="v" id="mevBundles">–</div></div>
+      <div class="stat"><div class="l">MEV profit (after gas)</div><div class="v" id="mevProfit">–</div></div>
+      <div class="stat"><div class="l">RPC calls used</div><div class="v" id="mevRpc">–</div></div>
+    </div>
+    <div class="scroll" style="margin-top:12px"><table>
+      <thead><tr><th>Time</th><th>Token</th><th>Buy on → sell on</th><th class="r">Size</th><th class="r">Gross</th><th class="r">Gas</th><th class="r">Net (ETH)</th><th>Result</th></tr></thead>
+      <tbody id="mevBody"></tbody>
+    </table></div>
+    <div class="row">
+      <button id="mevArmBtn" class="primary">Arm MEV (live bundles)</button>
+      <button id="mevDisarmBtn" class="danger" hidden>Disarm MEV</button>
+      <span class="sub" id="mevDeploy" style="align-self:center"></span>
+    </div>
+    <div class="note">Every block (12 s) the bot reads all watched pools in one call and looks for one token priced differently in two pools (Uniswap v3 fee tiers, Uniswap v2, SushiSwap). It checks the exact profit with an on-chain simulation and, when armed, sends a private Flashbots bundle: buy in the cheap pool and sell in the dear one in a single flash-swap transaction (no capital needed, profit arrives as ETH). A bundle lands only if it still pays after gas, otherwise it costs nothing. Pure arbitrage: it never front-runs or sandwiches other traders. Realistically, professional searchers take most gaps within milliseconds, so wins from a home Mac are rare.</div>
+  </section>
+
   <section class="grid2">
     <div class="card">
       <h2>Trades <span class="tabs"><button data-tab="live" class="on">Live</button><button data-tab="paper">Paper</button></span></h2>
@@ -244,6 +267,23 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
   <div class="row" style="justify-content:flex-end">
     <button id="armCancel" class="ghost">Cancel</button>
     <button id="armConfirm" class="primary" disabled>Arm live trading</button>
+  </div>
+</dialog>
+
+<dialog id="mevDlg">
+  <h3>Arm MEV arbitrage?</h3>
+  <ul>
+    <li id="mevDlgDeploy">First, one transaction deploys the bot's own arbitrage contract (owner = the bot wallet).</li>
+    <li>Then, whenever a price gap still pays after gas, the bot sends a private Flashbots bundle. It uses a flash swap, so <b>your USDC is not used</b>; profits arrive as <b>ETH</b> in the bot wallet.</li>
+    <li>A bundle that is no longer profitable is simply not included, and <b>costs nothing</b>. The contract reverts any trade that wouldn't cover its gas and the builder's tip.</li>
+    <li>Half of each after-gas profit is bid to the block builder (MEV_BUILDER_TIP_PCT in .env).</li>
+    <li>Expect few or no wins: professional searchers with faster infrastructure take most gaps first.</li>
+  </ul>
+  <label class="sub">Type <b>MEV</b> to confirm</label>
+  <input id="mevInput" autocomplete="off" spellcheck="false">
+  <div class="row" style="justify-content:flex-end">
+    <button id="mevCancel" class="ghost">Cancel</button>
+    <button id="mevConfirm" class="primary" disabled>Arm MEV</button>
   </div>
 </dialog>
 

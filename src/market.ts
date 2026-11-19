@@ -87,10 +87,10 @@ async function runPool<T, R>(items: T[], n: number, fn: (x: T) => Promise<R>): P
   return out;
 }
 
-type McResult = { status: 'success' | 'failure'; result?: unknown };
+export type McResult = { status: 'success' | 'failure'; result?: unknown };
 
 /** Thousands of reads: fixed-size chunks (one eth_call each), few at a time, each chunk retried — stays under RPC rate limits. */
-async function bigMulticall(contracts: any[], chunk = 400, concurrency = 3): Promise<McResult[]> {
+export async function bigMulticall(contracts: any[], chunk = 400, concurrency = 3): Promise<McResult[]> {
   const parts: any[][] = [];
   for (let i = 0; i < contracts.length; i += chunk) parts.push(contracts.slice(i, i + chunk));
   const results = await runPool(parts, concurrency, async (part) => {

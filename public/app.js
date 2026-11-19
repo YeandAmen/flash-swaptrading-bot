@@ -185,8 +185,42 @@ function render() {
     $('mlFeat').textContent = (M.importance || []).map((f) => `${f.name} ${f.weight >= 0 ? '+' : ''}${f.weight.toFixed(2)}`).join(' · ');
   }
 
+  // MEV arbitrage
+  const X = S.mev;
+  if (X) {
+    const tag = { live: 'buy', paper: 'flat', deploying: 'sell', arming: 'sell', off: 'flat' }[X.mode] || 'flat';
+    $('mevMode').innerHTML = `<span class="tag ${tag}">${esc(String(X.mode).toUpperCase())}</span>`;
+    const venues = Object.entries(X.venues || {}).map(([k, v]) => `${v} ${k}`).join(', ');
+    const lb = X.lastBlock;
+    $('mevStatus').textContent = `${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
+      (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + (X.lastError ? ` · last error: ${X.lastError}` : '');
+    const st = X.stats;
+    $('mevBlocks').textContent = st.blocks.toLocaleString();
+    const B = X.bestThisHour;
+    const bestVal = !B ? '–' : B.grossUsd != null
+      ? `<span class="${B.grossUsd > B.gasUsd ? 'pos' : ''}">${usd(B.grossUsd)}</span> <span class="sub">vs ${usd(B.gasUsd)} gas</span>`
+      : `${B.grossEth.toFixed(5)} <span class="sub">vs ${B.gasEth.toFixed(5)} ETH gas</span>`;
+    $('mevGap').innerHTML = bestVal + (B ? `<div class="sub">${esc(B.symbol || '')} · ${B.exact ? 'exact simulation' : 'estimate'}</div>` : '');
+    $('mevSims').textContent = `${st.simulated} / ${st.profitable}`;
+    $('mevBundles').textContent = `${st.bundles} / ${st.landed}`;
+    $('mevProfit').innerHTML = `<span class="${cls(st.netEth)}">${st.netEth.toFixed(5)} ETH</span> <span class="sub">${usd(st.netUsd)}</span>`;
+    $('mevRpc').textContent = st.rpcCalls.toLocaleString();
+    const rTag = { landed: 'buy', 'would send': 'buy', sent: 'sell', failed: 'down' };
+    $('mevBody').innerHTML = (X.recent || []).length ? X.recent.map((o) => `<tr><td>${hm(o.t)}</td><td><b>${esc(o.symbol)}</b></td>
+      <td class="why">${esc(o.buy)} → ${esc(o.sell)}</td><td class="r">${o.sizeEth.toFixed(3)}</td><td class="r">${o.grossEth.toFixed(5)}</td>
+      <td class="r">${o.gasEth.toFixed(5)}</td><td class="r ${cls(o.netEth)}">${o.netEth.toFixed(5)}</td>
+      <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
+      <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}</td></tr>`).join('')
+      : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
+    $('mevArmBtn').hidden = X.armed || X.mode === 'off';
+    $('mevDisarmBtn').hidden = !X.armed;
+    $('mevDeploy').textContent = X.contract
+      ? `contract ${X.contract.slice(0, 8)}…${X.contract.slice(-4)}`
+      : X.deployEstimateUsd != null ? `arming deploys the contract once (~${usd(X.deployEstimateUsd)} gas)` : '';
+  }
+
   // log
-  $('log').innerHTML = (S.events || []).map((e) => `<div><span class="t">${hm(e.t)}</span><span class="${e.level}">${esc(e.msg)}</span></div>`).join('');
+  $('log').innerHTML =(S.events || []).map((e) => `<div><span class="t">${hm(e.t)}</span><span class="${e.level}">${esc(e.msg)}</span></div>`).join('');
 
   // controls
   $('pauseBtn').textContent = S.entriesPaused ? 'Resume new entries' : 'Pause new entries';
@@ -234,7 +268,25 @@ $('armConfirm').onclick = async () => {
   if (typed !== 'LIVE') return;
   try { await api('/api/arm', { confirm: typed }); dlg.close(); refresh(); } catch (e) { alert(e.message); }
 };
-$('disarmBtn').onclick = async () => { if (confirm('Disarm live trading? Open positions are kept.')) { await api('/api/disarm'); refresh(); } };
+$('disarmBtn').onclick = async () => { if (confirm('Disarm live trading? Open positions are kept. MEV bundles stop too.')) { await api('/api/disarm'); refresh(); } };
+const mevDlg = $('mevDlg');
+$('mevArmBtn').onclick = () => {
+  const X = S?.mev;
+  $('mevDlgDeploy').innerHTML = X?.contract
+    ? 'The arbitrage contract is already deployed (owner = the bot wallet): no extra cost.'
+    : `First, one transaction deploys the bot's own arbitrage contract (owner = the bot wallet): about <b>${X?.deployEstimateUsd != null ? usd(X.deployEstimateUsd) : 'a few dollars'}</b> of ETH gas, once.`;
+  $('mevInput').value = '';
+  $('mevConfirm').disabled = true;
+  mevDlg.showModal();
+};
+$('mevInput').oninput = () => ($('mevConfirm').disabled = $('mevInput').value.trim() !== 'MEV');
+$('mevCancel').onclick = () => mevDlg.close();
+$('mevConfirm').onclick = async () => {
+  const typed = $('mevInput').value.trim();
+  if (typed !== 'MEV') return;
+  try { await api('/api/mev/arm', { confirm: typed }); mevDlg.close(); refresh(); } catch (e) { alert(e.message); }
+};
+$('mevDisarmBtn').onclick = async () => { if (confirm('Disarm MEV? Scanning continues in paper mode.')) { await api('/api/mev/disarm'); refresh(); } };
 $('pauseBtn').onclick = async () => { await api('/api/pause', { paused: !S.entriesPaused }); refresh(); };
 $('resumeLiveBtn').onclick = async () => { await api('/api/resume', { kind: 'live' }); refresh(); };
 $('resumePaperBtn').onclick = async () => { await api('/api/resume', { kind: 'paper' }); refresh(); };

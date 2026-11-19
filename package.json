@@ -15,7 +15,10 @@
     "service:uninstall": "bash scripts/service.sh uninstall",
     "service:status": "bash scripts/service.sh status",
     "service:restart": "bash scripts/service.sh restart",
-    "service:logs": "bash scripts/service.sh logs"
+    "service:logs": "bash scripts/service.sh logs",
+    "mev-fork-test": "bash scripts/fork-test.sh cli-mev-forktest",
+    "build:contract": "node scripts/build-contract.mjs",
+    "mev:scan": "node dist/cli-mev-scan.js"
   },
   "dependencies": {
     "express": "^4.22.3",

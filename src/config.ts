@@ -165,6 +165,23 @@ export const RISK = {
   gasUnits: { approve: 60_000, swap1Hop: 150_000, swap2Hop: 230_000 },
 };
 
+/**
+ * MEV arbitrage searcher: watches every token that has 2+ WETH pools (Uniswap v3 fee tiers, Uniswap v2, SushiSwap),
+ * and when the same token is cheaper in one pool than another, buys in the cheap pool and sells in the dear one in a
+ * single flash-swap transaction (no capital needed), sent privately as a Flashbots bundle: it only lands if it is
+ * profitable, otherwise it costs nothing. Arbitrage only: it never front-runs or sandwiches anyone.
+ * Scanning is always on (paper mode); real bundles need "Arm MEV" in the dashboard.
+ */
+export const MEV = {
+  enabled: str('MEV', 'on') !== 'off',
+  minPoolWeth: num('MEV_MIN_POOL_WETH', 2), // ignore pools holding less WETH than this
+  builderTipPct: num('MEV_BUILDER_TIP_PCT', 0.5), // share of the after-gas profit paid to the block builder
+  minNetUsd: num('MEV_MIN_NET_USD', 0.05), // smallest after-gas, after-tip profit worth a bundle
+  maxSimsPerBlock: num('MEV_MAX_SIMS_PER_BLOCK', 3),
+  builders: str('MEV_BUILDERS', 'https://relay.flashbots.net,https://rpc.titanbuilder.xyz,https://rpc.beaverbuild.org,https://rsync-builder.xyz')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+};
+
 // --- validate settings at startup (a typo here must stop the bot, not silently disable a safety limit)
 function check(ok: boolean, msg: string) {
   if (!ok) throw new Error(`Invalid setting in .env: ${msg}`);
@@ -199,3 +216,8 @@ frac('LONGTAIL_MAX_ALLOC_PCT', TOKENS.maxAllocPct, true);
 check(GAS_TOPUP.belowEth > 0 && GAS_TOPUP.belowEth < 1, 'GAS_TOPUP_BELOW_ETH must be between 0 and 1 ETH');
 check(GAS_TOPUP.usd >= 1 && GAS_TOPUP.usd <= 100, 'GAS_TOPUP_USD must be 1..100');
 check(Number.isInteger(GAS_TOPUP.maxPerDay) && GAS_TOPUP.maxPerDay >= 1 && GAS_TOPUP.maxPerDay <= 24, 'GAS_TOPUP_MAX_PER_DAY must be 1..24');
+check(MEV.minPoolWeth >= 0.1, 'MEV_MIN_POOL_WETH must be >= 0.1');
+frac('MEV_BUILDER_TIP_PCT', MEV.builderTipPct);
+check(MEV.minNetUsd >= 0.01, 'MEV_MIN_NET_USD must be >= 0.01');
+check(Number.isInteger(MEV.maxSimsPerBlock) && MEV.maxSimsPerBlock >= 1 && MEV.maxSimsPerBlock <= 10, 'MEV_MAX_SIMS_PER_BLOCK must be 1..10');
+check(MEV.builders.every((u) => /^https:\/\//.test(u)), 'MEV_BUILDERS must be https URLs separated by commas');

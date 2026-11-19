@@ -103,10 +103,61 @@ export function fillFromReceipt(receipt: TransactionReceipt, tokenIn: Address, t
 export class LiveExecutor implements Executor {
   kind = 'live' as const;
   private nextNonce = 0;
+  // Nonce gate shared with the MEV searcher: a Flashbots bundle signed with our next nonce may land until
+  // `bundleUntil`, so normal transactions wait for it; and no bundle is signed while a normal one is pending.
+  private bundleUntil = 0;
+  private txActive = 0;
+  private txWaiting = 0;
   constructor(private account: PrivateKeyAccount) {}
 
   get address(): Address {
     return this.account.address;
+  }
+
+  /** Runs one wallet operation (approve + swap, top-up, deploy) without overlapping a pending MEV bundle. */
+  private async exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    this.txWaiting++;
+    try {
+      while (Date.now() < this.bundleUntil) await sleep(CONFIG.forkMode ? 50 : 500);
+    } finally {
+      this.txWaiting--;
+    }
+    this.txActive++; // no await between the wait above and this line: the MEV searcher can't slip in
+    try {
+      return await fn();
+    } finally {
+      this.txActive--;
+    }
+  }
+
+  /** MEV: block normal transactions until `untilMs` so a bundle can use our next nonce. False if one is in progress. */
+  reserveForBundle(untilMs: number): boolean {
+    if (this.txActive > 0 || this.txWaiting > 0) return false;
+    this.bundleUntil = Math.max(this.bundleUntil, untilMs);
+    return true;
+  }
+
+  releaseBundle() {
+    this.bundleUntil = 0;
+  }
+
+  /** Next nonce for a bundle (a lagging RPC node may not know our last mined transaction yet). */
+  async bundleNonce(): Promise<number> {
+    const chainNonce = await publicClient.getTransactionCount({ address: this.account.address, blockTag: 'latest' });
+    return Math.max(chainNonce, this.nextNonce);
+  }
+
+  noteNonceUsed(nonce: number) {
+    this.nextNonce = Math.max(this.nextNonce, nonce + 1);
+  }
+
+  /** Deploys a contract from the bot wallet (privately, like every transaction). */
+  async deployContract(bytecode: Hex, log: (m: string) => void, onSigned?: (hash: Hex) => void): Promise<{ address: Address; hash: Hex; gasWei: bigint }> {
+    return this.exclusive(async () => {
+      const { hash, receipt } = await this.sendTx(null, bytecode, 'deploy', log, onSigned);
+      if (!receipt.contractAddress) throw new Error(`deploy ${hash} mined but created no contract`);
+      return { address: receipt.contractAddress, hash, gasWei: receipt.gasUsed * receipt.effectiveGasPrice };
+    });
   }
 
   /** Approve the router for exactly `amount` (resetting a partial allowance first). Returns gas spent in wei. */
@@ -137,6 +188,10 @@ export class LiveExecutor implements Executor {
    * Returns USDC spent and ETH received (read from the WETH Withdrawal event).
    */
   async topUpGas(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void) {
+    return this.exclusive(() => this.topUpGasNow(usdcIn, path, slippageBps, ethUsd, onSigned, log));
+  }
+
+  private async topUpGasNow(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void) {
     const owner = this.account.address;
     const hashes: Hex[] = [];
     let gasWei = await this.ensureAllowance(ADDR.usdc, usdcIn, hashes, log);
@@ -158,6 +213,10 @@ export class LiveExecutor implements Executor {
   }
 
   async swap(r: SwapRequest, log: (m: string) => void): Promise<Fill> {
+    return this.exclusive(() => this.swapNow(r, log));
+  }
+
+  private async swapNow(r: SwapRequest, log: (m: string) => void): Promise<Fill> {
     const owner = this.account.address;
     const hashes: Hex[] = [];
     let gasWei = await this.ensureAllowance(r.tokenIn, r.amountIn, hashes, log);
@@ -180,7 +239,8 @@ export class LiveExecutor implements Executor {
     return { amountIn: f.amountIn, amountOut: f.amountOut, gasUsd: (Number(gasWei) / 1e18) * r.ethUsd, txHashes: hashes, blockNumber: receipt.blockNumber };
   }
 
-  private async sendTx(to: Address, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex) => void) {
+  /** `to: null` deploys a contract (`data` = creation code). */
+  private async sendTx(to: Address | null, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex) => void) {
     const from = this.account.address;
     const [chainNonce, block, maxPriorityFeePerGas] = await Promise.all([
       publicClient.getTransactionCount({ address: from, blockTag: 'latest' }),
@@ -192,7 +252,7 @@ export class LiveExecutor implements Executor {
     const baseFee = block.baseFeePerGas ?? parseGwei('1');
     const maxFeePerGas = baseFee * 2n + maxPriorityFeePerGas;
     // estimateGas executes the tx against current state: it throws (and we abort) if it would revert.
-    const gasEst = await publicClient.estimateGas({ account: from, to, data });
+    const gasEst = await publicClient.estimateGas({ account: from, to: to ?? undefined, data });
     const gas = (gasEst * 130n) / 100n;
     const serializedTransaction = await this.account.signTransaction({
       chainId: publicClient.chain.id, type: 'eip1559', to, data, nonce, gas, maxFeePerGas, maxPriorityFeePerGas, value: 0n,

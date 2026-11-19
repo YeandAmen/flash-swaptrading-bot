@@ -124,6 +124,7 @@ app.get('/api/state', (_req, res) => {
       ml: engine.research ? { ...engine.research.ml, rulesOos: slimBt(engine.research.ml.rulesOos), mlOos: slimBt(engine.research.ml.mlOos) } : null,
     },
     events: engine.events.slice(-150).reverse(),
+    mev: engine.mev?.view() ?? null,
     params: { risk: RISK, strategy: STRATEGY, tokens: TOKENS },
   });
 });
@@ -168,6 +169,17 @@ app.post('/api/arm', (req, res) => {
   res.json({ ok: true });
 });
 app.post('/api/disarm', (_req, res) => { engine.disarm(); res.json({ ok: true }); });
+app.post('/api/mev/arm', (req, res) => {
+  if (req.body?.confirm !== 'MEV') { res.status(400).json({ error: 'Type MEV to confirm' }); return; }
+  if (!engine.mev) { res.status(503).json({ error: 'The bot is still starting; try again in a minute.' }); return; }
+  try {
+    engine.mev.arm();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: (e as Error).message });
+  }
+});
+app.post('/api/mev/disarm', (_req, res) => { engine.mev?.disarm(); res.json({ ok: true }); });
 app.post('/api/pause', (req, res) => { engine.setPaused(!!req.body?.paused); res.json({ ok: true }); });
 app.post('/api/resume', (req, res) => { engine.resume(kindOf(req)); res.json({ ok: true }); });
 app.post('/api/paper/reset', (_req, res) => { engine.resetPaper(); res.json({ ok: true }); });

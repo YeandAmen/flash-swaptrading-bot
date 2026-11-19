@@ -45,7 +45,14 @@ export const poolAbi = parseAbi([
   'function liquidity() view returns (uint128)',
 ]);
 
+export const v2FactoryAbi = parseAbi(['function getPair(address tokenA, address tokenB) view returns (address)']);
+
+export const v2PairAbi = parseAbi([
+  'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+]);
+
 export const multicall3Abi = parseAbi([
+  'function getBlockNumber() view returns (uint256)',
   'function getEthBalance(address addr) view returns (uint256)',
   'function getCurrentBlockTimestamp() view returns (uint256)',
   'function getBasefee() view returns (uint256)',

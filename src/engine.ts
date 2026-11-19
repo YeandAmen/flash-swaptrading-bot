@@ -16,6 +16,7 @@ import { analyze, ANALYSIS_WINDOW, checkExit, marketRegime, pickEntry, type Anal
 import { loadCandidates } from './tokens.js';
 import { migratePortfolio, newPortfolio, type BotEvent, type PortfolioState, type Position } from './types.js';
 import { loadOrCreateWallet, type WalletInfo } from './wallet.js';
+import { MevSearcher } from './mev/searcher.js';
 
 /** Journal of an in-flight live transaction. Written BEFORE broadcast so a crash or timeout can be reconciled from chain. */
 interface PendingSwap {
@@ -80,6 +81,8 @@ export class Engine {
   costs = { gasPerSwapUsd: 0, roundTripPctAt50: 0, hurdlePctAt50: 0 };
   /** tokens that failed a pre-trade honeypot/tax check: symbol -> blocked until (ms) */
   safetyBlocks: Record<string, number> = {};
+  /** MEV arbitrage searcher (scans every block; sends bundles only when armed) */
+  mev: MevSearcher | null = null;
   private mlModel: LogitModel | null = null;
   private lastMlScoreHour = -1;
   private paperExec = new PaperExecutor();
@@ -205,6 +208,7 @@ export class Engine {
       this.history.save(CONFIG.historyDays, new Set(m.tokens.map((t) => t.token.symbol)));
       this.log(`Token universe refreshed: ${before} -> ${m.tokens.length} tradeable tokens`);
       void this.runResearchNow();
+      void this.mev?.refreshPools().catch((e) => this.log(`MEV pool refresh failed: ${errMsg(e)}`, 'warn'));
     } catch (e) {
       this.log(`Token universe refresh failed (${errMsg(e)}); keeping the current one, retrying in 1h`, 'warn');
       if (this.market) this.market.discoveredAt = Date.now() - (TOKENS.refreshHours - 1) * HOUR;
@@ -249,6 +253,17 @@ export class Engine {
         this.status = 'running';
         this.lastError = null;
         this.log(`Bot running. Scanning ${this.market.tokens.length} tokens, up to ${RISK.maxPositions} positions. Signals: ${this.mlActive ? 'ML' : 'rules'}. Live trading: ${this.state.armed ? 'ARMED' : 'not armed'}.`);
+        this.mev = new MevSearcher({
+          log: (m, level) => this.log(m, level),
+          account: this.wallet.account,
+          exec: this.liveExec,
+          ethUsd: () => this.snap?.ethUsd ?? null,
+          gasPriceGwei: () => (this.snap ? this.snap.baseFeeGwei + this.snap.tipGwei : null),
+          baseFeeGwei: () => (this.snap && Date.now() - this.lastTickAt < 120_000 ? this.snap.baseFeeGwei : null),
+          tokens: () => this.market.tokens.map((t) => t.token),
+          tradePending: () => !!this.state.pending,
+        });
+        void this.mev.start();
         break;
       } catch (e) {
         this.status = 'error';
@@ -263,6 +278,7 @@ export class Engine {
   /** Graceful stop: wait for an in-flight trade (up to 25s) and persist state. */
   async stop() {
     this.stopping = true;
+    this.mev?.stop();
     for (let i = 0; i < 100 && this.busy; i++) await sleep(250);
     this.saveState();
   }
@@ -935,6 +951,7 @@ export class Engine {
     this.state.armed = false;
     this.log('Live trading DISARMED by user. No new buys; open positions keep their stop-loss/target (use Panic sell to exit now).', 'warn');
     this.saveState();
+    this.mev?.disarm('together with live trading'); // "Disarm" stops everything that uses real money
   }
 
   setPaused(p: boolean) {
