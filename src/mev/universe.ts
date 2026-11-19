@@ -4,7 +4,7 @@ import { getAddress, isAddress, zeroAddress } from 'viem';
 import { ADDR, CONFIG, DATA_DIR, MEV, type TokenCfg } from '../config.js';
 import { writeJson } from '../persistence.js';
 import { loadMevTokenCandidates } from '../tokens.js';
-import { discoverArbPools, type ArbPool, type ArbToken } from './pools.js';
+import { discoverArbPools, type ArbPool, type ArbToken, type DiscoverArbOptions } from './pools.js';
 
 const CACHE = path.join(DATA_DIR, 'mev-token-seeds.json');
 const SEED_LIMIT = 48;
@@ -59,7 +59,7 @@ export class MevUniverse {
   private completedAt: number | null = null;
   private sweepCutoff: number | null = null;
 
-  constructor(persistent: boolean, private log: Log) {
+  constructor(persistent: boolean, private log: Log, private readonly options: DiscoverArbOptions = {}) {
     this.broad = persistent && !CONFIG.forkMode && MEV.universe === 'all';
     this.seeds = this.broad ? this.readSeeds() : [];
   }
@@ -127,7 +127,7 @@ export class MevUniverse {
   }
 
   private async check(batch: TokenCfg[]) {
-    const found = await discoverArbPools(batch, MEV.minPoolWeth);
+    const found = await discoverArbPools(batch, MEV.minPoolWeth, this.options);
     const now = Date.now();
     for (const token of batch) {
       const key = tokenKey(token);

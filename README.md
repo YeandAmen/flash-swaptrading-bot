@@ -1,167 +1,191 @@
 # ETH Token Bot
 
-Ethereum mainnet pe ERC-20 tokens ko **Uniswap v3** pe USDC ke against trade karne wala bot. Ye tumhare Mac pe 24/7 chalta hai, aur dashboard **http://localhost:7777** pe dikhta hai.
+A local Ethereum mainnet dashboard for Uniswap v3 spot strategies and two-pool arbitrage. It runs on Node.js on macOS, Linux, or Windows. The spot engine can use momentum rules or a calibrated ML model. The MEV engine scans supported pools using a consistent Ethereum block and simulates candidates before considering a transaction.
 
-> Koi bhi strategy profit ki guarantee nahi deti. Sirf utna paisa lagao jitna poora doob jaye to bhi chalega.
+`ALLOW_LIVE_TRADING=off` is the default. It disables all mainnet signing from the bot, including trades, gas top-ups, contract deployment, and MEV bundles. Paper spot and MEV scans use public state and leave the wallet unfunded. Both live modes start disarmed after every restart.
 
-## Kya chal raha hai
-- Bot ek macOS **LaunchAgent** ke roop mein chalta hai: login pe khud start hota hai, crash ho to restart hota hai, aur chalte waqt Mac ko sleep nahi hone deta (`caffeinate`).
-- **Paper trading** ($50 virtual) hamesha asli prices ke saath chalti hai.
-- **Live spot aur MEV** har startup par disarmed hain. Mainnet signing ke liye `.env` mein `ALLOW_LIVE_TRADING=on` aur dashboard se explicit arm dono chahiye.
+## 1. Install and configure
 
-## Local setup
+Install [Node.js 22 or later](https://nodejs.org/en/download), Git, and an Ethereum mainnet read RPC endpoint. Historical replay requires an archive-capable RPC. MEV paper simulation requires `eth_call` state overrides. For Windows PowerShell, use `npm.cmd` in place of `npm` if execution policy blocks the PowerShell npm shim.
 
-Use Node.js 22 or later (`nvm use` with the checked-in `.nvmrc`). Copy `.env.example` to `.env`, enter an Ethereum mainnet read RPC in `RPC_URL`, then run `npm ci && npm run build && npm start`. Keep `ALLOW_LIVE_TRADING=off` for paper operation. Backfill uses archive `eth_call`, and paper safety/MEV simulation uses RPC state overrides.
-
-At `http://localhost:7777`, sign in as `operator` with the password returned by `npm run --silent service:token`. The password is generated on first server startup and stored under the bot's data directory with owner-only permissions. The dashboard binds to loopback. `npm run service:status` checks both HTTP reachability and completion of a recent market cycle. If upgrading an existing LaunchAgent, reinstall it with the supported Node version to pick up the managed logging entry point.
-
-`ALLOW_LIVE_TRADING=off` disables every broadcast, including automatic spot exits, Panic sells, gas top-ups, MEV deployment and bundles. With live signing allowed, spot exits run while spot is armed. Panic can request liquidation while spot is disarmed, after any in-flight transaction settles. Disarm stops new automated spot and MEV actions. Previously submitted transactions can still settle.
-
-Keep a backup of the data directory and use one running bot per wallet. The wallet stays blocked if a signed transaction cannot be reconciled by hash. Preserve `state.json`, `wallet-transaction.json`, and `mev.json` while checking the transaction and provider status. Restart after repairing a storage failure so the bot can reconcile the existing journal.
-
-## Sab tokens (TOKEN_MODE=all)
-Bot sirf 6 fixed tokens nahi dekhta. Ye **saare listed Ethereum tokens** scan karta hai (CoinGecko + Uniswap token lists, ~5,400 tokens), lekin trade sirf wahi hote hain jo ye checks pass karein:
-1. **Liquidity:** token ka Uniswap v3 pool (WETH ya USDC ke saath) kam se kam $30k gehra ho. Abhi ~200 tokens ye pass karte hain. Jinka gehra pool USDC ke saath hai, wo seedha USDC→token trade hote hain (1 hop, kam gas).
-2. **Honeypot / hidden tax:** buy→sell ka simulation chain pe hota hai (koi transaction nahi bhejta). Token bech na sake, ya round-trip loss pool fees se 2% zyada ho, to reject. Ye check **har buy se theek pehle dobara** chalta hai.
-3. **History:** naye tokens ke paas kam se kam 14 din ki price history honi chahiye. Isse fresh pump-and-dump se bachav hota hai.
-4. **Stablecoins / pegged assets** (USDT, DAI, stETH…) skip hote hain, kyunki unme trend nahi hota.
-5. **Long-tail limit:** nayi buy se pehle sabhi chhote token positions ka combined exposure check hota hai, default max 50% equity.
-
-Universe har 24 ghante refresh hota hai. Uniswap v2-only tokens aur jo token lists mein nahi hain, wo scan nahi hote.
-
-## Gas apne aap (auto gas top-up)
-Jab wallet mein ETH kam ho (< 0.0015 ETH), bot **USDC se ~$3 ka ETH khud kharid leta hai**. Ye ek hi transaction hoti hai: USDC→WETH swap aur unwrap, Flashbots se private.
-- Din mein max 4 top-ups, aur do top-ups ke beech kam se kam 15 minute.
-- Har nayi buy ke baad bhi ~$3 USDC gas ke liye bacha ke rakhta hai.
-- **Pehli baar thoda ETH (~0.001) tumhe bhejna padega**, kyunki pehli top-up transaction ke liye bhi gas chahiye.
-- Top-up ko loss nahi gina jata (USDC bas "gas wallet" mein shift hota hai). Jo gas sach mein jalti hai, wahi P&L mein ghatai jaati hai.
-
-## Live start karne ke steps
-1. Paper aur local fork pe verify karne ke baad hi `.env` mein `ALLOW_LIVE_TRADING=on` set karo. **Private key ka backup lo.** Terminal mein ye chalao aur key safe jagah save karo. Kisi ko mat dikhana.
-   ```bash
-   security find-generic-password -s eth-token-bot -a bot-wallet -w
-   ```
-2. Bot wallet pe **Ethereum mainnet (ERC-20 network)** se bhejo: **USDC**, aur pehli baar **~0.001 ETH**.
-3. Dashboard pe **Arm live trading** karo (`LIVE` type karke).
-
-## AI signal model (intelligent-trading-bot se inspired)
-[asavinov/intelligent-trading-bot](https://github.com/asavinov/intelligent-trading-bot) jaisi pipeline, TypeScript mein:
-1. **Features:** har token-hour ke 21 features: 1h–7d returns (volatility se normalised), volatility, EMA20/50/200 se doori, RSI, 72h/168h high-low se doori, ETH ke against strength, aur ETH ka market regime.
-2. **Labels:** kya price agle 48 ghante mein +1R (stop jitna upar) pehle chhuega ya −1R pehle.
-3. **Model:** L2 logistic regression, sab tokens ka data milake (`src/ml.ts`).
-4. **Walk-forward test:** har 3 din pe model dobara train hota hai. Training sirf un purane token-hours pe hoti hai jinke 48-hour outcomes tab tak known the.
-5. **Gate (`ML_MODE=auto`):** earlier walk-forward predictions se threshold choose hota hai, phir final chronological holdout pe wahi threshold test hota hai. Auto mode requires enough completed trades, holdout AUC ≥ 0.55 by default, and performance ahead of both the rules and holding USDC. `ML_MODE=on` trained model ko force kar sakta hai. `off` rules use karta hai.
-6. Model har 6 ghante mein dobara train hota hai. Dashboard final holdout metrics, earlier threshold calibration aur sabse strong features dikhata hai.
-
-## Ek saath kai tokens
-Bot ek saath **3 tokens tak** hold kar sakta hai (`MAX_POSITIONS`), har ek mein max 45% equity (`MAX_POSITION_PCT`). Har position ka apna stop-loss, target aur trailing stop hota hai. Har ghante max ek nayi entry.
-
-## Bot ka dimaag (rules)
-- **Market filter:** ETH apne 200-hour EMA ke upar ho aur wo EMA khud upar ja raha ho. Tabhi koi bhi buy hota hai. Bear market mein bot USDC mein baitha rehta hai.
-- **Token chunna:** uptrend (price > EMA20 > EMA50, aur EMA200 ke upar), 3-din ka volatility-adjusted momentum ≥ 0.75σ, RSI 45–72, aur daily volatility ≥ 1.5%. Sabse strong token chuna jata hai.
-- **Cost check:** asli Uniswap quote aur gas se round-trip cost nikalta hai. Target move cost ka 3 guna na ho to trade nahi.
-- **Exits:** stop-loss (1.5× daily vol), take-profit (2.5R), trailing stop, trend tootne pe exit, time stop. Live exits ko armed spot, running process, fresh price aur gas chahiye.
-- **Risk limits:**
-  - Har trade mein ~2.5% equity risk
-  - Din mein 6% loss pe nayi buying band
-  - 25% drawdown pe halt
-  - 3 failed transactions ke baad bhi halt
-- **Execution:**
-  - Exact-amount approvals
-  - Fresh quote, 0.5% max slippage aur simulation har trade se pehle
-  - Flashbots Protect by default (`SEND_RPC_URL`)
-  - Har transaction pehle journal mein likhi jaati hai, taaki crash ke baad chain se reconcile ho sake
-
-**Backtest:** signals and exits use a measured hourly close, then fill one hour later when that close was measured. Today's token universe, fees and gas price are used with assumed slippage. The simulator keeps forward-filled features across gaps, and holdout AUC uses only labels with observed hourly outcomes throughout the horizon.
-
-**Gas ka asar ($50 pe):** backtest aur bot dono abhi ki gas price use karte hain. Gas ~1 gwei ho to ek $20 trade ka round trip ~$1.2 (~6%) padta hai, jo 3% cost limit se zyada hai, isliye bot trade nahi karta (backtest bhi 0 trades dikhata hai). Gas 0.2–0.4 gwei ho tab trades hote hain. Zyada capital ho to gas ka hissa chhota ho jata hai.
-
-## MEV arbitrage (flash swaps + Flashbots bundles)
-The scanner compares WETH pairs across Uniswap v2, Uniswap v3, SushiSwap v2, and SushiSwap v3. SushiSwap v3 uses the same swap callback as Uniswap v3, so it works with the existing FlashArb bytecode. The scanner starts with core and cached tokens, then checks the Ethereum token lists in paced background batches. It keeps tokens with at least two sufficiently deep pools and caps the active block reads. The dashboard shows discovery progress, venue counts, and how long reads and decisions took.
-
-- Pool reads use a consistent block. The searcher uses the constant-product estimate to shortlist routes, then simulates candidate swap sizes against that block. For V3 routes it probes both sides of the estimate and can reuse a recent successful size because concentrated liquidity changes at tick boundaries.
-- **Armed** ho to private **Flashbots bundle** bhejta hai: sasta khareedo, mehenga becho, ek hi transaction mein. Ye flash swap hai, yaani apna capital nahi lagta (USDC use nahi hota). Profit ETH mein wallet mein aata hai.
-- The contract (`contracts/FlashArb.sol`) reverts below the submitted profit floor. The searcher sets that floor using padded estimated gas at the target block's fee ceiling, the builder tip, and the configured minimum net profit. An included transaction that reverts can still consume gas. Builder acceptance and on-chain inclusion are tracked separately.
-- **Sirf arbitrage.** Bot kabhi kisi ka front-run ya sandwich nahi karta.
-
-FlashArb unwraps successful WETH profit and pays the deployer wallet directly after the builder tip. The wallet pays transaction gas separately. The contract's owner-only `sweep` can recover unsolicited transfers or residual token dust. The SushiSwap v3 fork test checks the owner's actual ETH balance and the contract's ETH, WETH, and route-token balances after settlement.
-
-Shuru mein ye **paper mode** mein hai: scan aur simulate karta hai, bhejta kuch nahi. Live signing enabled ho to dashboard pe **"Arm MEV"** dabao aur `MEV` type karo. Bot existing contract ko verify karta hai. Pehli deployment gas leti hai. Wallet ka main **Disarm** button MEV ko bhi band karta hai.
-
-**Sach:** MEV duniya ki sabse competitive cheez hai. Professional searchers ke paas apne nodes aur builders ke saath setup hota hai, wo gaps milliseconds mein le jaate hain. Ghar ke Mac se jeet kam milegi, shayad bilkul nahi. Dashboard dikhata hai kitne blocks scan hue, is ghante sabse bada price gap kitna tha, kitne simulate hue aur kitne profitable the.
-
-Settings include `MEV_UNIVERSE=all` for the independent token-list sweep, `MEV_UNIVERSE=spot` for core and spot candidates only, and `MEV_MAX_TRACKED_POOLS=480` for the active read budget. The liquidity floor defaults to `MEV_MIN_POOL_WETH=2`. `MEV_BUILDER_TIP_PCT`, `MEV_MIN_NET_USD`, and `MEV_BUILDERS` control live submission. Set `MEV_CONTRACT_ADDRESS` to adopt an existing FlashArb on an empty data directory. Arming checks the deployed bytecode and wallet ownership and rejects a conflict with the saved address. Contract changes require `npm run build:contract` with solc 0.8.26.
-
-### What determines profitability
-
-- **Coverage and depth.** An Ethereum read-only check of the official SushiSwap v3 factory at block 26,451,128 found active WETH pools across multiple liquid tokens, including WBTC, DAI, USDC, USDT, LINK, and AAVE. V3 virtual reserves are a size estimate within a tick. The exact simulation accounts for movement across ticks. [Sushi deployment](https://github.com/sushiswap/v3-core/blob/master/deployments/ethereum/UniswapV3Factory.json) · [Sushi pool source](https://github.com/sushiswap/v3-core/blob/master/contracts/UniswapV3Pool.sol) · [Uniswap v3 design](https://app.uniswap.org/whitepaper-v3.pdf)
-- **Net profit and timing.** Compare simulated gross profit with the target block fee, actual gas capacity, builder payment, and decision time. Paper candidates measure opportunity frequency. Confirmed receipts account for realized outcomes. Other bids, blocks arriving late, and builder or validator coverage can prevent inclusion. [Flashbots inclusion troubleshooting](https://docs.flashbots.net/flashbots-auction/advanced/troubleshooting) · [Ethereum arbitrage measurement study](https://www.usenix.org/conference/usenixsecurity23/presentation/mclaughlin)
-- **Contract expansion.** PancakeSwap v3 uses a different callback and pool-state layout. Uniswap v4 uses a singleton with separate settlement. Aave flash loans add repayment costs. Each deserves its own adapter, payout tests, and measured opportunities before migrating the deployed contract. [PancakeSwap v3 pool interface](https://github.com/pancakeswap/pancake-developer/blob/master/docs/pages/contracts/v3/pancakev3pool.md) · [Uniswap v4 accounting](https://developers.uniswap.org/docs/protocols/v4/concepts/flash-accounting) · [Aave flash loans](https://aave.com/docs/aave-v3/smart-contracts/pool#flashloansimple)
-
-## Commands
-```bash
-npm run service:status      # chal raha hai ya nahi
-npm run service:logs        # last 60 log lines
-npm run --silent service:token # localhost dashboard password
-npm run service:restart     # code/settings badalne ke baad (build + restart)
-npm run service:uninstall   # bot band karke LaunchAgent hatao
-npm run scan                # token universe + safety checks dobara chalao (read-only)
-npm run backtest            # strategy ko history pe chalao
-npm run wallet:local-test   # disposable local Anvil chain; no upstream provider
+```sh
+git clone https://github.com/cutiapreta/eth-token-bot.git
+cd eth-token-bot
+npm ci
+cp .env.example .env
 ```
 
-For fork suites, install Anvil, build with `npm run build`, and pass the upstream **read-only** archive endpoint explicitly. Choose `FORK_BLOCK_NUMBER` to repeat a test at a pinned mainnet block. Each suite creates a loopback Anvil, a throwaway key and temporary state. Transactions run on the fork with fake funds.
+On Windows PowerShell, replace the `cp` line with `Copy-Item .env.example .env`. Open `.env` locally and set `RPC_URL` to your Ethereum mainnet RPC URL. Keep `ALLOW_LIVE_TRADING=off`. Leave `MEV=on` for paper arbitrage scanning. The default dashboard port is `7777`.
 
-```bash
-FORK_RPC_URL='https://your-archive-provider' npm run fork-test
-FORK_RPC_URL='https://your-archive-provider' npm run wallet:fork-test
-FORK_RPC_URL='https://your-archive-provider' npm run mev-fork-test
+```sh
+npm run build
+npm start
 ```
 
-## GitHub (private repo)
-Code yahan save hai: **https://github.com/cutiapreta/eth-token-bot** (private). `.env` (Alchemy key) aur `data/` kabhi commit nahi hote (`.gitignore`). Private key Keychain mein hai, repo mein nahi.
+Open [http://127.0.0.1:7777](http://127.0.0.1:7777). The dashboard and paper controls open directly on this computer. The dashboard binds to IPv4 loopback, so the address refers to the computer running the process. Keep the terminal open during a foreground run. Stop with `Ctrl+C`. After code edits, build again before restarting.
 
-Is Mac pe SSH key (`~/.ssh/id_ed25519`) GitHub se judi hai, to aage changes save karne ke liye:
-```bash
-git add -A && git commit -m "kya badla" && git push
+## 2. Wallet creation, backup, and restore
+
+**The bot creates its wallet automatically on first startup.** To initialize it before starting the dashboard or check the existing public address, run the address command after building and configuring `.env`.
+
+```sh
+npm run --silent wallet:address
 ```
 
-## Settings (`.env`)
-- **Mainnet signing:** `ALLOW_LIVE_TRADING` (`off` by default)
-- **Risk:** `RISK_PER_TRADE_PCT`, `MAX_SLIPPAGE_BPS`, `MAX_ENTRY_GAS_GWEI`, `DAILY_LOSS_LIMIT_PCT`, `MAX_DRAWDOWN_PCT`, `MIN_GAS_ETH`, `APPROVAL_MODE`
-- **Positions / AI:** `MAX_POSITIONS` (default 3), `MAX_POSITION_PCT` (0.45), `ML_MODE` (`auto`/`on`/`off`), `ML_MIN_AUC` (0.55)
-- **Tokens:**
-  - `TOKEN_MODE` (`all` ya `core`)
-  - `MIN_POOL_USD` (default 30000)
-  - `MAX_TOKENS` (default 300)
-  - `MIN_HISTORY_DAYS` (default 14)
-  - `MAX_ROUNDTRIP_TAX_PCT` (default 0.02)
-  - `LONGTAIL_MAX_ALLOC_PCT` (default 0.5)
-- **Gas:** `GAS_TOPUP` (`on`/`off`), `GAS_TOPUP_BELOW_ETH`, `GAS_TOPUP_USD`, `GAS_TOPUP_MAX_PER_DAY`
-- **MEV:** `MEV` (`on`/`off`), `MEV_BUILDER_TIP_PCT`, `MEV_MIN_NET_USD`, `MEV_MIN_POOL_WETH`, `MEV_MAX_SIMS_PER_BLOCK`, `MEV_BUILDERS`, `MEV_CONTRACT_ADDRESS`
-- **Baaki:** `LOOP_SECONDS`, `PAPER_START_USD`, `HISTORY_DAYS`
+Check the same public address on the dashboard. The wallet record in `DATA_DIR/wallet.json` binds that data directory to the original address. `DATA_DIR` defaults to `data` under the checkout.
 
-Galat value hogi to bot start hi nahi hoga (safety ke liye). Koi bhi setting badalne ke baad `npm run service:restart` chalao.
+| Platform | Default private key storage |
+| --- | --- |
+| macOS | Login Keychain, service `eth-token-bot`, account `bot-wallet`. The protected local fallback is `~/.eth-token-bot/wallet.key`. Installations already using that file keep the same key. |
+| Linux and Windows | `DATA_DIR/wallet.key`. The bot creates it with `0600` permissions on Linux and an owner-only access list on Windows. Use a local NTFS data directory on Windows. |
 
-## Dhyan rakho
-- Mac on aur charger pe rehna chahiye. Lid band hua to bot ruk jayega.
-- Private key macOS Keychain mein hai (service `eth-token-bot`). Backup zaroor lo.
-- Dashboard sirf isi Mac se khulta hai (127.0.0.1).
-- Chhote tokens zyada risky hote hain. Safety checks honeypot aur tax pakadte hain, lekin rug-pull (team ka liquidity nikal lena) future mein ho sakta hai.
-- Crypto profit pe India mein tax lagta hai. Apne CA se confirm kar lena.
+The address command, dashboard, and server logs show public information. Export the private key to a new file outside the checkout only when you need an offline backup or need to import the original key into a deployment signer.
 
-## Files
-| Path | Kya hai |
-|---|---|
-| `src/engine.ts` | main loop, decisions, deposit detection, gas top-up, risk limits |
-| `src/strategy.ts` | indicators, entry/exit rules |
-| `src/ml.ts` | AI features, labels, logistic regression, walk-forward |
-| `src/backtest.ts` | multi-position simulator, research + AI gate |
-| `src/tokens.ts` | token lists se candidates |
-| `src/safety.ts` | honeypot / hidden-tax simulation |
-| `src/market.ts` | pool discovery, prices, history |
-| `src/executor.ts` | paper aur live swaps, gas top-up, contract deploy, MEV ke saath nonce gate |
-| `src/mev/` | MEV arbitrage: pools dhundhna (`pools.ts`), har block scan + simulate (`searcher.ts`), Flashbots bundles (`bundles.ts`) |
-| `contracts/FlashArb.sol` | flash-swap arbitrage contract (sirf owner chala sakta hai, kuch hold nahi karta) |
-| `src/server.ts` + `public/` | localhost dashboard |
-| `data/` | state, trades, logs, price history, token universe |
+**macOS or Linux**
+
+```sh
+mkdir -p "$HOME/wallet-backups"
+chmod 700 "$HOME/wallet-backups"
+npm run --silent wallet:export -- "$HOME/wallet-backups/eth-token-bot.key"
+```
+
+**Windows PowerShell**
+
+```powershell
+$walletBackup = Join-Path $env:USERPROFILE 'wallet-backups'
+New-Item -ItemType Directory -Force -Path $walletBackup | Out-Null
+npm run --silent wallet:export -- (Join-Path $walletBackup 'eth-token-bot.key')
+```
+
+The exported file contains one `0x`-prefixed private key in plaintext. The command prints the public address and destination, with the key stored in the restricted file. Keep it in encrypted offline storage. Anyone who obtains the key can spend the wallet’s funds. Share the repository and `.env.example` when handing the project to someone. Keep your `.env`, `DATA_DIR`, private key backups, and dashboard credential local.
+
+**To restore or import:** Before starting, set `WALLET_KEY_FILE` in `.env` to the absolute path of a protected file containing one `0x`-prefixed private key. On macOS or Linux, set `chmod 600 /absolute/path/to/wallet.key`. On Windows use an owner-only NTFS file, such as a file created by the export command. Run `npm run --silent wallet:address` and verify the address against your existing public address before funding it. If you are restoring an existing bot, also restore its data directory and wallet metadata so the bot can reconcile positions and in-flight transactions.
+
+To reuse a Mac Keychain wallet on another platform, export it from the original checkout on the Mac, transfer the protected backup securely, and set `WALLET_KEY_FILE` on the new machine. Always verify the public address. A different key requires a separate `DATA_DIR`; keep the original wallet and state together.
+
+## 3. Dashboard and localhost troubleshooting
+
+The dashboard uses HTTP at `http://127.0.0.1:7777`. Use the port configured by `PORT` if you changed it. Opening the dashboard and using paper controls requires no sign-in. Sensitive live wallet actions require the local operator credential. The bot generates this credential on the first startup with live signing enabled.
+
+```sh
+npm run --silent dashboard:password
+```
+
+Use `operator` if a live action asks for a username. The password is distinct from the wallet key and is stored at `DATA_DIR/dashboard-token`.
+
+| Symptom | Check |
+| --- | --- |
+| Connection refused | Run `npm run build` and `npm start` from the checkout, then check the terminal output. Use the displayed loopback port. If another process is already listening, stop the duplicate or set an unused `PORT`, such as `7778`, in `.env` and restart. |
+| A browser shows an old sign-in popup | Confirm that the process serving the port is the updated bot. Restart it, then open `http://127.0.0.1:7777` in a fresh private window to clear cached HTTP credentials. |
+| Dashboard is open and paper scan is still starting | Check `/api/ready` and the startup status on the page. Market discovery, archive history and MEV pool discovery use the configured RPC. Use `/api/health` to check the HTTP process. |
+| Chain or RPC error | Use an Ethereum mainnet endpoint. The RPC must report chain ID `1`. Keep the endpoint credentials inside `.env`. A provider without history or state overrides can limit backtests and eligibility simulations. |
+| Browser is on another device, container or remote host | `127.0.0.1` points to that device or environment. Open the dashboard on the host running the bot. Keep the wallet operator interface bound to loopback. |
+
+```sh
+curl http://127.0.0.1:7777/api/health
+curl http://127.0.0.1:7777/api/ready
+```
+
+On Windows PowerShell, use `curl.exe` for these commands.
+
+## 4. Arbitrage venues and funding
+
+| Runtime | Pool support | Funding |
+| --- | --- | --- |
+| Legacy FlashArb (default) | Uniswap v2/v3 and SushiSwap v2/v3 WETH pairs | Pool flash swap |
+| FlashArb V2 | Legacy venues plus PancakeSwap v3 and supported hook-free, static-fee Uniswap v4 ETH or WETH pools | Pool funding, Aave V3 WETH flash loans, or Morpho Blue WETH flash loans, subject to route eligibility |
+
+The searcher checks canonical factory or PoolManager state. It compares live pool depth, quotes candidate sizes at a consistent block, and rejects candidates that fail the profit floor after gas and any applicable flash-loan premium and builder tip. The V4 scanner restricts compatibility to pool types the contract can settle. Tokens from the public Ethereum token lists are indexed in paced batches. `MEV_UNIVERSE=spot` restricts the sweep to the spot and core universe, and `MEV_MAX_TRACKED_POOLS` limits active per-block reads.
+
+The bot's receipts record realized outcomes. A pool count or a profitable paper simulation alone does not establish realized returns. Inclusion depends on pool movement, gas, competing bids, RPC latency, and builder coverage. See [SushiSwap V3 core](https://github.com/sushiswap/v3-core), [PancakeSwap V3 addresses](https://developer.pancakeswap.finance/contracts/v3/addresses), [Uniswap v4 settlement](https://developers.uniswap.org/docs/protocols/v4/concepts/flash-accounting), [Aave V3 flash loans](https://aave.com/docs/aave-v3/smart-contracts/pool#flashloansimple), [Morpho Blue flash loans](https://docs.morpho.org/learn/concepts/flashloans/), and [Flashbots bundle troubleshooting](https://docs.flashbots.net/flashbots-auction/advanced/troubleshooting).
+
+## 5. Test with fake funds
+
+Install [Foundry](https://getfoundry.sh/introduction/installation) and confirm `anvil --version` works. The test runner starts an isolated Anvil instance on a temporary loopback port and generates a throwaway wallet. All signed test transactions go to that local instance. `FORK_RPC_URL` is the upstream for state reads only. The runner does not load `.env` or use the bot's configured wallet or data directory.
+
+```sh
+npm run build
+npm run wallet:local-test
+```
+
+**macOS or Linux**
+
+```sh
+export FORK_RPC_URL='https://your-ethereum-archive-rpc.example'
+npm run fork-test
+npm run wallet:fork-test
+npm run mev-fork-test
+FORK_BLOCK_NUMBER=26451239 npm run mev-v2-fork-test
+```
+
+**Windows PowerShell**
+
+```powershell
+$env:FORK_RPC_URL = 'https://your-ethereum-archive-rpc.example'
+npm run fork-test
+npm run wallet:fork-test
+npm run mev-fork-test
+$env:FORK_BLOCK_NUMBER = '26451239'
+npm run mev-v2-fork-test
+Remove-Item Env:FORK_BLOCK_NUMBER
+```
+
+Ethereum block `26451239` contains the canonical PancakeSwap v3 and Uniswap v4 pools used by the V2 fixture. Choose another archive snapshot by setting `FORK_BLOCK_NUMBER`. Use the `ANVIL` environment variable for a locally installed executable outside your `PATH`.
+
+## 6. Select FlashArb V2 and deploy manually when you are ready
+
+The legacy contract remains the default for existing deployments. To select V2 for paper simulation, set `MEV_CONTRACT_VERSION=v2` and `MEV_FUNDING=auto`. The alternatives `pool`, `aave`, and `morpho` restrict routes to the corresponding funding source. Keep `ALLOW_LIVE_TRADING=off` throughout setup. Aave charges a repayment premium. Morpho Blue has no lender premium but still consumes gas and can only lend its available balance. Compare net profit after repayment, gas, and the builder tip.
+
+FlashArb V2 requires an explicit deployment for live use. The bot verifies the supplied contract runtime and confirms that its `owner()` matches the bot wallet. Successful routes settle the loan and forward net proceeds and relevant route leftovers to the owner. An owner-only recovery path handles assets transferred to the contract outside a route.
+
+To build the raw creation data locally, install `solc` 0.8.26 and run the contract and TypeScript builds. The command displays public deployment data.
+
+```sh
+npm run build:contract -- v2
+npm run build
+npm run --silent mev:v2:bytecode
+```
+
+For a manual deployment using Cast, import the bot owner key interactively into an encrypted keystore. Use the local protected key backup and keep the raw key out of shell arguments.
+
+```sh
+cast wallet import bot-owner --interactive
+cast wallet address --account bot-owner
+```
+
+Before sending any deployment transaction, confirm that the wallet address equals `npm run --silent wallet:address` and that the chosen deployment RPC reports chain ID `1`. A mainnet contract deployment costs real ETH. Once you intentionally choose to deploy, you can send the compiled creation data from that owner account. These are Bash commands. On Windows use a compatible shell or WSL for the deployment command.
+
+```sh
+cast chain-id --rpc-url "$DEPLOY_RPC_URL"
+creation_data=$(npm run --silent mev:v2:bytecode)
+cast send --create "$creation_data" --account bot-owner --rpc-url "$DEPLOY_RPC_URL"
+```
+
+`DEPLOY_RPC_URL` is your chosen Ethereum transaction endpoint for this manual step. After confirmation, record the receipt's `contractAddress`. Add `MEV_V2_CONTRACT_ADDRESS` to `.env`, keep `MEV_CONTRACT_VERSION=v2` and `ALLOW_LIVE_TRADING=off`, then restart and verify paper mode. Keep the previous deployment record and `MEV_CONTRACT_ADDRESS` if you plan to return to the legacy version. Resolve pending wallet operations before switching versions.
+
+## Commands and key settings
+
+| Command | Purpose |
+| --- | --- |
+| `npm run build` | Compile TypeScript. |
+| `npm run typecheck` | Check types without rebuilding. |
+| `npm start` | Run the local dashboard, spot loop, and configured MEV scanner. |
+| `npm run scan` | Read-only spot universe scan. |
+| `npm run mev:scan -- 3` | Read-only paper MEV scan for three blocks. |
+| `npm run backtest` | Backtest rules and perform a walk-forward ML evaluation locally. |
+| `npm run --silent wallet:address` | Initialize or show the public bot address. |
+| `npm run --silent wallet:export -- <absolute-path>` | Export the existing key to a new owner-only file outside the checkout. |
+| `npm run --silent dashboard:password` | Read the local operator credential for live actions. |
+
+| Setting | Purpose |
+| --- | --- |
+| `RPC_URL` | Ethereum mainnet read RPC. |
+| `SEND_RPC_URL` | Live submission endpoint, used only when signing is explicitly enabled. |
+| `ALLOW_LIVE_TRADING` | Master signing switch. Off by default. |
+| `PORT`, `DATA_DIR`, `WALLET_KEY_FILE` | Local dashboard port, state directory and optional protected key import. |
+| `TOKEN_MODE`, `TOKEN_LIST_URLS`, `MEV_UNIVERSE` | Spot token strategy and separate MEV list scope. |
+| `MEV_CONTRACT_VERSION`, `MEV_CONTRACT_ADDRESS`, `MEV_V2_CONTRACT_ADDRESS` | Version selection and verified deployment addresses. |
+| `MEV_FUNDING`, `MEV_MIN_POOL_WETH`, `MEV_MIN_NET_USD` | V2 funding selection, depth and profit floors. |
+| `MEV_BUILDERS`, `MEV_BUILDER_TIP_PCT`, `MEV_MAX_TRACKED_POOLS`, `MEV_MAX_SIMS_PER_BLOCK` | Bundle destinations, builder bid, active read budget and candidate simulation budget. |
+
+Use one running bot per wallet. Back up the wallet and its state, including `state.json`, `wallet-transaction.json`, and MEV journal files. Preserve the journals if a signed transaction cannot be reconciled. A restart restores monitoring and resets both live arming flags.

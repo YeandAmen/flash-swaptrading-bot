@@ -3,6 +3,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export function syncDirectory(directory: string) {
+  // Windows Node file descriptors cannot flush an open directory. The file itself is still flushed before replacement.
+  if (process.platform === 'win32') return;
   const fd = fs.openSync(directory, 'r');
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }

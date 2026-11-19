@@ -10,6 +10,7 @@ import { Engine } from './engine.js';
 import { LiveExecutor, LiveSendBlocked } from './executor.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
 import { FLASH_ARB_ABI, FLASH_ARB_BYTECODE, FLASH_ARB_RUNTIME } from './mev/artifact.js';
+import { FLASH_ARB_V2_BYTECODE } from './mev/artifact-v2.js';
 import { MevSearcher } from './mev/searcher.js';
 import { loadOrCreateWallet } from './wallet.js';
 
@@ -163,4 +164,34 @@ await assert.rejects(restored.deployContract(emptyContract, log), /still settlin
 assert.equal(await nonce(), before + 2, 'an unresolved intent blocks new sends');
 assert.ok(fs.existsSync(walletJournal), 'an unresolved intent survives reconciliation');
 console.log('✓ Restart reconciled a known receipt and preserved an unresolved wallet intent');
+
+// Remove the fake, deliberately unresolved intent above before starting this independent fixture.
+fs.unlinkSync(walletJournal);
+const originalVersion = MEV.version;
+const originalV2Address = MEV.v2ContractAddress;
+try {
+  MEV.version = 'v2';
+  MEV.v2ContractAddress = null;
+  const beforeV2 = await nonce();
+  const paperV2 = new MevSearcher(mevHost);
+  assert.equal(paperV2.view().mode, 'paper');
+  assert.throws(() => paperV2.arm(), /manual deployment/);
+  assert.equal(await nonce(), beforeV2, 'the V2 app cannot auto-deploy');
+
+  const v2 = await exec.deployContract(FLASH_ARB_V2_BYTECODE, log); // Explicit local deployment only.
+  MEV.v2ContractAddress = v2.address;
+  const adoptedV2 = new MevSearcher(mevHost);
+  adoptedV2.arm();
+  await waitForPreparation(adoptedV2);
+  assert.equal(adoptedV2.view().mode, 'live');
+  assert.equal(adoptedV2.file.v2Contract, v2.address);
+  assert.equal(adoptedV2.file.contract?.toLowerCase(), flashArb.address.toLowerCase());
+  assert.equal(await nonce(), beforeV2 + 1, 'V2 adoption only verified runtime and owner');
+  adoptedV2.disarm();
+  assert.equal(new MevSearcher(mevHost).view().mode, 'paper');
+} finally {
+  MEV.version = originalVersion;
+  MEV.v2ContractAddress = originalV2Address;
+}
+console.log('✓ FlashArbV2 required manual deployment and was verified separately from legacy state');
 console.log('ALL WALLET TESTS PASSED');

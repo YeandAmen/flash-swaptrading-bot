@@ -56,7 +56,7 @@ export const CONFIG = {
   allowLiveTrading: liveTradingSetting === 'on',
   keychainService: str('KEYCHAIN_SERVICE', 'eth-token-bot'),
   keychainAccount: str('KEYCHAIN_ACCOUNT', 'bot-wallet'),
-  /** Only for tests on a local fork: read the key from this file instead of the macOS Keychain. */
+  /** Optional local import from an owner-only key file. Forks always use an isolated throwaway one. */
   walletKeyFile: str('WALLET_KEY_FILE'),
   /** Test mode for a local anvil fork: skip Flashbots status checks. */
   forkMode: forkSetting === '1',
@@ -197,9 +197,15 @@ export const RISK = {
  * Scanning is always on (paper mode); real bundles need "Arm MEV" in the dashboard.
  */
 const configuredMevContract = str('MEV_CONTRACT_ADDRESS').trim();
+const configuredMevV2 = str('MEV_V2_CONTRACT_ADDRESS').trim();
+export type MevContractVersion = 'legacy' | 'v2';
+export type MevFundingMode = 'auto' | 'pool' | 'aave' | 'morpho';
 export const MEV = {
   enabled: str('MEV', 'on') !== 'off',
+  version: str('MEV_CONTRACT_VERSION', 'legacy') as MevContractVersion,
+  funding: str('MEV_FUNDING', 'auto') as MevFundingMode,
   contractAddress: configuredMevContract ? getAddress(configuredMevContract) : null,
+  v2ContractAddress: configuredMevV2 ? getAddress(configuredMevV2) : null,
   minPoolWeth: num('MEV_MIN_POOL_WETH', 2), // ignore pools holding less WETH than this
   universe: str('MEV_UNIVERSE', 'all'), // independently check the public list; 'spot' only uses the spot/core universe
   maxTrackedPools: num('MEV_MAX_TRACKED_POOLS', 480),
@@ -245,6 +251,9 @@ check(GAS_TOPUP.belowEth > 0 && GAS_TOPUP.belowEth < 1, 'GAS_TOPUP_BELOW_ETH mus
 check(GAS_TOPUP.usd >= 1 && GAS_TOPUP.usd <= 100, 'GAS_TOPUP_USD must be 1..100');
 check(Number.isInteger(GAS_TOPUP.maxPerDay) && GAS_TOPUP.maxPerDay >= 1 && GAS_TOPUP.maxPerDay <= 24, 'GAS_TOPUP_MAX_PER_DAY must be 1..24');
 check(MEV.minPoolWeth >= 0.1, 'MEV_MIN_POOL_WETH must be >= 0.1');
+check(MEV.version === 'legacy' || MEV.version === 'v2', 'MEV_CONTRACT_VERSION must be legacy or v2');
+check(['auto', 'pool', 'aave', 'morpho'].includes(MEV.funding), 'MEV_FUNDING must be auto, pool, aave or morpho');
+check(MEV.version === 'v2' || MEV.funding === 'auto' || MEV.funding === 'pool', 'Lender funding requires MEV_CONTRACT_VERSION=v2');
 check(MEV.universe === 'all' || MEV.universe === 'spot', 'MEV_UNIVERSE must be all or spot');
 check(Number.isInteger(MEV.maxTrackedPools) && MEV.maxTrackedPools >= 16 && MEV.maxTrackedPools <= 1000, 'MEV_MAX_TRACKED_POOLS must be 16..1000');
 frac('MEV_BUILDER_TIP_PCT', MEV.builderTipPct);

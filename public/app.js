@@ -246,9 +246,10 @@ function render() {
     $('mevDisarmBtn').hidden = !X.armed;
     $('mevDeploy').textContent = X.contract
       ? `contract ${X.contract.slice(0, 8)}…${X.contract.slice(-4)}`
+      : X.configuredContract ? 'Configured contract · verified on arming'
       : X.contractVersion === 'v2' ? 'FlashArbV2 · paper simulation · manual deployment required for execution'
         : X.deployEstimateUsd != null ? `arming deploys the contract once (~${usd(X.deployEstimateUsd)} gas)` : '';
-    if (X.contractVersion === 'v2' && !X.contract) $('mevArmBtn').disabled = true;
+    if (X.contractVersion === 'v2' && !X.contract && !X.configuredContract) $('mevArmBtn').disabled = true;
   }
 
   // log
@@ -308,7 +309,7 @@ $('disarmBtn').onclick = async () => {
 const mevDlg = $('mevDlg');
 $('mevArmBtn').onclick = () => {
   const X = S?.mev;
-  $('mevDlgDeploy').innerHTML = X?.contract
+  $('mevDlgDeploy').innerHTML = X?.contract || X?.configuredContract
     ? 'Arming verifies the configured contract bytecode and wallet ownership.'
     : `First, one transaction deploys the bot's own arbitrage contract (owner = the bot wallet): about <b>${X?.deployEstimateUsd != null ? usd(X.deployEstimateUsd) : 'a few dollars'}</b> of ETH gas, once.`;
   $('mevInput').value = '';
