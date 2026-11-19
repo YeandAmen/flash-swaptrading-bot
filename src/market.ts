@@ -16,12 +16,14 @@ export interface PoolInfo {
 
 export interface TokenMarket {
   token: TokenCfg;
-  pool: PoolInfo | null; // TOKEN/WETH pool (null for WETH itself)
+  pool: PoolInfo | null; // TOKEN/quote pool (null for WETH itself)
+  quote: 'WETH' | 'USDC'; // the pool's other token
   buyPath: Hex; // USDC -> ... -> TOKEN
   sellPath: Hex; // TOKEN -> ... -> USDC
   hops: number;
   poolFeePct: number; // total pool fee for one direction
-  wethDepth: number; // WETH held by the TOKEN/WETH pool (depth indicator)
+  depthUsd: number; // quote-side value held by the pool (depth indicator)
+  wethDepth: number; // depthUsd expressed in WETH
   safety?: string; // last round-trip simulation result
 }
 
@@ -122,52 +124,73 @@ export async function discoverMarkets(
   const excluded: { symbol: string; reason: string }[] = [];
   const failRatio = (rs: { status: string }[]) => (rs.length ? rs.filter((r) => r.status !== 'success').length / rs.length : 0);
 
-  // 1. pools
-  const pairs: { key: string; a: Address; fee: number }[] = [];
-  for (const fee of FEE_TIERS) pairs.push({ key: '__USDC', a: ADDR.usdc, fee });
+  // 1. pools: every token vs WETH and vs USDC, all fee tiers (tens of thousands of lookups, batched)
+  type Quote = 'WETH' | 'USDC';
+  const quoteAddr = (q: Quote) => (q === 'WETH' ? ADDR.weth : ADDR.usdc);
+  const pairs: { key: string; a: Address; quote: Quote; fee: number }[] = [];
+  for (const fee of FEE_TIERS) pairs.push({ key: '__USDC', a: ADDR.usdc, quote: 'WETH', fee });
   for (const t of candidates) {
-    if (t.address === ADDR.weth) continue;
-    for (const fee of FEE_TIERS) pairs.push({ key: t.symbol, a: t.address, fee });
+    if (t.address === ADDR.weth || t.address === ADDR.usdc) continue;
+    for (const quote of ['WETH', 'USDC'] as const) {
+      for (const fee of FEE_TIERS) pairs.push({ key: t.symbol, a: t.address, quote, fee });
+    }
   }
   const poolAddrs = await bigMulticall(
-    pairs.map((p) => ({ address: ADDR.uniFactory, abi: factoryAbi, functionName: 'getPool', args: [p.a, ADDR.weth, p.fee] })),
+    pairs.map((p) => ({ address: ADDR.uniFactory, abi: factoryAbi, functionName: 'getPool', args: [p.a, quoteAddr(p.quote), p.fee] })),
+    800,
   );
   if (failRatio(poolAddrs) > 0.02) throw new Error('RPC error while looking up Uniswap pools');
   const found = pairs
     .map((p, i) => ({ ...p, pool: (poolAddrs[i].status === 'success' ? poolAddrs[i].result : zeroAddress) as Address }))
     .filter((p) => p.pool !== zeroAddress);
 
-  // 2. depth
+  // 2. depth: in-range liquidity + the quote token held by each pool, valued in USD
   const depth = await bigMulticall(
     found.flatMap((p) => [
       { address: p.pool, abi: poolAbi, functionName: 'liquidity' },
-      { address: ADDR.weth, abi: erc20Abi, functionName: 'balanceOf', args: [p.pool] },
+      { address: quoteAddr(p.quote), abi: erc20Abi, functionName: 'balanceOf', args: [p.pool] },
     ]),
   );
   if (failRatio(depth) > 0.02) throw new Error('RPC error while measuring pool depth');
-  const bestByKey = new Map<string, { fee: number; pool: Address; liq: bigint; wethBal: number }>();
+  const uwBest = found
+    .map((p, i) => ({ p, liq: depth[2 * i].status === 'success' ? (depth[2 * i].result as bigint) : 0n, wethBal: Number((depth[2 * i + 1].result as bigint) ?? 0n) / 1e18 }))
+    .filter((x) => x.p.key === '__USDC' && x.liq > 0n)
+    .sort((a, b) => (b.liq > a.liq ? 1 : b.liq < a.liq ? -1 : 0))[0];
+  if (!uwBest) throw new Error('Could not find a USDC/WETH Uniswap v3 pool');
+  const usdcWeth = mkPool(ADDR.usdc, ADDR.weth, USDC_DECIMALS, 18, uwBest.p.fee, uwBest.p.pool);
+  const uwSlot0 = (await publicClient.readContract({ address: usdcWeth.address, abi: poolAbi, functionName: 'slot0' })) as readonly [bigint, ...unknown[]];
+  const ethUsd = priceIn(usdcWeth, uwSlot0[0], ADDR.weth);
+  log(`USDC/WETH pool ${usdcWeth.address} fee ${usdcWeth.fee / 1e4}% depth ${uwBest.wethBal.toFixed(0)} WETH, ETH $${ethUsd.toFixed(0)}`);
+
+  // deepest pool per (token, quote) by in-range liquidity, then the better quote by USD depth
+  type Best = { quote: Quote; fee: number; pool: Address; liq: bigint; depthUsd: number };
+  const perQuote = new Map<string, Best>();
   found.forEach((p, i) => {
+    if (p.key === '__USDC') return;
     if (depth[2 * i].status !== 'success' || depth[2 * i + 1].status !== 'success') return;
     const liq = depth[2 * i].result as bigint;
-    const wethBal = Number(depth[2 * i + 1].result as bigint) / 1e18;
     if (liq === 0n) return;
-    const cur = bestByKey.get(p.key);
-    if (!cur || liq > cur.liq) bestByKey.set(p.key, { fee: p.fee, pool: p.pool, liq, wethBal });
+    const bal = depth[2 * i + 1].result as bigint;
+    const depthUsd = p.quote === 'WETH' ? (Number(bal) / 1e18) * ethUsd : Number(bal) / 1e6;
+    const k = `${p.key}|${p.quote}`;
+    const cur = perQuote.get(k);
+    if (!cur || liq > cur.liq) perQuote.set(k, { quote: p.quote, fee: p.fee, pool: p.pool, liq, depthUsd });
   });
+  const bestByKey = new Map<string, Best>();
+  for (const [k, b] of perQuote) {
+    const key = k.slice(0, k.lastIndexOf('|'));
+    const cur = bestByKey.get(key);
+    if (!cur || b.depthUsd > cur.depthUsd) bestByKey.set(key, b);
+  }
 
-  const uw = bestByKey.get('__USDC');
-  if (!uw) throw new Error('Could not find a USDC/WETH Uniswap v3 pool');
-  const usdcWeth = mkPool(ADDR.usdc, ADDR.weth, USDC_DECIMALS, 18, uw.fee, uw.pool);
-  log(`USDC/WETH pool ${uw.pool} fee ${uw.fee / 1e4}% depth ${uw.wethBal.toFixed(0)} WETH`);
-
-  const minDepth = (t: TokenCfg) => (mustInclude.includes(t.symbol) ? 0 : t.core ? TOKENS.corePoolWeth : TOKENS.minPoolWeth);
+  const minDepth = (t: TokenCfg) => (mustInclude.includes(t.symbol) ? 0 : t.core ? TOKENS.corePoolUsd : TOKENS.minPoolUsd);
   const withPool = candidates.filter((t) => t.address === ADDR.weth || bestByKey.has(t.symbol));
-  let deep = withPool.filter((t) => t.address === ADDR.weth || bestByKey.get(t.symbol)!.wethBal >= minDepth(t));
+  let deep = withPool.filter((t) => t.address === ADDR.weth || bestByKey.get(t.symbol)!.depthUsd >= minDepth(t));
   for (const t of candidates.filter((c) => c.core && !deep.includes(c))) {
-    excluded.push({ symbol: t.symbol, reason: `no Uniswap v3 WETH pool with >= ${TOKENS.corePoolWeth} WETH depth` });
+    excluded.push({ symbol: t.symbol, reason: `no Uniswap v3 pool with >= $${TOKENS.corePoolUsd} depth` });
   }
   const longTail = deep.filter((t) => !t.core && !mustInclude.includes(t.symbol))
-    .sort((x, y) => bestByKey.get(y.symbol)!.wethBal - bestByKey.get(x.symbol)!.wethBal);
+    .sort((x, y) => bestByKey.get(y.symbol)!.depthUsd - bestByKey.get(x.symbol)!.depthUsd);
   const dropped = new Set(longTail.slice(TOKENS.maxTokens).map((t) => t.symbol));
   deep = deep.filter((t) => !dropped.has(t.symbol));
   const deepCount = deep.length;
@@ -187,22 +210,30 @@ export async function discoverMarkets(
     verified.push({ ...t, decimals: d });
   });
 
-  const tokens: TokenMarket[] = verified.map((t) => {
+  const tokens: TokenMarket[] = verified.map((t): TokenMarket => {
     if (t.address === ADDR.weth) {
       return {
-        token: t, pool: null,
+        token: t, pool: null, quote: 'USDC',
         buyPath: encodePacked(['address', 'uint24', 'address'], [ADDR.usdc, usdcWeth.fee, ADDR.weth]),
         sellPath: encodePacked(['address', 'uint24', 'address'], [ADDR.weth, usdcWeth.fee, ADDR.usdc]),
-        hops: 1, poolFeePct: usdcWeth.fee / 1e6, wethDepth: uw.wethBal,
+        hops: 1, poolFeePct: usdcWeth.fee / 1e6, depthUsd: uwBest.wethBal * ethUsd, wethDepth: uwBest.wethBal,
       };
     }
     const b = bestByKey.get(t.symbol)!;
+    if (b.quote === 'USDC') {
+      // direct TOKEN/USDC pool: one hop, cheaper gas
+      return {
+        token: t, pool: mkPool(t.address, ADDR.usdc, t.decimals, USDC_DECIMALS, b.fee, b.pool), quote: 'USDC',
+        buyPath: encodePacked(['address', 'uint24', 'address'], [ADDR.usdc, b.fee, t.address]),
+        sellPath: encodePacked(['address', 'uint24', 'address'], [t.address, b.fee, ADDR.usdc]),
+        hops: 1, poolFeePct: b.fee / 1e6, depthUsd: b.depthUsd, wethDepth: b.depthUsd / ethUsd,
+      };
+    }
     return {
-      token: t,
-      pool: mkPool(t.address, ADDR.weth, t.decimals, 18, b.fee, b.pool),
+      token: t, pool: mkPool(t.address, ADDR.weth, t.decimals, 18, b.fee, b.pool), quote: 'WETH',
       buyPath: encodePacked(['address', 'uint24', 'address', 'uint24', 'address'], [ADDR.usdc, usdcWeth.fee, ADDR.weth, b.fee, t.address]),
       sellPath: encodePacked(['address', 'uint24', 'address', 'uint24', 'address'], [t.address, b.fee, ADDR.weth, usdcWeth.fee, ADDR.usdc]),
-      hops: 2, poolFeePct: (usdcWeth.fee + b.fee) / 1e6, wethDepth: b.wethBal,
+      hops: 2, poolFeePct: (usdcWeth.fee + b.fee) / 1e6, depthUsd: b.depthUsd, wethDepth: b.depthUsd / ethUsd,
     };
   });
 
@@ -213,7 +244,7 @@ export async function discoverMarkets(
     const verdicts = await runPool(tokens, 4, async (t) => {
       if (t.token.core || !t.pool) return { ok: true, reason: 'core' };
       for (let attempt = 0; attempt < 2; attempt++) {
-        try { return await roundTripCheck(t, parseEther('0.05')); } catch { await new Promise((r) => setTimeout(r, 1500)); }
+        try { return await roundTripCheck(t, parseEther('0.05'), usdcWeth.fee); } catch { await new Promise((r) => setTimeout(r, 1500)); }
       }
       return { ok: false, reason: 'safety simulation unavailable (RPC)' };
     });
@@ -227,18 +258,19 @@ export async function discoverMarkets(
   }
 
   for (const t of kept.filter((x) => x.token.core && x.pool)) {
-    log(`${t.token.symbol}/WETH pool ${t.pool!.address} fee ${t.pool!.fee / 1e4}% depth ${t.wethDepth.toFixed(0)} WETH`);
+    log(`${t.token.symbol}/${t.quote} pool ${t.pool!.address} fee ${t.pool!.fee / 1e4}% depth $${(t.depthUsd / 1000).toFixed(0)}k`);
   }
   const stats: MarketStats = {
     candidates: candidates.length, withPool: withPool.length, deepEnough: deepCount, safetyRejected, scanned: kept.length,
   };
-  log(`Universe: ${kept.length} tokens tradeable (from ${stats.candidates} candidates: ${stats.withPool} have a v3 WETH pool, ` +
-    `${stats.deepEnough} deep enough, ${stats.safetyRejected} failed the honeypot/tax check)`);
+  log(`Universe: ${kept.length} tokens tradeable (from ${stats.candidates} candidates: ${stats.withPool} have a v3 WETH/USDC pool, ` +
+    `${stats.deepEnough} deep enough, ${stats.safetyRejected} failed the honeypot/tax check; ` +
+    `${kept.filter((x) => x.quote === 'USDC' && x.pool).length} trade via USDC pools)`);
   for (const e of excluded.filter((x) => candidates.find((c) => c.symbol === x.symbol)?.core)) log(`Excluded ${e.symbol}: ${e.reason}`);
   return { usdcWeth, tokens: kept, excluded, stats, discoveredAt: Date.now() };
 }
 
-const MARKET_CACHE_VERSION = 2; // bump when token keys or the entry format change
+const MARKET_CACHE_VERSION = 3; // bump when token keys or the entry format change
 
 export function saveMarketCache(m: MarketInfo) {
   try {
@@ -295,7 +327,7 @@ export async function snapshot(m: MarketInfo, wallet?: Address, blockNumber?: bi
   m.tokens.forEach((t, i) => {
     if (!t.pool) { prices[t.token.symbol] = usdcPerWeth; return; }
     if (r[3 + i].status !== 'success') return; // pool did not exist at this block
-    const p = priceIn(t.pool, r[3 + i].result[0] as bigint, t.token.address) * usdcPerWeth;
+    const p = priceIn(t.pool, r[3 + i].result[0] as bigint, t.token.address) * (t.quote === 'USDC' ? 1 : usdcPerWeth);
     if (Number.isFinite(p) && p > 0) prices[t.token.symbol] = p;
   });
 

@@ -38,8 +38,6 @@ function portfolioView(pf: PortfolioState) {
   const snap = engine.snap;
   const equity = snap ? engine.equity(pf, snap) : pf.cashUsd;
   const netPnl = pf.kind === 'paper' ? equity - pf.netDepositsUsd : equity - pf.netDepositsUsd - pf.gasSpentUsd;
-  const pos = pf.position;
-  const price = pos && snap ? snap.prices[pos.symbol] : undefined;
   return {
     kind: pf.kind,
     equity,
@@ -53,9 +51,11 @@ function portfolioView(pf: PortfolioState) {
     pausedUntil: pf.pausedUntil,
     lastDecision: pf.lastDecision,
     cooldowns: Object.fromEntries(Object.entries(pf.cooldowns).filter(([, t]) => t > Date.now())),
-    position: pos
-      ? { ...pos, price, valueUsd: price ? pos.qty * price : null, pnlPct: price ? price / pos.breakevenPrice - 1 : null }
-      : null,
+    positions: pf.positions.map((pos) => {
+      const price = snap ? snap.prices[pos.symbol] : undefined;
+      return { ...pos, price, valueUsd: price ? pos.qty * price : null, pnlPct: price ? price / pos.breakevenPrice - 1 : null, ml: engine.mlScores[pos.symbol] ?? null };
+    }),
+    maxPositions: RISK.maxPositions,
     trades: pf.trades.slice(-60).reverse(),
     equityHistory: downsample(pf.equityHistory, 300),
   };
@@ -116,22 +116,41 @@ app.get('/api/state', (_req, res) => {
     paper: portfolioView(engine.state.paper),
     live: portfolioView(engine.state.live),
     backtest: engine.backtest,
+    signals: {
+      mode: engine.mlActive ? 'ml' : 'rules',
+      mlThreshold: engine.mlThreshold,
+      researching: engine.researching,
+      ranAt: engine.research?.ranAt ?? null,
+      ml: engine.research ? { ...engine.research.ml, rulesOos: slimBt(engine.research.ml.rulesOos), mlOos: slimBt(engine.research.ml.mlOos) } : null,
+    },
     events: engine.events.slice(-150).reverse(),
     params: { risk: RISK, strategy: STRATEGY, tokens: TOKENS },
   });
 });
 
-/** Held tokens first, then buy signals, then the strongest scores — enough rows for the dashboard. */
+function slimBt(b: { equity: unknown; tradeList: unknown } | null) {
+  return b ? { ...b, tradeList: undefined } : null;
+}
+
+/** Held tokens first, then buy signals (rules or ML), then the strongest scores — enough rows for the dashboard. */
 function topAnalyses() {
-  const held = new Set([engine.state.paper.position?.symbol, engine.state.live.position?.symbol].filter(Boolean));
+  const held = new Set([...engine.state.paper.positions, ...engine.state.live.positions].map((p) => p.symbol));
   const byKey = new Map((engine.market?.tokens ?? []).map((t) => [t.token.symbol, t]));
-  const rank = (a: (typeof engine.analyses)[number]) => (held.has(a.symbol) ? 2e9 : a.eligible ? 1e9 : 0) + (Number.isFinite(a.score) ? a.score : -1e6);
+  const ml = engine.mlScores;
+  const signal = (a: (typeof engine.analyses)[number]) =>
+    engine.mlActive ? (ml[a.symbol] ?? 0) >= engine.mlThreshold : a.eligible && engine.regime.riskOn;
+  const strength = (a: (typeof engine.analyses)[number]) =>
+    engine.mlActive ? (ml[a.symbol] ?? 0) : Number.isFinite(a.score) ? a.score : -1e6;
+  const rank = (a: (typeof engine.analyses)[number]) => (held.has(a.symbol) ? 2e9 : signal(a) ? 1e9 : 0) + strength(a);
   return [...engine.analyses]
     .sort((x, y) => rank(y) - rank(x))
     .slice(0, 30)
     .map((a) => {
       const t = byKey.get(a.symbol);
-      return { ...a, address: t?.token.address, core: t?.token.core ?? false, name: t?.token.name, wethDepth: t?.wethDepth, poolFeePct: t?.poolFeePct };
+      return {
+        ...a, ml: ml[a.symbol] ?? null, address: t?.token.address, core: t?.token.core ?? false, name: t?.token.name,
+        depthUsd: t?.depthUsd, quote: t?.quote, poolFeePct: t?.poolFeePct,
+      };
     });
 }
 
@@ -152,7 +171,7 @@ app.post('/api/disarm', (_req, res) => { engine.disarm(); res.json({ ok: true })
 app.post('/api/pause', (req, res) => { engine.setPaused(!!req.body?.paused); res.json({ ok: true }); });
 app.post('/api/resume', (req, res) => { engine.resume(kindOf(req)); res.json({ ok: true }); });
 app.post('/api/paper/reset', (_req, res) => { engine.resetPaper(); res.json({ ok: true }); });
-app.post('/api/backtest', (_req, res) => { engine.runBacktestNow(); res.json({ ok: true }); });
+app.post('/api/backtest', (_req, res) => { void engine.runResearchNow(); res.json({ ok: true }); });
 app.post('/api/panic', async (req, res) => {
   try {
     await engine.panic(kindOf(req));

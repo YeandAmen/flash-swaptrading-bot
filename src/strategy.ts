@@ -2,14 +2,17 @@ import { STRATEGY as S } from './config.js';
 import type { Position } from './types.js';
 
 // ---------------------------------------------------------------- indicators
-export function emaLast(values: number[], period: number): number {
+/** Plain arrays or typed-array views (the backtest passes zero-copy Float64Array windows). */
+export type Closes = ArrayLike<number> & { slice(start?: number, end?: number): ArrayLike<number> };
+
+export function emaLast(values: ArrayLike<number>, period: number): number {
   const k = 2 / (period + 1);
   let e = values[0];
   for (let i = 1; i < values.length; i++) e = values[i] * k + e * (1 - k);
   return e;
 }
 
-export function rsiLast(values: number[], period: number): number {
+export function rsiLast(values: ArrayLike<number>, period: number): number {
   if (values.length <= period) return 50;
   let gain = 0;
   let loss = 0;
@@ -28,10 +31,15 @@ export function rsiLast(values: number[], period: number): number {
   return 100 - 100 / (1 + gain / loss);
 }
 
-export function stdev(arr: number[]): number {
-  if (arr.length < 2) return 0;
-  const m = arr.reduce((s, x) => s + x, 0) / arr.length;
-  return Math.sqrt(arr.reduce((s, x) => s + (x - m) ** 2, 0) / (arr.length - 1));
+export function stdev(arr: ArrayLike<number>): number {
+  const n = arr.length;
+  if (n < 2) return 0;
+  let m = 0;
+  for (let i = 0; i < n; i++) m += arr[i];
+  m /= n;
+  let v = 0;
+  for (let i = 0; i < n; i++) v += (arr[i] - m) ** 2;
+  return Math.sqrt(v / (n - 1));
 }
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
@@ -65,7 +73,7 @@ export const ANALYSIS_WINDOW = S.emaLong * 3 + 30;
  * `minBars`: history required before the token may be bought (longer for non-core tokens).
  * `totalBars`: full history length when `closes` is only the trailing window.
  */
-export function analyze(symbol: string, closes: number[], minBars: number = S.minBars, totalBars?: number): Analysis {
+export function analyze(symbol: string, closes: Closes, minBars: number = S.minBars, totalBars?: number): Analysis {
   const n = closes.length;
   const have = totalBars ?? n;
   const price = closes[n - 1] ?? 0;

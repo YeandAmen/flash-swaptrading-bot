@@ -31,17 +31,25 @@ export interface SafetyResult {
  * (state override gives the simulator WETH + router allowance). Catches tokens that can't be sold, transfer taxes,
  * blacklists and trading switches. Read-only: nothing is sent to the chain.
  */
-export async function roundTripCheck(t: TokenMarket, wethIn: bigint): Promise<SafetyResult> {
+export async function roundTripCheck(t: TokenMarket, wethIn: bigint, usdcWethFee: number): Promise<SafetyResult> {
   if (!t.pool) return { ok: true, roundTripLossPct: 0, hiddenCostPct: 0, reason: 'WETH itself' };
   const fee = t.pool.fee;
   const token = t.token.address;
+  // WETH-quoted: WETH -> TOKEN -> WETH. USDC-quoted: WETH -> USDC -> TOKEN -> USDC -> WETH (same WETH override works)
+  const viaUsdc = t.quote === 'USDC';
+  const buyPath = viaUsdc
+    ? encodePacked(['address', 'uint24', 'address', 'uint24', 'address'], [ADDR.weth, usdcWethFee, ADDR.usdc, fee, token])
+    : encodePacked(['address', 'uint24', 'address'], [ADDR.weth, fee, token]);
+  const sellPath = viaUsdc
+    ? encodePacked(['address', 'uint24', 'address', 'uint24', 'address'], [token, fee, ADDR.usdc, usdcWethFee, ADDR.weth])
+    : encodePacked(['address', 'uint24', 'address'], [token, fee, ADDR.weth]);
   const buy = encodeFunctionData({
     abi: swapRouter02Abi, functionName: 'exactInput',
-    args: [{ path: encodePacked(['address', 'uint24', 'address'], [ADDR.weth, fee, token]), recipient: ADDRESS_THIS, amountIn: wethIn, amountOutMinimum: 0n }],
+    args: [{ path: buyPath, recipient: ADDRESS_THIS, amountIn: wethIn, amountOutMinimum: 0n }],
   });
   const sell = encodeFunctionData({
     abi: swapRouter02Abi, functionName: 'exactInput',
-    args: [{ path: encodePacked(['address', 'uint24', 'address'], [token, fee, ADDR.weth]), recipient: SIM, amountIn: CONTRACT_BALANCE, amountOutMinimum: 0n }],
+    args: [{ path: sellPath, recipient: SIM, amountIn: CONTRACT_BALANCE, amountOutMinimum: 0n }],
   });
   const data = encodeFunctionData({ abi: swapRouter02Abi, functionName: 'multicall', args: [BigInt(Math.floor(Date.now() / 1000) + 900), [buy, sell]] });
   const amount = pad(toHex(wethIn), { size: 32 });
@@ -62,7 +70,8 @@ export async function roundTripCheck(t: TokenMarket, wethIn: bigint): Promise<Sa
     const results = decodeFunctionResult({ abi: swapRouter02Abi, functionName: 'multicall', data: res.data }) as readonly Hex[];
     const [wethBack] = decodeAbiParameters([{ type: 'uint256' }], results[1]);
     const loss = 1 - Number(wethBack) / Number(wethIn);
-    const fees = 1 - (1 - fee / 1e6) ** 2;
+    const oneWay = (1 - fee / 1e6) * (viaUsdc ? 1 - usdcWethFee / 1e6 : 1);
+    const fees = 1 - oneWay ** 2;
     const hidden = loss - fees;
     if (wethBack === 0n) return { ok: false, roundTripLossPct: 1, hiddenCostPct: 1, reason: 'sell returns nothing (honeypot)' };
     if (hidden > TOKENS.maxRoundTripTaxPct) {

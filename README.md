@@ -11,7 +11,7 @@ Ethereum mainnet pe ERC-20 tokens ko **Uniswap v3** pe USDC ke against trade kar
 
 ## Sab tokens (TOKEN_MODE=all)
 Bot sirf 6 fixed tokens nahi dekhta. Ye **saare listed Ethereum tokens** scan karta hai (CoinGecko + Uniswap token lists, ~5,400 tokens), lekin trade sirf wahi hote hain jo ye checks pass karein:
-1. **Liquidity:** token ka Uniswap v3 WETH pool kam se kam 50 WETH (~$90k) gehra ho. Abhi ~84 tokens ye pass karte hain.
+1. **Liquidity:** token ka Uniswap v3 pool (WETH ya USDC ke saath) kam se kam $30k gehra ho. Abhi ~200 tokens ye pass karte hain. Jinka gehra pool USDC ke saath hai, wo seedha USDC→token trade hote hain (1 hop, kam gas).
 2. **Honeypot / hidden tax:** buy→sell ka simulation chain pe hota hai (koi transaction nahi bhejta). Token bech na sake, ya round-trip loss pool fees se 2% zyada ho, to reject. Ye check **har buy se theek pehle dobara** chalta hai.
 3. **History:** naye tokens ke paas kam se kam 14 din ki price history honi chahiye. Isse fresh pump-and-dump se bachav hota hai.
 4. **Stablecoins / pegged assets** (USDT, DAI, stETH…) skip hote hain, kyunki unme trend nahi hota.
@@ -34,7 +34,19 @@ Jab wallet mein ETH kam ho (< 0.0015 ETH), bot **USDC se ~$3 ka ETH khud kharid 
 2. Bot wallet pe **Ethereum mainnet (ERC-20 network)** se bhejo: **USDC**, aur pehli baar **~0.001 ETH**.
 3. Dashboard pe **Arm live trading** karo (`LIVE` type karke).
 
-## Bot ka dimaag
+## AI signal model (intelligent-trading-bot se inspired)
+[asavinov/intelligent-trading-bot](https://github.com/asavinov/intelligent-trading-bot) jaisi pipeline, TypeScript mein:
+1. **Features:** har token-hour ke 21 features: 1h–7d returns (volatility se normalised), volatility, EMA20/50/200 se doori, RSI, 72h/168h high-low se doori, ETH ke against strength, aur ETH ka market regime.
+2. **Labels:** kya price agle 48 ghante mein +1R (stop jitna upar) pehle chhuega ya −1R pehle.
+3. **Model:** L2 logistic regression, sab tokens ka data milake (`src/ml.ts`).
+4. **Walk-forward test:** har 3 din ke data pe model sirf purane data se dobara train hota hai, aur agle din ke unseen data pe test hota hai (ITB ke `predict_rolling` jaisa).
+5. **Gate (`ML_MODE=auto`):** AI tabhi buy decide karta hai jab unseen data pe uska AUC ≥ 0.55 ho **aur** wo rules aur USDC hold karne, dono se behtar raha ho. Warna rules chalte hain. `ML_MODE=on` forcibly on karta hai, `off` band.
+6. Model har 6 ghante mein dobara train hota hai. Dashboard ke "AI signal model" card mein AUC, alag-alag thresholds ke results aur sabse strong features dikhte hain.
+
+## Ek saath kai tokens
+Bot ek saath **3 tokens tak** hold kar sakta hai (`MAX_POSITIONS`), har ek mein max 45% equity (`MAX_POSITION_PCT`). Har position ka apna stop-loss, target aur trailing stop hota hai. Har ghante max ek nayi entry.
+
+## Bot ka dimaag (rules)
 - **Market filter:** ETH apne 200-hour EMA ke upar ho aur wo EMA khud upar ja raha ho. Tabhi koi bhi buy hota hai. Bear market mein bot USDC mein baitha rehta hai.
 - **Token chunna:** uptrend (price > EMA20 > EMA50, aur EMA200 ke upar), 3-din ka volatility-adjusted momentum ≥ 0.75σ, RSI 45–72, aur daily volatility ≥ 1.5%. Sabse strong token chuna jata hai.
 - **Cost check:** asli Uniswap quote aur gas se round-trip cost nikalta hai. Target move cost ka 3 guna na ho to trade nahi.
@@ -65,12 +77,21 @@ npm run backtest            # strategy ko history pe chalao
 npm run fork-test           # live path ka test, mainnet fork pe nakli paise se
 ```
 
+## GitHub (private repo)
+Code yahan save hai: **https://github.com/cutiapreta/eth-token-bot** (private). `.env` (Alchemy key) aur `data/` kabhi commit nahi hote (`.gitignore`). Private key Keychain mein hai, repo mein nahi.
+
+Is Mac pe SSH key (`~/.ssh/id_ed25519`) GitHub se judi hai, to aage changes save karne ke liye:
+```bash
+git add -A && git commit -m "kya badla" && git push
+```
+
 ## Settings (`.env`)
 - **Risk:** `RISK_PER_TRADE_PCT`, `MAX_SLIPPAGE_BPS`, `MAX_ENTRY_GAS_GWEI`, `DAILY_LOSS_LIMIT_PCT`, `MAX_DRAWDOWN_PCT`, `MIN_GAS_ETH`, `APPROVAL_MODE`
+- **Positions / AI:** `MAX_POSITIONS` (default 3), `MAX_POSITION_PCT` (0.45), `ML_MODE` (`auto`/`on`/`off`), `ML_MIN_AUC` (0.55)
 - **Tokens:**
   - `TOKEN_MODE` (`all` ya `core`)
-  - `MIN_POOL_WETH` (default 50)
-  - `MAX_TOKENS` (default 250)
+  - `MIN_POOL_USD` (default 30000)
+  - `MAX_TOKENS` (default 300)
   - `MIN_HISTORY_DAYS` (default 14)
   - `MAX_ROUNDTRIP_TAX_PCT` (default 0.02)
   - `LONGTAIL_MAX_ALLOC_PCT` (default 0.5)
@@ -91,6 +112,8 @@ Galat value hogi to bot start hi nahi hoga (safety ke liye). Koi bhi setting bad
 |---|---|
 | `src/engine.ts` | main loop, decisions, deposit detection, gas top-up, risk limits |
 | `src/strategy.ts` | indicators, entry/exit rules |
+| `src/ml.ts` | AI features, labels, logistic regression, walk-forward |
+| `src/backtest.ts` | multi-position simulator, research + AI gate |
 | `src/tokens.ts` | token lists se candidates |
 | `src/safety.ts` | honeypot / hidden-tax simulation |
 | `src/market.ts` | pool discovery, prices, history |

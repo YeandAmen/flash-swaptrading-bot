@@ -34,7 +34,9 @@ export interface Trade {
 export interface PortfolioState {
   kind: 'paper' | 'live';
   cashUsd: number;
-  position: Position | null;
+  positions: Position[];
+  /** @deprecated single-position state from older versions; migrated into `positions` on load (do not use) */
+  position?: never | null;
   trades: Trade[];
   equityHistory: [number, number][];
   peakEquity: number;
@@ -61,7 +63,7 @@ export interface BotEvent {
 export const newPortfolio = (kind: 'paper' | 'live', cash: number): PortfolioState => ({
   kind,
   cashUsd: cash,
-  position: null,
+  positions: [],
   trades: [],
   equityHistory: [],
   peakEquity: cash,
@@ -78,3 +80,10 @@ export const newPortfolio = (kind: 'paper' | 'live', cash: number): PortfolioSta
   pausedUntil: null,
   lastDecision: 'Starting up',
 });
+
+/** Upgrade a portfolio saved by an older version (single `position`) to `positions[]`. */
+export function migratePortfolio(pf: PortfolioState): PortfolioState {
+  if (!Array.isArray(pf.positions)) pf.positions = pf.position ? [pf.position] : [];
+  delete pf.position;
+  return pf;
+}

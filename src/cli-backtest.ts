@@ -1,12 +1,14 @@
 // Usage: npm run build && npm run backtest
-// Builds the token universe (or reuses today's cache), backfills on-chain hourly history and replays the strategy with real costs.
+// Builds the token universe (or reuses today's cache), backfills on-chain hourly history, backtests the rules and
+// trains + walk-forward-evaluates the ML model exactly like the live bot does.
 import { CONFIG, STRATEGY, TOKENS } from './config.js';
-import { runBacktest } from './backtest.js';
+import { runResearch, type BacktestResult } from './backtest.js';
 import { discoverMarkets, History, loadMarketCache, saveMarketCache, snapshot } from './market.js';
 import { analyze, ANALYSIS_WINDOW, marketRegime } from './strategy.js';
 import { loadCandidates } from './tokens.js';
 
 const log = (m: string) => console.log(m);
+const pct = (x: number) => `${(x * 100).toFixed(2)}%`;
 let market = loadMarketCache(TOKENS.refreshHours * 3_600_000);
 if (market) log(`Using cached token universe (${market.tokens.length} tokens)`);
 else {
@@ -31,15 +33,27 @@ const analyses = market.tokens.map((t) => {
 });
 const regime = marketRegime(analyses.find((a) => a.symbol === 'WETH'));
 log(`\nRegime: ${regime.riskOn ? 'RISK-ON' : 'RISK-OFF'} (${regime.reason})`);
-log(`Eligible now: ${analyses.filter((a) => a.eligible).map((a) => a.symbol).join(', ') || 'none'}`);
-log('Top 15 by score:');
-for (const a of [...analyses].sort((x, y) => y.score - x.score).slice(0, 15)) {
-  log(`  ${a.symbol.padEnd(14)} bars ${String(a.bars).padStart(4)} trend ${a.trend.padEnd(4)} mom ${a.momentum.toFixed(2)}σ RSI ${a.rsi.toFixed(0)} dVol ${(a.dailyVol * 100).toFixed(1)}% ${a.eligible ? 'ELIGIBLE' : '- ' + a.reasons.slice(0, 2).join('; ')}`);
-}
+log(`Rule signals now: ${analyses.filter((a) => a.eligible).map((a) => a.symbol).join(', ') || 'none'}`);
 
 const t0 = Date.now();
-const r = runBacktest(h, market, CONFIG.paperStartUsd, snap.baseFeeGwei + snap.tipGwei, snap.ethUsd);
-log(`\nBacktest ${new Date(r.from).toISOString().slice(0, 10)} -> ${new Date(r.to).toISOString().slice(0, 10)} (${r.hours}h, ${market.tokens.length} tokens, ran in ${Date.now() - t0}ms)`);
-log(`  $${r.startUsd} -> $${r.endUsd.toFixed(2)} (${(r.returnPct * 100).toFixed(2)}%), ETH hold ${(r.ethHoldPct * 100).toFixed(2)}%`);
-log(`  trades ${r.trades}, win rate ${(r.winRate * 100).toFixed(0)}%, max DD ${(r.maxDrawdownPct * 100).toFixed(2)}%, gas $${r.gasPaidUsd.toFixed(2)}`);
-for (const t of r.tradeList) log(`  ${new Date(t.t).toISOString().slice(0, 16)} ${t.side.padEnd(4)} ${t.symbol.padEnd(14)} @ ${t.price.toPrecision(6)} $${t.usd.toFixed(2)} ${t.pnlUsd !== undefined ? 'pnl $' + t.pnlUsd.toFixed(2) : ''} ${t.reason}`);
+const gasNow = snap.baseFeeGwei + snap.tipGwei;
+const show = (b: BacktestResult | null) => {
+  if (!b) return;
+  log(`  ${b.label.padEnd(22)} $${b.startUsd} -> $${b.endUsd.toFixed(2)} (${pct(b.returnPct)}) | ETH ${pct(b.ethHoldPct)} | trades ${b.trades}, win ${(b.winRate * 100).toFixed(0)}%, max DD ${pct(b.maxDrawdownPct)}, gas $${b.gasPaidUsd.toFixed(2)}`);
+};
+for (const g of [gasNow, 0.3]) {
+  const r = await runResearch(h, market, g, snap.ethUsd, CONFIG.paperStartUsd);
+  log(`\n=== gas ${g.toPrecision(2)} gwei (${g === gasNow ? 'now' : 'cheap-gas scenario'}) — ${((Date.now() - t0) / 1000).toFixed(0)}s ===`);
+  show(r.rules);
+  const m = r.ml;
+  log(`  ML walk-forward: AUC ${m.auc === null ? 'n/a' : m.auc.toFixed(3)} on ${m.oosRows} unseen token-hours (base rate ${m.baseRate === null ? 'n/a' : pct(m.baseRate)}), ${m.folds} re-trains, out-of-sample from ${new Date(m.oosFrom).toISOString().slice(0, 10)}`);
+  show(m.rulesOos);
+  for (const x of m.thresholds) log(`  ML p≥${x.threshold}`.padEnd(25) + `${pct(x.returnPct)} | trades ${x.trades} | max DD ${pct(x.maxDrawdownPct)}`);
+  log(`  → ${m.active ? 'ML ACTIVE' : 'rules stay in charge'}: ${m.reason}`);
+  if (g === gasNow) {
+    log(`  Top features: ${m.importance.map((f) => `${f.name} ${f.weight >= 0 ? '+' : ''}${f.weight.toFixed(2)}`).join(', ')}`);
+    for (const t of (m.active ? m.mlOos : r.rules)?.tradeList.slice(-12) ?? []) {
+      log(`    ${new Date(t.t).toISOString().slice(0, 16)} ${t.side.padEnd(4)} ${t.symbol.padEnd(14)} @ ${t.price.toPrecision(6)} $${t.usd.toFixed(2)} ${t.pnlUsd !== undefined ? 'pnl $' + t.pnlUsd.toFixed(2) : ''} ${t.reason}`);
+    }
+  }
+}

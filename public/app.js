@@ -31,10 +31,10 @@ async function refresh() {
   }
 }
 
-function posBox(p) {
-  if (!p) return '<div class="posbox sub">No open position — holding USDC</div>';
-  return `<div class="posbox"><b>${esc(p.symbol)}</b> ${p.qty.toPrecision(5)} · value ${usd(p.valueUsd)} · <span class="${cls(p.pnlPct)}">${pct(p.pnlPct)}</span> vs breakeven
-    <div class="sub">entry ${price(p.entryMid)} · stop ${price(p.stopPrice)}${p.trailActive ? ' (trailing)' : ''} · target ${price(p.targetPrice)} · since ${time(p.entryTime)}</div></div>`;
+function posList(list, max) {
+  if (!list || !list.length) return `<div class="posbox sub">No open positions — holding USDC (up to ${max || 1} at once)</div>`;
+  return list.map((p) => `<div class="posbox"><b>${esc(p.symbol)}</b> ${p.qty.toPrecision(5)} · value ${usd(p.valueUsd)} · <span class="${cls(p.pnlPct)}">${pct(p.pnlPct)}</span> vs breakeven${p.ml != null ? ` · AI ${(p.ml * 100).toFixed(0)}%` : ''}
+    <div class="sub">entry ${price(p.entryMid)} · stop ${price(p.stopPrice)}${p.trailActive ? ' (trailing)' : ''} · target ${price(p.targetPrice)} · since ${time(p.entryTime)}</div></div>`).join('');
 }
 
 function render() {
@@ -93,7 +93,7 @@ function render() {
   const L = S.live;
   $('lEq').textContent = usd(L.equity);
   $('lPnl').innerHTML = L.netDepositsUsd > 0 ? `Net P&amp;L <span class="${cls(L.netPnlUsd)}">${usd(L.netPnlUsd)} (${pct(L.netPnlPct)})</span> after gas` : 'No deposits yet';
-  $('lPos').innerHTML = posBox(L.position);
+  $('lPos').innerHTML = posList(L.positions, L.maxPositions);
   $('lDep').textContent = usd(L.netDepositsUsd);
   $('lReal').innerHTML = `<span class="${cls(L.realizedPnlUsd)}">${usd(L.realizedPnlUsd)}</span>`;
   $('lGas').textContent = usd(L.gasSpentUsd);
@@ -104,7 +104,7 @@ function render() {
   const P = S.paper;
   $('pEq').textContent = usd(P.equity);
   $('pPnl').innerHTML = `Net P&amp;L <span class="${cls(P.netPnlUsd)}">${usd(P.netPnlUsd)} (${pct(P.netPnlPct)})</span> from ${usd(P.netDepositsUsd)}`;
-  $('pPos').innerHTML = posBox(P.position);
+  $('pPos').innerHTML = posList(P.positions, P.maxPositions);
   $('pReal').innerHTML = `<span class="${cls(P.realizedPnlUsd)}">${usd(P.realizedPnlUsd)}</span>`;
   $('pGas').textContent = usd(P.gasSpentUsd);
   $('pTrades').textContent = P.trades.length;
@@ -112,13 +112,16 @@ function render() {
 
   // brain
   $('regime').innerHTML = `Market: <span class="${S.regime.riskOn ? 'pos' : 'amb'}">${S.regime.riskOn ? 'RISK-ON' : 'RISK-OFF'}</span> — ${esc(S.regime.reason)}`;
-  const heldSet = new Set([P.position && P.position.symbol, L.position && L.position.symbol].filter(Boolean));
+  const heldSet = new Set([...(P.positions || []), ...(L.positions || [])].map((p) => p.symbol));
+  const SG = S.signals || {};
+  const mlMode = SG.mode === 'ml';
   const U = S.universe;
   if (U) {
     const st = U.stats || {};
-    $('uniStats').textContent = `Scanning ${U.scanned} tokens (${U.core} core + ${U.scanned - U.core} from token lists) · ` +
-      `${U.eligible} with a buy signal · ${U.warming} still collecting history · ` +
-      `${st.safetyRejected ?? 0} rejected by the honeypot/tax check · from ${st.candidates ?? '?'} listed tokens (${st.withPool ?? '?'} with a Uniswap v3 WETH pool)` +
+    $('uniStats').textContent = `Signals: ${mlMode ? `AI model (buys when probability ≥ ${(SG.mlThreshold * 100).toFixed(0)}%)` : 'rules'} · ` +
+      `Scanning ${U.scanned} tokens (${U.core} core + ${U.scanned - U.core} from token lists) · ` +
+      `${U.eligible} with a rule signal · ${U.warming} still collecting history · ` +
+      `${st.safetyRejected ?? 0} rejected by the honeypot/tax check · from ${st.candidates ?? '?'} listed tokens (${st.withPool ?? '?'} with a Uniswap v3 pool)` +
       (U.refreshing ? ' · refreshing universe…' : ` · refreshed ${time(U.discoveredAt)}`);
     $('rejected').innerHTML = (U.excluded || []).length
       ? U.excluded.map((e) => `<div><b>${esc(e.symbol)}</b> — ${esc(e.reason)}</div>`).join('')
@@ -131,11 +134,14 @@ function render() {
   };
   $('anaBody').innerHTML = (S.analyses || []).map((a) => {
     let decision;
+    const aiOk = a.ml != null && a.ml >= SG.mlThreshold;
     if (heldSet.has(a.symbol)) decision = '<span class="tag buy">HOLDING</span>';
-    else if (a.eligible && S.regime.riskOn) decision = '<span class="tag buy">BUY SIGNAL</span>';
-    else if (a.eligible) decision = '<span class="tag sell">SIGNAL, MARKET RISK-OFF</span>';
-    else decision = '<span class="why">' + esc(a.reasons.join(' · ')) + '</span>';
-    return `<tr><td>${symCell(a)}</td><td class="r">${price(a.price)}</td><td class="r ${cls(a.change24h)}">${pct(a.change24h, 1)}</td>
+    else if (mlMode && aiOk) decision = '<span class="tag buy">AI BUY SIGNAL</span>';
+    else if (!mlMode && a.eligible && S.regime.riskOn) decision = '<span class="tag buy">BUY SIGNAL</span>';
+    else if (!mlMode && a.eligible) decision = '<span class="tag sell">SIGNAL, MARKET RISK-OFF</span>';
+    else decision = '<span class="why">' + esc((mlMode ? [`AI ${a.ml == null ? 'n/a' : (a.ml * 100).toFixed(0) + '%'} < ${(SG.mlThreshold * 100).toFixed(0)}%`] : a.reasons).join(' · ')) + '</span>';
+    const aiCell = a.ml == null ? '–' : `<span class="${aiOk ? 'pos' : ''}">${(a.ml * 100).toFixed(0)}%</span>`;
+    return `<tr><td>${symCell(a)}</td><td class="r">${aiCell}</td><td class="r">${price(a.price)}</td><td class="r ${cls(a.change24h)}">${pct(a.change24h, 1)}</td>
       <td><span class="tag ${a.trend}">${a.trend}</span></td><td class="r">${a.momentum.toFixed(2)}σ</td><td class="r">${a.rsi.toFixed(0)}</td>
       <td class="r">${(a.dailyVol * 100).toFixed(1)}%</td><td class="r">-${(a.stopPct * 100).toFixed(1)}% / +${(a.targetPct * 100).toFixed(1)}%</td><td>${decision}</td></tr>`;
   }).join('');
@@ -159,8 +165,24 @@ function render() {
     $('btTrades').textContent = b.trades;
     $('btWin').textContent = b.trades ? pct(b.winRate, 0).replace('+', '') : '–';
     $('btGas').textContent = usd(b.gasPaidUsd);
-    $('btNote').textContent = 'Same strategy replayed on on-chain hourly prices. ' + b.assumptions + '. A short history is not proof of future results.';
+    $('btNote').textContent = 'Rule-based strategy replayed on on-chain hourly prices. ' + b.assumptions + '. A short history is not proof of future results.';
     spark($('btSpark'), b.equity, b.startUsd);
+  }
+
+  // AI model (walk-forward)
+  const M = SG.ml;
+  if (SG.researching && !M) $('mlSummary').textContent = 'Training and testing the model…';
+  if (M) {
+    const aucTxt = M.auc == null ? 'n/a' : M.auc.toFixed(3);
+    $('mlMode').innerHTML = M.active ? '<span class="tag buy">AI ACTIVE</span>' : '<span class="tag flat">RULES IN CHARGE</span>';
+    $('mlSummary').innerHTML = `${esc(M.reason)}.` +
+      `<div class="sub" style="margin-top:6px">Out-of-sample since ${M.oosFrom ? new Date(M.oosFrom).toLocaleDateString() : '–'} · ${M.folds} re-trains · ${(M.oosRows || 0).toLocaleString()} unseen token-hours · base rate ${M.baseRate == null ? '–' : pct(M.baseRate, 1).replace('+', '')} · last run ${SG.ranAt ? time(SG.ranAt) : '–'}${SG.researching ? ' · re-training…' : ''}</div>`;
+    $('mlAuc').textContent = aucTxt;
+    $('mlAuc').className = 'v ' + (M.auc != null && M.auc >= 0.55 ? 'pos' : 'amb');
+    $('mlRules').innerHTML = M.rulesOos ? `<span class="${cls(M.rulesOos.returnPct)}">${pct(M.rulesOos.returnPct)}</span>` : '–';
+    $('mlBest').innerHTML = M.mlOos ? `<span class="${cls(M.mlOos.returnPct)}">${pct(M.mlOos.returnPct)}</span> <span class="sub">p≥${M.threshold}</span>` : '–';
+    $('mlThr').innerHTML = (M.thresholds || []).map((x) => `<span>p ≥ ${x.threshold}</span><span><span class="${cls(x.returnPct)}">${pct(x.returnPct)}</span> · ${x.trades} trades · DD ${pct(-x.maxDrawdownPct, 1)}</span>`).join('');
+    $('mlFeat').textContent = (M.importance || []).map((f) => `${f.name} ${f.weight >= 0 ? '+' : ''}${f.weight.toFixed(2)}`).join(' · ');
   }
 
   // log
@@ -168,8 +190,8 @@ function render() {
 
   // controls
   $('pauseBtn').textContent = S.entriesPaused ? 'Resume new entries' : 'Pause new entries';
-  $('panicLiveBtn').disabled = !L.position;
-  $('panicPaperBtn').disabled = !P.position;
+  $('panicLiveBtn').disabled = !(L.positions && L.positions.length);
+  $('panicPaperBtn').disabled = !(P.positions && P.positions.length);
   $('sendRpc').textContent = S.sendRpc;
   const r = S.params.risk;
   $('params').innerHTML = [

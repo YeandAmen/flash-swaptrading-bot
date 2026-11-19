@@ -81,9 +81,10 @@ export const TOKENS = {
   mode: str('TOKEN_MODE', 'all') as 'all' | 'core',
   listUrls: str('TOKEN_LIST_URLS', 'https://tokens.coingecko.com/ethereum/all.json,https://tokens.uniswap.org')
     .split(',').map((s) => s.trim()).filter(Boolean),
-  minPoolWeth: num('MIN_POOL_WETH', 50), // non-core token's Uniswap v3 WETH pool must hold at least this much WETH
-  corePoolWeth: 30,
-  maxTokens: num('MAX_TOKENS', 250), // deepest N non-core tokens are scanned
+  // non-core token's deepest Uniswap v3 pool (vs WETH or USDC) must hold at least this much quote-side value
+  minPoolUsd: num('MIN_POOL_USD', 30_000),
+  corePoolUsd: 25_000,
+  maxTokens: num('MAX_TOKENS', 300), // deepest N non-core tokens are scanned
   minHistoryDays: num('MIN_HISTORY_DAYS', 14), // non-core tokens need this much price history before they can be bought
   maxRoundTripTaxPct: num('MAX_ROUNDTRIP_TAX_PCT', 0.02), // simulated buy->sell may lose at most fees + this
   maxAllocPct: num('LONGTAIL_MAX_ALLOC_PCT', 0.5), // max equity in one non-core token
@@ -99,6 +100,21 @@ export const GAS_TOPUP = {
 };
 
 export const USDC_DECIMALS = 6;
+
+/**
+ * ML signal model (inspired by asavinov/intelligent-trading-bot): engineered features -> logistic regression
+ * -> probability that a trade reaches +1R before -1R within the horizon. Walk-forward validated; in `auto` mode it only
+ * drives entries when its out-of-sample results beat the rule-based strategy.
+ */
+export const ML = {
+  mode: str('ML_MODE', 'auto') as 'auto' | 'on' | 'off',
+  horizonHours: 48,
+  retrainEveryHours: 72, // walk-forward refit cadence in backtests
+  minTrainDays: 21,
+  minAuc: num('ML_MIN_AUC', 0.55),
+  thresholds: [0.5, 0.55, 0.6, 0.65],
+  l2: 0.01,
+};
 
 /** Strategy brain parameters (hourly bars). */
 export const STRATEGY = {
@@ -128,6 +144,8 @@ export const STRATEGY = {
 export const RISK = {
   riskPerTradePct: num('RISK_PER_TRADE_PCT', 0.025), // max equity lost if stop is hit
   maxAllocPct: num('MAX_ALLOC_PCT', 0.95),
+  maxPositions: num('MAX_POSITIONS', 3), // tokens held at the same time
+  maxPositionPct: num('MAX_POSITION_PCT', 0.45), // max equity in any one position
   minTradeUsd: num('MIN_TRADE_USD', 10),
   maxSlippageBps: num('MAX_SLIPPAGE_BPS', 50),
   panicSlippageBps: 200,
@@ -168,7 +186,11 @@ check(CONFIG.historyDays >= 15 && CONFIG.historyDays <= 365, 'HISTORY_DAYS must 
 check(CONFIG.paperStartUsd > 0, 'PAPER_START_USD must be > 0');
 check(Number.isInteger(CONFIG.port) && CONFIG.port >= 1024 && CONFIG.port <= 65535, 'PORT must be 1024..65535');
 check(TOKENS.mode === 'all' || TOKENS.mode === 'core', 'TOKEN_MODE must be all or core');
-check(TOKENS.minPoolWeth >= 1, 'MIN_POOL_WETH must be >= 1');
+check(TOKENS.minPoolUsd >= 1000, 'MIN_POOL_USD must be >= 1000');
+check(Number.isInteger(RISK.maxPositions) && RISK.maxPositions >= 1 && RISK.maxPositions <= 10, 'MAX_POSITIONS must be 1..10');
+frac('MAX_POSITION_PCT', RISK.maxPositionPct, true);
+check(ML.mode === 'auto' || ML.mode === 'on' || ML.mode === 'off', 'ML_MODE must be auto, on or off');
+check(ML.minAuc > 0.5 && ML.minAuc < 1, 'ML_MIN_AUC must be between 0.5 and 1');
 check(Number.isInteger(TOKENS.maxTokens) && TOKENS.maxTokens >= 1 && TOKENS.maxTokens <= 1000, 'MAX_TOKENS must be 1..1000');
 check(TOKENS.minHistoryDays >= 4 && TOKENS.minHistoryDays <= CONFIG.historyDays, 'MIN_HISTORY_DAYS must be 4..HISTORY_DAYS');
 frac('MAX_ROUNDTRIP_TAX_PCT', TOKENS.maxRoundTripTaxPct);

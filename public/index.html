@@ -158,12 +158,25 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     <div class="sub" id="uniStats" style="margin:-4px 0 10px"></div>
     <div class="scroll">
       <table>
-        <thead><tr><th>Token</th><th class="r">Price</th><th class="r">24h</th><th>Trend</th><th class="r">Momentum</th><th class="r">RSI</th><th class="r">Daily vol</th><th class="r">Stop / Target</th><th>Decision</th></tr></thead>
+        <thead><tr><th>Token</th><th class="r" title="AI model probability of reaching +1R before -1R within 48h">AI</th><th class="r">Price</th><th class="r">24h</th><th>Trend</th><th class="r">Momentum</th><th class="r">RSI</th><th class="r">Daily vol</th><th class="r">Stop / Target</th><th>Decision</th></tr></thead>
         <tbody id="anaBody"></tbody>
       </table>
     </div>
     <div class="note" id="costNote"></div>
     <details class="note" id="rejectedBox"><summary>Tokens rejected by safety checks</summary><div id="rejected" class="why" style="max-width:none;margin-top:6px"></div></details>
+  </section>
+
+  <section class="card">
+    <h2>AI signal model · walk-forward tested <span id="mlMode"></span></h2>
+    <div id="mlSummary">Waiting for the first training run…</div>
+    <div class="stats">
+      <div class="stat"><div class="l">AUC on unseen data</div><div class="v" id="mlAuc">–</div></div>
+      <div class="stat"><div class="l">Rules, same period</div><div class="v" id="mlRules">–</div></div>
+      <div class="stat"><div class="l">Best AI setting</div><div class="v" id="mlBest">–</div></div>
+    </div>
+    <div class="kv" id="mlThr"></div>
+    <div class="note">Strongest features: <span id="mlFeat">–</span></div>
+    <div class="note">Like intelligent-trading-bot: 21 engineered features per token-hour → logistic-regression model predicting “+1R before −1R within 48h”, re-trained every 3 days on past data only and tested on data it never saw. AUC 0.50 = coin flip. In <b>auto</b> mode the AI only drives buys if it beats the rules out of sample; otherwise the rules stay in charge. Re-trains every 6 hours.</div>
   </section>
 
   <section class="grid2">
@@ -223,7 +236,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     <li>The bot will trade the <b>real USDC</b> in its wallet automatically, 24/7, with no further confirmation.</li>
     <li>It needs <b>USDC + a tiny bit of ETH once</b> (Ethereum mainnet). After that it <b>buys its own gas with USDC</b> (small amounts, capped per day).</li>
     <li>It may buy <b>any token that passes the safety checks</b> (deep Uniswap pool, 14+ days of history, simulated buy→sell). Smaller tokens are riskier: at most 50% of equity in one of them.</li>
-    <li>Losses are possible. Risk limits: ~2.5% of equity per trade, daily loss stop 6%, max drawdown halt 25%.</li>
+    <li>Losses are possible. It can hold up to 3 tokens at once (max 45% of equity each). Risk limits: ~2.5% of equity per trade, daily loss stop 6%, max drawdown halt 25%.</li>
     <li>Back up the private key first. It is stored in your macOS Keychain (see README).</li>
   </ul>
   <label class="sub">Type <b>LIVE</b> to confirm</label>
