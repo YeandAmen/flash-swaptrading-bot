@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Ethereum ERC-20 token trading bot (Uniswap v3) with a localhost dashboard",
+  "engines": { "node": ">=22" },
   "scripts": {
     "build": "tsc -p .",
     "start": "node dist/server.js",
@@ -16,7 +17,10 @@
     "service:status": "bash scripts/service.sh status",
     "service:restart": "bash scripts/service.sh restart",
     "service:logs": "bash scripts/service.sh logs",
+    "service:token": "bash scripts/service.sh token",
     "mev-fork-test": "bash scripts/fork-test.sh cli-mev-forktest",
+    "wallet:fork-test": "bash scripts/fork-test.sh cli-wallet-forktest",
+    "wallet:local-test": "bash scripts/fork-test.sh cli-wallet-forktest --standalone",
     "build:contract": "node scripts/build-contract.mjs",
     "mev:scan": "node dist/cli-mev-scan.js"
   },

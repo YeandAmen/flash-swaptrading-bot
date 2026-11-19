@@ -1,11 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { encodePacked, formatUnits, parseEther, parseUnits, type Hex, type TransactionReceipt } from 'viem';
+import { encodePacked, formatUnits, parseEther, parseUnits, type Hex } from 'viem';
 import { ADDR, CONFIG, DATA_DIR, GAS_TOPUP, ML, RISK, STRATEGY, TOKENS, USDC_DECIMALS, type TokenCfg } from './config.js';
 import { publicClient } from './chain.js';
+import { appendRotatingLog, readLogTail, redactDiagnostic } from './diagnostics.js';
+import { writeJson } from './persistence.js';
+import { assertForkTestEnvironment } from './forktest-env.js';
 import { runResearch, type BacktestResult, type Research } from './backtest.js';
 import {
-  fillFromReceipt, gasUsd, LiveExecutor, PaperExecutor, swapGasUnits, topUpFromReceipt, UncertainTxError, type Executor, type Fill,
+  fillFromReceipt, gasUsd, LiveExecutor, LiveSendBlocked, PaperExecutor, swapGasUnits, topUpFromReceipt, transactionSettlement, type Executor, type Fill, type SwapRequest,
 } from './executor.js';
 import {
   discoverMarkets, History, loadMarketCache, quoteExactIn, saveMarketCache, snapshot, type MarketInfo, type Snapshot, type TokenMarket,
@@ -26,6 +29,7 @@ interface PendingSwap {
   startedAt: number;
   hash: Hex | null;
   deadline: number | null;
+  approvalHashes?: Hex[];
   reason: string;
   stopPct: number;
   targetPct: number;
@@ -39,6 +43,7 @@ interface BotState {
   entriesPaused: boolean;
   lastUsdcRaw: string | null;
   lastTradeBlock: string | null;
+  netRiskBaseline?: true;
   pending: PendingSwap | null;
   topups: { t: number; usd: number; eth: number }[];
   /** market entries of tokens we hold or are trading (by lowercase address): never dropped from the universe */
@@ -51,13 +56,17 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const EVENTS_FILE = path.join(DATA_DIR, 'events.log');
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const usd = (x: number) => `$${x.toFixed(2)}`;
-const errMsg = (e: unknown) => ((e as Error)?.message ?? String(e)).split('\n')[0].slice(0, 300);
+const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String(e)).split('\n')[0]).slice(0, 300);
 const HOUR = 3_600_000;
+const positive = (value: number | undefined): value is number => value !== undefined && Number.isFinite(value) && value > 0;
+const liveEnabled = () => CONFIG.allowLiveTrading || CONFIG.forkMode;
 
 export class Engine {
   status: 'starting' | 'running' | 'error' = 'starting';
   startupStep = 'Loading';
   lastError: string | null = null;
+  liveFault: string | null = null;
+  walletReady = false;
   lastTickAt = 0;
   market!: MarketInfo;
   wallet!: WalletInfo;
@@ -92,48 +101,84 @@ export class Engine {
   private lastResearchAt = 0;
   private lastGasWarn = 0;
   private liveActed = false; // a live buy/sell was attempted this tick
+  private entryEpoch = 0;
+  private disarmEpoch = 0;
+  private panicActive = false;
 
   constructor() {
     this.state = this.loadState();
     try {
-      const lines = fs.readFileSync(EVENTS_FILE, 'utf8').trim().split('\n').slice(-300);
-      this.events = lines.map((l) => JSON.parse(l) as BotEvent);
+      this.events = readLogTail(EVENTS_FILE).slice(-300).flatMap((line) => {
+        try { return [JSON.parse(line) as BotEvent]; } catch { return []; }
+      });
     } catch { /* first run */ }
   }
 
   // ------------------------------------------------------------------ logging & state
   log(msg: string, level: BotEvent['level'] = 'info') {
-    const e: BotEvent = { t: Date.now(), level, msg };
+    const e: BotEvent = { t: Date.now(), level, msg: redactDiagnostic(msg) };
     this.events.push(e);
     if (this.events.length > 400) this.events.splice(0, this.events.length - 400);
-    try { fs.appendFileSync(EVENTS_FILE, JSON.stringify(e) + '\n'); } catch { /* disk issue: keep running */ }
-    console.log(`[${new Date(e.t).toISOString()}] ${level.toUpperCase()} ${msg}`);
+    try { appendRotatingLog(EVENTS_FILE, JSON.stringify(e) + '\n'); } catch { /* keep diagnostics available in memory */ }
+    console.log(`[${new Date(e.t).toISOString()}] ${level.toUpperCase()} ${e.msg}`);
   }
 
   private loadState(): BotState {
     try {
       const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as BotState;
-      if (s.version === 1) {
+      if (s.version === 1 && s.paper?.kind === 'paper' && s.live?.kind === 'live') {
         s.pending ??= null;
         s.topups ??= [];
         s.heldMarkets ??= {};
-        migratePortfolio(s.paper);
-        migratePortfolio(s.live);
+        for (const pf of [migratePortfolio(s.paper), migratePortfolio(s.live)]) {
+          if (!Array.isArray(pf.trades) || !Array.isArray(pf.equityHistory) || !pf.cooldowns || !Number.isFinite(pf.cashUsd) || !Number.isFinite(pf.gasSpentUsd)) throw new Error('Invalid portfolio state');
+          const lastBuy = pf.trades.slice().reverse().find((trade) => trade.side === 'BUY');
+          pf.lastEntryHour ??= lastBuy ? Math.floor(lastBuy.time / HOUR) : null;
+          for (const pos of pf.positions) {
+            if (positive(pos.entryMid) && positive(pos.stopPrice) && positive(pos.targetPrice) && positive(pos.peakPrice)) continue;
+            if (!positive(pos.entryPrice) || !positive(pos.stopPct) || pos.stopPct >= 1 || !positive(pos.targetPct)) throw new Error('Invalid open position');
+            pos.entryMid = pos.entryPrice;
+            pos.stopPrice = pos.entryPrice * (1 - pos.stopPct);
+            pos.targetPrice = pos.entryPrice * (1 + pos.targetPct);
+            pos.peakPrice = pos.entryPrice;
+            pos.trailActive = false;
+          }
+        }
+        if (!s.netRiskBaseline) {
+          s.live.peakEquity = Math.max(0, s.live.peakEquity - s.live.gasSpentUsd);
+          s.live.dayStartEquity = Math.max(0, s.live.dayStartEquity - s.live.gasSpentUsd);
+          s.netRiskBaseline = true;
+        }
+        s.armed = false;
+        s.armedAt = null;
         return s;
       }
-    } catch { /* fresh */ }
+      throw new Error('Unsupported portfolio state');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.liveFault = 'Trading state could not be loaded. Preserve and repair state.json before restarting.';
+    }
     return {
       version: 1, armed: false, armedAt: null, entriesPaused: false, lastUsdcRaw: null, lastTradeBlock: null, pending: null, topups: [],
-      heldMarkets: {}, paper: newPortfolio('paper', CONFIG.paperStartUsd), live: newPortfolio('live', 0),
+      heldMarkets: {}, netRiskBaseline: true, paper: newPortfolio('paper', CONFIG.paperStartUsd), live: newPortfolio('live', 0),
     };
   }
 
-  saveState() {
+  saveState(required = false) {
+    if (this.liveFault) {
+      if (required) throw new Error(this.liveFault);
+      return false;
+    }
     try {
-      fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify(this.state, null, 1));
-      fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
-    } catch (e) {
-      console.error('saveState failed', e);
+      writeJson(STATE_FILE, this.state);
+      return true;
+    } catch (error) {
+      this.liveFault = 'Trading state could not be saved. Review storage and restart to reconcile pending transactions.';
+      this.state.armed = false;
+      this.entryEpoch++;
+      try { this.mev?.disarm('because trading state could not be saved'); } catch { /* liveFault also blocks signing */ }
+      this.log(`${this.liveFault} ${errMsg(error)}`, 'error');
+      if (required) throw new Error(this.liveFault, { cause: error });
+      return false;
     }
   }
 
@@ -221,11 +266,16 @@ export class Engine {
   async start(): Promise<void> {
     for (;;) {
       try {
+        if (CONFIG.forkMode) {
+          this.startupStep = 'Verifying local Anvil';
+          await assertForkTestEnvironment();
+        }
         this.startupStep = 'Loading wallet';
         this.wallet = loadOrCreateWallet();
         this.liveExec = new LiveExecutor(this.wallet.account);
-        if (this.wallet.created) this.log(`Created new bot wallet ${this.wallet.account.address} (key stored in ${this.wallet.storage})`);
-        else this.log(`Bot wallet ${this.wallet.account.address} (key in ${this.wallet.storage})`);
+        const storage = this.wallet.storage === 'macOS Keychain' ? 'macOS Keychain' : 'local key file';
+        if (this.wallet.created) this.log(`Created new bot wallet ${this.wallet.account.address} (key stored in ${storage})`);
+        else this.log(`Bot wallet ${this.wallet.account.address} (key in ${storage})`);
 
         const chainId = await publicClient.getChainId();
         if (chainId !== 1) throw new Error(`RPC is chain ${chainId}, expected Ethereum mainnet (1)`);
@@ -246,23 +296,23 @@ export class Engine {
         if (fresh.length) await this.history.backfill(this.market, CONFIG.historyDays, (m) => this.log(m), fresh);
         this.history.save(CONFIG.historyDays, new Set(this.market.tokens.map((t) => t.token.symbol)));
 
+        this.mev = new MevSearcher({
+          log: (m, level) => this.log(m, level),
+          account: this.wallet.account,
+          exec: this.liveExec,
+          ethUsd: () => (this.snap && this.isCurrent(this.snap) ? this.snap.ethUsd : null),
+          gasPriceGwei: () => (this.snap ? this.snap.baseFeeGwei + this.snap.tipGwei : null),
+          baseFeeGwei: () => (this.snap && this.isCurrent(this.snap) ? this.snap.baseFeeGwei : null),
+          tokens: () => this.market.tokens.map((t) => t.token),
+          tradePending: () => !!this.state.pending || !!this.liveFault || this.stopping || this.panicActive,
+        });
         this.startupStep = 'First market snapshot';
         await this.tick();
         this.startupStep = 'Backtesting rules and training the ML model (walk-forward)';
         await this.runResearchNow();
         this.status = 'running';
         this.lastError = null;
-        this.log(`Bot running. Scanning ${this.market.tokens.length} tokens, up to ${RISK.maxPositions} positions. Signals: ${this.mlActive ? 'ML' : 'rules'}. Live trading: ${this.state.armed ? 'ARMED' : 'not armed'}.`);
-        this.mev = new MevSearcher({
-          log: (m, level) => this.log(m, level),
-          account: this.wallet.account,
-          exec: this.liveExec,
-          ethUsd: () => this.snap?.ethUsd ?? null,
-          gasPriceGwei: () => (this.snap ? this.snap.baseFeeGwei + this.snap.tipGwei : null),
-          baseFeeGwei: () => (this.snap && Date.now() - this.lastTickAt < 120_000 ? this.snap.baseFeeGwei : null),
-          tokens: () => this.market.tokens.map((t) => t.token),
-          tradePending: () => !!this.state.pending,
-        });
+        this.log(`Bot running. Scanning ${this.market.tokens.length} tokens, up to ${RISK.maxPositions} positions. Signals: ${this.mlActive ? 'ML' : 'rules'}. Live trading starts disarmed.`);
         void this.mev.start();
         break;
       } catch (e) {
@@ -359,13 +409,32 @@ export class Engine {
   }
 
   // ------------------------------------------------------------------ main tick
+  private isCurrent(snap: Snapshot) {
+    if (!positive(snap.ethUsd) || !Number.isFinite(snap.timestamp)) return false;
+    if (this.snap && snap.blockNumber < this.snap.blockNumber) return false;
+    if (CONFIG.forkMode) return true;
+    const age = Date.now() - snap.timestamp * 1000;
+    return age >= -30_000 && age <= 120_000;
+  }
+
+  private async walletSettled() {
+    await this.mev?.reconcileWallet();
+    const settled = await this.liveExec.reconcileWallet();
+    return settled && !this.mev?.walletPending();
+  }
+
+  private canTrade(snap: Snapshot) {
+    return liveEnabled() && !this.liveFault && !this.stopping && this.isCurrent(snap) && !this.mev?.walletPending() &&
+      (this.state.lastTradeBlock === null || snap.blockNumber >= BigInt(this.state.lastTradeBlock));
+  }
+
   async tick() {
-    if (this.busy || this.stopping) return;
+    if (this.busy || this.stopping || this.panicActive) return;
     this.busy = true;
     try {
       const snap = await snapshot(this.market, this.wallet.account.address);
+      if (!this.isCurrent(snap)) throw new Error('Ethereum snapshot is stale, invalid or behind the previous block');
       this.snap = snap;
-      this.lastTickAt = Date.now();
       this.history.record(snap);
       const hour = Math.floor(snap.timestamp / 3600);
       if (hour !== this.lastHourSaved) { this.history.save(CONFIG.historyDays); this.lastHourSaved = hour; }
@@ -381,19 +450,21 @@ export class Engine {
       const rt = (2 * g) / 50 + 2 * 0.0035;
       this.costs = { gasPerSwapUsd: g, roundTripPctAt50: rt, hurdlePctAt50: rt * RISK.costHurdleMult };
 
+      const walletSettled = await this.walletSettled();
       const settled = await this.reconcilePending(snap);
-      this.syncLive(snap, settled);
+      this.syncLive(snap, settled && walletSettled);
       this.liveActed = false;
 
       // live first (real money has priority): exits/entries before anything else, each step isolated
       try {
-        await this.manageLive(snap);
+        if (walletSettled && settled) await this.manageLive(snap);
+        else this.liveStatus = { ready: false, reason: 'Waiting for wallet settlement' };
       } catch (e) {
         this.log(`[live] decision error: ${errMsg(e)}`, 'error');
       }
       try {
         // gas top-up only on a quiet tick (no live trade just happened, nothing in flight)
-        if (settled && !this.liveActed && !this.state.pending) await this.maybeTopUpGas(snap);
+        if (walletSettled && settled && !this.liveActed && !this.state.pending) await this.maybeTopUpGas(snap);
       } catch (e) {
         this.log(`[live] gas top-up error: ${errMsg(e)}`, 'error');
       }
@@ -412,6 +483,11 @@ export class Engine {
       }
       this.pruneHeldMarkets();
       this.saveState();
+      this.walletReady = !this.liveFault && !this.state.pending && !this.mev?.walletPending() && walletSettled && this.isCurrent(snap);
+      this.lastTickAt = Date.now();
+    } catch (error) {
+      this.walletReady = false;
+      throw error;
     } finally {
       this.busy = false;
     }
@@ -436,6 +512,10 @@ export class Engine {
     return pf.cashUsd + pf.positions.reduce((s, p) => s + p.qty * (snap.prices[p.symbol] ?? 0), 0);
   }
 
+  private riskEquity(pf: PortfolioState, snap: Snapshot) {
+    return Math.max(0, this.equity(pf, snap) - (pf.kind === 'live' ? pf.gasSpentUsd : 0));
+  }
+
   /**
    * Settles a journaled in-flight transaction (after a crash, broadcast error or receipt timeout) from on-chain facts.
    * Returns false while it is still unresolved: balances are then in flux and must not be read as deposits.
@@ -443,48 +523,49 @@ export class Engine {
   private async reconcilePending(snap: Snapshot): Promise<boolean> {
     const p = this.state.pending;
     if (!p) return true;
-    if (!p.hash) {
-      this.log(`[live] Cleared journal of a ${p.side} ${p.symbol} transaction that was never broadcast.`);
-      this.state.pending = null;
-      return true;
+    const hashes = [...(p.approvalHashes ?? []), ...(p.hash ? [p.hash] : [])];
+    const outcomes = await Promise.all(hashes.map((hash) => transactionSettlement(hash, Date.now() - p.startedAt > 45_000)));
+    if (outcomes.some((outcome) => outcome.status === 'pending')) {
+      this.state.live.lastDecision = `Waiting for in-flight ${p.side} ${p.symbol} transaction or approval to settle`;
+      return false;
     }
-    let receipt: TransactionReceipt | null = null;
-    try { receipt = await publicClient.getTransactionReceipt({ hash: p.hash }); } catch { /* not mined / not found */ }
-    const t = p.side === 'GAS' ? null : this.findTm(p.symbol) ?? null;
-    if (receipt && (t || p.side === 'GAS')) {
-      if (receipt.status === 'success') {
-        this.log(`[live] In-flight ${p.side} ${p.symbol} transaction landed on chain (${p.hash}). Recording it.`, 'trade');
-        if (p.side === 'GAS') {
-          const g = topUpFromReceipt(receipt, this.wallet.account.address);
-          this.bookGasTopup(g.usdcIn, g.ethOut, (Number(g.gasWei) / 1e18) * snap.ethUsd, receipt.blockNumber);
-        } else {
-          const tokenIn = p.side === 'BUY' ? ADDR.usdc : t!.token.address;
-          const tokenOut = p.side === 'BUY' ? t!.token.address : ADDR.usdc;
-          const f = fillFromReceipt(receipt, tokenIn, tokenOut, this.wallet.account.address);
-          const fill: Fill = {
-            amountIn: f.amountIn, amountOut: f.amountOut, gasUsd: (Number(f.gasWei) / 1e18) * snap.ethUsd,
-            txHashes: [p.hash], blockNumber: receipt.blockNumber,
-          };
-          if (p.side === 'BUY') this.commitBuy(this.state.live, t!, fill, p.mid, p.stopPct, p.targetPct, p.reason, snap);
-          else if (this.state.live.positions.some((x) => x.symbol === p.symbol)) this.commitSell(this.state.live, t!, fill, p.reason);
-          else this.afterLiveFill(fill.amountOut, fill.blockNumber);
-        }
+    let gasWei = 0n;
+    let lastBlock = 0n;
+    for (const outcome of outcomes) {
+      if (outcome.status !== 'receipt') continue;
+      const { receipt } = outcome;
+      gasWei += receipt.gasUsed * receipt.effectiveGasPrice;
+      if (receipt.blockNumber > lastBlock) lastBlock = receipt.blockNumber;
+    }
+    const gasUsdSpent = (Number(gasWei) / 1e18) * snap.ethUsd;
+    const terminal = p.hash ? outcomes.at(-1) : undefined;
+    const receipt = terminal?.status === 'receipt' ? terminal.receipt : null;
+    if (receipt?.status === 'success') {
+      if (p.side === 'GAS') {
+        const g = topUpFromReceipt(receipt, this.wallet.account.address);
+        if (g.usdcIn === 0n || g.ethOut === 0n) throw new Error('Pending gas top-up receipt amounts could not be verified');
+        this.bookGasTopup(g.usdcIn, g.ethOut, gasUsdSpent, receipt.blockNumber);
       } else {
-        this.log(`[live] In-flight ${p.side} ${p.symbol} transaction reverted on chain (${p.hash}). Only gas was spent.`, 'warn');
-        this.state.live.gasSpentUsd += (Number(receipt.gasUsed * receipt.effectiveGasPrice) / 1e18) * snap.ethUsd;
-        this.state.lastTradeBlock = receipt.blockNumber.toString();
-        this.state.pending = null;
+        const t = this.findTm(p.symbol);
+        if (!t) throw new Error(`Cannot reconcile ${p.symbol} until its market is restored`);
+        const [tokenIn, tokenOut] = p.side === 'BUY' ? [ADDR.usdc, t.token.address] : [t.token.address, ADDR.usdc];
+        const f = fillFromReceipt(receipt, tokenIn, tokenOut, this.wallet.account.address);
+        if (f.amountIn === 0n || f.amountOut === 0n) throw new Error('Pending swap receipt amounts could not be verified');
+        const fill = { amountIn: f.amountIn, amountOut: f.amountOut, gasUsd: gasUsdSpent, txHashes: hashes, blockNumber: receipt.blockNumber };
+        if (p.side === 'BUY') {
+          const mid = positive(p.mid) ? p.mid : Number(formatUnits(f.amountIn, USDC_DECIMALS)) / Number(formatUnits(f.amountOut, t.token.decimals));
+          this.commitBuy(this.state.live, t, fill, mid, p.stopPct, p.targetPct, p.reason, snap);
+        } else this.commitSell(this.state.live, t, fill, p.reason);
       }
-      this.saveState();
-      return false; // balances in this tick's snapshot may predate the trade
-    }
-    if (p.deadline !== null && Date.now() / 1000 > p.deadline + 180) {
-      this.log(`[live] In-flight ${p.side} ${p.symbol} transaction ${p.hash} passed its deadline without being mined. Cleared.`, 'warn');
+      this.log(`[live] Reconciled ${p.side} ${p.symbol} from receipt ${p.hash}.`, 'trade');
+    } else {
+      this.state.live.gasSpentUsd += gasUsdSpent;
+      if (p.side === 'GAS') this.state.topups.push({ t: p.startedAt, usd: 0, eth: 0 });
+      if (lastBlock > 0n) this.state.lastTradeBlock = lastBlock.toString();
       this.state.pending = null;
       this.saveState();
-      return true;
+      this.log(`[live] Settled ${p.side} ${p.symbol} without a fill. Verified gas ${usd(gasUsdSpent)}.`, 'warn');
     }
-    this.state.live.lastDecision = `Waiting for in-flight ${p.side} ${p.symbol} transaction ${p.hash.slice(0, 10)}… to settle`;
     return false;
   }
 
@@ -528,8 +609,27 @@ export class Engine {
         live.dayStartEquity = Math.max(0, live.dayStartEquity - value);
         live.positions.splice(live.positions.indexOf(pos), 1);
       } else {
+        const qty = Number(formatUnits(bal, t.token.decimals));
+        const price = snap.prices[pos.symbol];
+        if (bal !== BigInt(pos.qtyRaw)) {
+          if (!positive(price)) {
+            this.warnLive(`Waiting for a current price before reconciling the changed ${pos.symbol} balance`);
+            continue;
+          }
+          const delta = (qty - pos.qty) * price;
+          const retained = Math.min(1, qty / pos.qty);
+          pos.costUsd = pos.costUsd * retained + Math.max(delta, 0);
+          pos.entryGasUsd *= retained;
+          pos.entryPrice = pos.costUsd / qty;
+          const exitGas = gasUsd(swapGasUnits(t.hops, RISK.approvalMode === 'exact'), snap.baseFeeGwei + snap.tipGwei, snap.ethUsd);
+          pos.breakevenPrice = (pos.costUsd + pos.entryGasUsd + exitGas) / (qty * (1 - t.poolFeePct - 0.001));
+          live.netDepositsUsd += delta;
+          live.peakEquity = Math.max(0, live.peakEquity + delta);
+          live.dayStartEquity = Math.max(0, live.dayStartEquity + delta);
+          this.log(`[live] Reconciled external ${pos.symbol} balance change of ${usd(delta)}`, 'warn');
+        }
         pos.qtyRaw = bal.toString();
-        pos.qty = Number(formatUnits(bal, t.token.decimals));
+        pos.qty = qty;
       }
     }
     if (this.state.armed && live.positions.length < RISK.maxPositions) {
@@ -566,7 +666,7 @@ export class Engine {
 
   /** Buys a little ETH for gas with USDC when the wallet runs low (approve + swap + unwrap, journaled like trades). */
   private async maybeTopUpGas(snap: Snapshot) {
-    if (!GAS_TOPUP.enabled || !this.state.armed || this.state.pending) return;
+    if (!GAS_TOPUP.enabled || !this.state.armed || !this.canTrade(snap) || this.state.pending) return;
     const b = snap.balances!;
     const live = this.state.live;
     const now = Date.now();
@@ -598,21 +698,16 @@ export class Engine {
     const usdcIn = parseUnits(amount.toFixed(6), USDC_DECIMALS);
     const path = encodePacked(['address', 'uint24', 'address'], [ADDR.usdc, this.market.usdcWeth.fee, ADDR.weth]);
     this.log(`[live] Gas is low (${eth.toFixed(5)} ETH): buying ${usd(amount)} of ETH with USDC`, 'trade');
-    this.state.pending = { side: 'GAS', symbol: 'ETH', amountIn: usdcIn.toString(), startedAt: now, hash: null, deadline: null, reason: 'gas top-up', stopPct: 0, targetPct: 0, mid: snap.ethUsd };
-    this.saveState();
+    const epoch = this.entryEpoch;
+    const canSend = () => this.state.armed && epoch === this.entryEpoch && this.canTrade(snap);
     try {
-      const r = await this.liveExec.topUpGas(usdcIn, path, RISK.maxSlippageBps, snap.ethUsd, (hash, deadline) => {
-        if (this.state.pending) { this.state.pending.hash = hash; this.state.pending.deadline = deadline; this.saveState(); }
-      }, (m) => this.log(`[live] ${m}`));
+      const journal = this.journal({ side: 'GAS', symbol: 'ETH', amountIn: usdcIn.toString(), reason: 'gas top-up', stopPct: 0, targetPct: 0, mid: snap.ethUsd });
+      const r = await this.liveExec.topUpGas(usdcIn, path, RISK.maxSlippageBps, snap.ethUsd, journal.onSwapSigned, (m) => this.log(`[live] ${m}`), journal.onApprovalSigned, canSend);
       this.bookGasTopup(r.usdcIn, r.ethOut, r.gasUsd, r.blockNumber);
     } catch (e) {
-      if (e instanceof UncertainTxError && this.state.pending?.hash === e.hash) {
-        this.log(`[live] gas top-up: ${e.message}. Will settle it from chain.`, 'warn');
-      } else {
-        this.state.pending = null;
-        this.state.topups.push({ t: now, usd: 0, eth: 0 }); // counts toward the rate limit so failures can't loop
-        this.log(`[live] gas top-up failed: ${errMsg(e)}`, 'error');
-      }
+      this.discardUnsigned();
+      if (!this.state.pending && !(e instanceof LiveSendBlocked)) this.state.topups.push({ t: now, usd: 0, eth: 0 });
+      this.log(`[live] gas top-up: ${errMsg(e)}`, 'warn');
       this.saveState();
     }
   }
@@ -636,9 +731,9 @@ export class Engine {
   private liveReadiness(snap: Snapshot): { ready: boolean; reason: string } {
     const live = this.state.live;
     const holding = live.positions.length > 0;
-    if (!this.state.armed) {
-      return { ready: false, reason: holding ? 'Disarmed — no new buys; open positions keep their stop-loss/target' : 'Live trading not armed — paper trading only' };
-    }
+    if (this.liveFault) return { ready: false, reason: this.liveFault };
+    if (!liveEnabled()) return { ready: false, reason: 'Live broadcasting disabled by configuration' };
+    if (!this.state.armed) return { ready: false, reason: 'Disarmed. Automated wallet activity is off.' };
     if (live.halted) return { ready: false, reason: `HALTED: ${live.halted}. No new buys (open positions still protected). Reset after reviewing.` };
     const eth = Number(formatUnits(snap.balances!.eth, 18));
     const usdc = Number(formatUnits(snap.balances!.usdc, USDC_DECIMALS));
@@ -663,9 +758,9 @@ export class Engine {
   private async manageLive(snap: Snapshot) {
     const live = this.state.live;
     this.liveStatus = this.liveReadiness(snap);
-    if (this.state.pending) return; // never trade while a transaction is unresolved
+    if (this.state.pending || !this.state.armed || !this.canTrade(snap)) return;
     if (live.positions.length > 0 || this.liveStatus.ready) {
-      // exits ALWAYS run while we hold something (armed or not, halted or not); entries only when ready
+      // While armed, entry halts do not prevent exits.
       await this.manage(live, snap, this.liveExec, this.liveStatus.ready);
     } else {
       live.lastDecision = this.liveStatus.reason;
@@ -692,16 +787,16 @@ export class Engine {
   // ------------------------------------------------------------------ decisions
   private async manage(pf: PortfolioState, snap: Snapshot, exec: Executor, entriesAllowed: boolean) {
     const now = Date.now();
-    const equity = this.equity(pf, snap);
+    const pricesComplete = pf.positions.every((p) => positive(snap.prices[p.symbol]));
+    const equity = pricesComplete ? this.riskEquity(pf, snap) : null;
     const dayKey = new Date(snap.timestamp * 1000).toISOString().slice(0, 10);
-    if (pf.dayKey !== dayKey) { pf.dayKey = dayKey; pf.dayStartEquity = equity; pf.pausedUntil = null; }
-    if (pf.kind === 'live' && pf.peakEquity === 0) pf.peakEquity = equity;
-    pf.peakEquity = Math.max(pf.peakEquity, equity);
-    if (!pf.halted && pf.peakEquity > 0 && equity < pf.peakEquity * (1 - RISK.maxDrawdownPct)) {
+    if (equity !== null && pf.dayKey !== dayKey) { pf.dayKey = dayKey; pf.dayStartEquity = equity; pf.pausedUntil = null; }
+    if (equity !== null) pf.peakEquity = Math.max(pf.peakEquity, equity);
+    if (equity !== null && !pf.halted && pf.peakEquity > 0 && equity < pf.peakEquity * (1 - RISK.maxDrawdownPct)) {
       pf.halted = `max drawdown ${(RISK.maxDrawdownPct * 100).toFixed(0)}% reached`;
       this.log(`[${pf.kind}] Circuit breaker: ${pf.halted}. No new buys until you reset it.`, 'warn');
     }
-    if (!pf.pausedUntil && pf.dayStartEquity > 0 && equity < pf.dayStartEquity * (1 - RISK.dailyLossLimitPct)) {
+    if (equity !== null && !pf.pausedUntil && pf.dayStartEquity > 0 && equity < pf.dayStartEquity * (1 - RISK.dailyLossLimitPct)) {
       const midnight = new Date(dayKey + 'T00:00:00Z').getTime() + 86_400_000;
       pf.pausedUntil = midnight;
       this.log(`[${pf.kind}] Daily loss limit hit. No new buys until ${new Date(midnight).toISOString()}.`, 'warn');
@@ -729,9 +824,9 @@ export class Engine {
           continue;
         }
       }
-      await this.sell(pf, exec, snap, pos, ex.reason, RISK.maxSlippageBps);
-      sold = true;
+      sold = await this.sell(pf, exec, snap, pos, ex.reason, RISK.maxSlippageBps) || sold;
       if (this.state.pending) return; // an unresolved live transaction: stop this tick
+      if (sold && pf.kind === 'live') break; // the next wallet action needs a post-fill snapshot
     }
     const holding = notes.length ? `Holding ${notes.join(', ')}. ` : '';
 
@@ -749,9 +844,14 @@ export class Engine {
     if (pf.halted) return `Halted: ${pf.halted}.`;
     if (pf.pausedUntil && now < pf.pausedUntil) return 'Daily loss limit — waiting for next UTC day.';
     if (snap.baseFeeGwei > RISK.maxEntryGasGwei) return `Gas ${snap.baseFeeGwei.toFixed(1)} gwei above entry limit ${RISK.maxEntryGasGwei}.`;
+    const hour = Math.floor(snap.timestamp / 3600);
+    if (pf.lastEntryHour !== null && pf.lastEntryHour !== undefined && hour <= pf.lastEntryHour) return 'Already opened a position this hour.';
+    if (pf.positions.some((p) => !positive(snap.prices[p.symbol]))) return 'Waiting for current prices of open positions.';
+    const epoch = this.entryEpoch;
+    const canEnter = () => this.entryEpoch === epoch && this.state[pf.kind] === pf && !this.state.entriesPaused && !pf.halted && !this.stopping && this.isCurrent(snap);
     const held = new Set(pf.positions.map((p) => p.symbol));
     const blocked: Record<string, number> = { ...pf.cooldowns, ...this.safetyBlocks };
-    const free = this.analyses.filter((a) => !held.has(a.symbol));
+    const free = this.analyses.filter((a) => !held.has(a.symbol) && positive(snap.prices[a.symbol]));
 
     let cand: Analysis | null = null;
     let why = '';
@@ -780,13 +880,14 @@ export class Engine {
     const equity = this.equity(pf, snap);
     const cash = pf.kind === 'live' ? Number(formatUnits(snap.balances!.usdc, USDC_DECIMALS)) : pf.cashUsd;
     const gasReserve = pf.kind === 'live' && GAS_TOPUP.enabled ? GAS_TOPUP.usd : 0; // keep a little USDC to buy gas later
+    const longTailExposure = pf.positions.reduce((sum, p) => this.findTm(p.symbol)?.token.core ? sum : sum + p.qty * snap.prices[p.symbol], 0);
     const capUsd = Math.min(
       (cash - gasReserve) * RISK.maxAllocPct,
       equity * RISK.maxPositionPct,
-      t.token.core ? Infinity : equity * TOKENS.maxAllocPct,
+      t.token.core ? Infinity : equity * TOKENS.maxAllocPct - longTailExposure,
     );
     const size = Math.floor(Math.min(capUsd, (equity * RISK.riskPerTradePct) / cand.stopPct) * 100) / 100;
-    if (size < RISK.minTradeUsd) return `${cand.symbol} signal (${why}), but size ${usd(size)} < minimum ${usd(RISK.minTradeUsd)}.`;
+    if (!positive(size) || size < RISK.minTradeUsd) return `${cand.symbol} signal (${why}), but size ${usd(size)} < minimum ${usd(RISK.minTradeUsd)}.`;
 
     const amountIn = parseUnits(size.toFixed(6), USDC_DECIMALS);
     const q = await quoteExactIn(t.buyPath, amountIn);
@@ -794,6 +895,7 @@ export class Engine {
     const impact = Math.max(0, 1 - (outQty * snap.prices[cand.symbol]) / size); // pool fees + price impact
     const g = gasUsd(swapGasUnits(t.hops, RISK.approvalMode === 'exact'), snap.baseFeeGwei + snap.tipGwei, snap.ethUsd);
     const rtCost = 2 * impact + (2 * g) / size;
+    if (!positive(outQty) || !Number.isFinite(rtCost)) return `${cand.symbol} quote or cost is invalid.`;
     if (rtCost > RISK.maxRoundTripCostPct) {
       return `${cand.symbol} signal (${why}) skipped: round-trip cost ${(rtCost * 100).toFixed(2)}% > max ${(RISK.maxRoundTripCostPct * 100).toFixed(1)}% (gas ${usd(g)}/swap on a ${usd(size)} trade).`;
     }
@@ -809,40 +911,51 @@ export class Engine {
         return `${cand.symbol} failed the pre-trade safety check: ${s.reason}.`;
       }
     }
-    const ok = await this.buy(pf, exec, snap, t, cand, amountIn, why);
+    if (!canEnter()) return `${cand.symbol} entry canceled.`;
+    const ok = await this.buy(pf, exec, snap, t, cand, amountIn, why, canEnter);
     return ok ? `Bought ${cand.symbol} (${why}).` : `Buy of ${cand.symbol} failed — see log.`;
   }
 
-  private journal(pf: PortfolioState, p: Omit<PendingSwap, 'startedAt' | 'hash' | 'deadline'>) {
-    if (pf.kind !== 'live') return undefined;
-    this.state.pending = { ...p, startedAt: Date.now(), hash: null, deadline: null };
-    this.saveState();
-    return (hash: Hex, deadline: number) => {
-      if (!this.state.pending) return;
-      this.state.pending.hash = hash;
-      this.state.pending.deadline = deadline;
-      this.saveState();
+  private journal(p: Omit<PendingSwap, 'startedAt' | 'hash' | 'deadline'>): Required<Pick<SwapRequest, 'onSwapSigned' | 'onApprovalSigned'>> {
+    if (this.state.pending) throw new Error('A spot wallet operation is already awaiting settlement');
+    let record: PendingSwap = { ...p, startedAt: Date.now(), hash: null, deadline: null };
+    this.state.pending = record;
+    this.saveState(true);
+    const update = (patch: Partial<PendingSwap>) => {
+      if (this.state.pending !== record) throw new Error('Spot journal changed before signing');
+      this.state.pending = { ...record, ...patch };
+      try { this.saveState(true); } catch (error) { this.state.pending = record; throw error; }
+      record = this.state.pending;
+    };
+    return {
+      onSwapSigned: (hash, deadline) => update({ hash, deadline }),
+      onApprovalSigned: (hash) => update({ approvalHashes: [...(record.approvalHashes ?? []), hash] }),
     };
   }
 
-  private async buy(pf: PortfolioState, exec: Executor, snap: Snapshot, t: TokenMarket, cand: Analysis, amountIn: bigint, why: string): Promise<boolean> {
+  private async buy(pf: PortfolioState, exec: Executor, snap: Snapshot, t: TokenMarket, cand: Analysis, amountIn: bigint, why: string, canEnter = () => true): Promise<boolean> {
     const sym = t.token.symbol;
+    const mid = snap.prices[sym];
+    if (!positive(mid)) return false;
+    const epoch = this.entryEpoch;
+    const canSend = () => this.state.armed && epoch === this.entryEpoch && !this.panicActive && this.canTrade(snap) && canEnter();
+    if (pf.kind === 'live' && !canSend()) return false;
     this.rememberMarket(t);
     if (pf.kind === 'live') this.liveActed = true;
     const reason = `${why}, momentum ${cand.momentum.toFixed(2)}σ, ${cand.trend} trend, RSI ${cand.rsi.toFixed(0)}`;
     this.log(`[${pf.kind}] BUY ${sym}: ${reason}, stop -${(cand.stopPct * 100).toFixed(1)}%, target +${(cand.targetPct * 100).toFixed(1)}%`, 'trade');
-    const mid = snap.prices[sym];
-    const onSwapSigned = this.journal(pf, { side: 'BUY', symbol: sym, amountIn: amountIn.toString(), reason, stopPct: cand.stopPct, targetPct: cand.targetPct, mid });
     let fill: Fill;
     try {
+      const hooks = pf.kind === 'live' ? this.journal({ side: 'BUY', symbol: sym, amountIn: amountIn.toString(), reason, stopPct: cand.stopPct, targetPct: cand.targetPct, mid }) : {};
       fill = await exec.swap({
         path: t.buyPath, tokenIn: ADDR.usdc, tokenOut: t.token.address, amountIn, hops: t.hops,
-        slippageBps: RISK.maxSlippageBps, gasPriceGwei: snap.baseFeeGwei + snap.tipGwei, ethUsd: snap.ethUsd, onSwapSigned,
+        slippageBps: RISK.maxSlippageBps, gasPriceGwei: snap.baseFeeGwei + snap.tipGwei, ethUsd: snap.ethUsd, ...hooks, canSend,
       }, (m) => this.log(`[${pf.kind}] ${m}`));
     } catch (e) {
       this.onTradeFailure(pf, `buy ${sym}`, e, false);
       return false;
     }
+    if (pf.kind === 'paper' && !canEnter()) return false;
     this.commitBuy(pf, t, fill, mid, cand.stopPct, cand.targetPct, reason, snap);
     return true;
   }
@@ -851,6 +964,7 @@ export class Engine {
     const spent = Number(formatUnits(fill.amountIn, USDC_DECIMALS));
     const pos = this.makePosition(t, fill.amountOut, spent, mid, fill.gasUsd, stopPct, targetPct, snap);
     pf.positions.push(pos);
+    pf.lastEntryHour = Math.floor(snap.timestamp / 3600);
     pf.gasSpentUsd += fill.gasUsd;
     if (pf.kind === 'paper') pf.cashUsd -= spent + fill.gasUsd;
     else this.afterLiveFill(-fill.amountIn, fill.blockNumber);
@@ -865,17 +979,20 @@ export class Engine {
     this.saveState();
   }
 
-  private async sell(pf: PortfolioState, exec: Executor, snap: Snapshot, pos: Position, reason: string, slippageBps: number): Promise<boolean> {
+  private async sell(pf: PortfolioState, exec: Executor, snap: Snapshot, pos: Position, reason: string, slippageBps: number, manual = false): Promise<boolean> {
+    const epoch = this.disarmEpoch;
+    const canSend = () => epoch === this.disarmEpoch && this.canTrade(snap) && (manual ? this.panicActive : this.state.armed && !this.panicActive);
+    if (pf.kind === 'live' && !canSend()) return false;
     const t = this.tm(pos.symbol);
     if (pf.kind === 'live') this.liveActed = true;
     this.log(`[${pf.kind}] SELL ${pos.symbol}: ${reason}`, 'trade');
     const amountIn = BigInt(pos.qtyRaw);
-    const onSwapSigned = this.journal(pf, { side: 'SELL', symbol: pos.symbol, amountIn: amountIn.toString(), reason, stopPct: pos.stopPct, targetPct: pos.targetPct, mid: snap.prices[pos.symbol] });
     let fill: Fill;
     try {
+      const hooks = pf.kind === 'live' ? this.journal({ side: 'SELL', symbol: pos.symbol, amountIn: amountIn.toString(), reason, stopPct: pos.stopPct, targetPct: pos.targetPct, mid: snap.prices[pos.symbol] ?? pos.entryMid }) : {};
       fill = await exec.swap({
         path: t.sellPath, tokenIn: t.token.address, tokenOut: ADDR.usdc, amountIn, hops: t.hops,
-        slippageBps, gasPriceGwei: snap.baseFeeGwei + snap.tipGwei, ethUsd: snap.ethUsd, onSwapSigned,
+        slippageBps, gasPriceGwei: snap.baseFeeGwei + snap.tipGwei, ethUsd: snap.ethUsd, ...hooks, canSend,
       }, (m) => this.log(`[${pf.kind}] ${m}`));
     } catch (e) {
       this.onTradeFailure(pf, `sell ${pos.symbol}`, e, true);
@@ -887,7 +1004,14 @@ export class Engine {
 
   private commitSell(pf: PortfolioState, t: TokenMarket, fill: Fill, reason: string) {
     const idx = pf.positions.findIndex((p) => p.symbol === t.token.symbol);
-    if (idx === -1) { if (pf.kind === 'live') this.afterLiveFill(fill.amountOut, fill.blockNumber); return; }
+    if (idx === -1) {
+      if (pf.kind === 'live') {
+        pf.gasSpentUsd += fill.gasUsd;
+        this.afterLiveFill(fill.amountOut, fill.blockNumber);
+        this.saveState();
+      }
+      return;
+    }
     const pos = pf.positions[idx];
     const got = Number(formatUnits(fill.amountOut, USDC_DECIMALS));
     const soldQty = Number(formatUnits(fill.amountIn, t.token.decimals));
@@ -920,13 +1044,11 @@ export class Engine {
   }
 
   private onTradeFailure(pf: PortfolioState, what: string, e: unknown, isExit: boolean) {
-    if (pf.kind === 'live' && this.state.pending) {
-      if (e instanceof UncertainTxError && this.state.pending.hash === e.hash) {
-        this.log(`[live] ${what}: ${e.message}. Will settle it from chain before trading again.`, 'warn');
-        this.saveState();
-        return;
-      }
-      this.state.pending = null;
+    if (pf.kind === 'live') this.discardUnsigned();
+    if (e instanceof LiveSendBlocked) {
+      this.log(`[${pf.kind}] ${what} canceled before broadcast. Any signed approvals will be reconciled.`, 'warn');
+      this.saveState();
+      return;
     }
     pf.consecutiveFailures++;
     if (isExit) pf.exitRetryAfter = Date.now() + 60_000 * Math.min(5, pf.consecutiveFailures);
@@ -934,27 +1056,35 @@ export class Engine {
     this.log(`[${pf.kind}] ${what} failed (${pf.consecutiveFailures}/${RISK.maxConsecutiveFailures}): ${errMsg(e)}`, 'error');
     if (pf.consecutiveFailures >= RISK.maxConsecutiveFailures && !pf.halted) {
       pf.halted = `${pf.consecutiveFailures} failed trades in a row`;
-      this.log(`[${pf.kind}] HALTED new buys after repeated failures (exits keep retrying). Check the log, then Reset.`, 'error');
+      this.log(`[${pf.kind}] HALTED new buys after repeated failures. Review the log before resetting.`, 'error');
     }
     this.saveState();
   }
 
+  private discardUnsigned() {
+    if (this.state.pending && !this.state.pending.hash && !this.state.pending.approvalHashes?.length) this.state.pending = null;
+  }
+
   // ------------------------------------------------------------------ controls
   arm() {
+    if (!liveEnabled()) throw new Error('Live broadcasting is disabled by configuration');
+    if (this.liveFault || this.stopping || this.panicActive) throw new Error(this.liveFault ?? 'Wallet controls are busy');
     this.state.armed = true;
     this.state.armedAt = Date.now();
+    this.saveState(true);
     this.log('Live trading ARMED by user. The bot will trade the wallet\'s USDC (and buy its own gas) automatically.', 'warn');
-    this.saveState();
   }
 
   disarm() {
     this.state.armed = false;
-    this.log('Live trading DISARMED by user. No new buys; open positions keep their stop-loss/target (use Panic sell to exit now).', 'warn');
-    this.saveState();
-    this.mev?.disarm('together with live trading'); // "Disarm" stops everything that uses real money
+    this.entryEpoch++;
+    this.disarmEpoch++;
+    this.log('Live trading disarmed. Automated sends are off. Already submitted transactions may still settle.', 'warn');
+    try { this.mev?.disarm('together with spot trading'); } finally { this.saveState(); }
   }
 
   setPaused(p: boolean) {
+    this.entryEpoch++;
     this.state.entriesPaused = p;
     this.log(p ? 'New entries paused by user (exits still managed).' : 'New entries resumed by user.', 'warn');
     this.saveState();
@@ -967,12 +1097,14 @@ export class Engine {
     pf.retryAfter = null;
     pf.exitRetryAfter = null;
     pf.pausedUntil = null;
-    if (this.snap) pf.peakEquity = this.equity(pf, this.snap);
+    const snap = this.snap;
+    if (snap && pf.positions.every((p) => positive(snap.prices[p.symbol]))) pf.peakEquity = this.riskEquity(pf, snap);
     this.log(`[${kind}] Circuit breaker reset by user.`, 'warn');
     this.saveState();
   }
 
   resetPaper() {
+    this.entryEpoch++;
     this.state.paper = newPortfolio('paper', CONFIG.paperStartUsd);
     this.log(`Paper portfolio reset to ${usd(CONFIG.paperStartUsd)}.`);
     this.saveState();
@@ -980,29 +1112,48 @@ export class Engine {
 
   /** Sell every open position now. Throws if any could not be sold. */
   async panic(kind: 'paper' | 'live') {
-    const pf = this.state[kind];
-    if (kind === 'live' && this.state.armed) this.disarm();
-    if (pf.positions.length === 0) { this.log(`[${kind}] Panic: no open positions.`, 'warn'); return; }
-    for (let i = 0; i < 2400 && this.busy; i++) await sleep(250);
-    if (this.busy) throw new Error('Bot is busy with another transaction; try again in a minute.');
-    this.busy = true;
-    const failed: string[] = [];
+    if (this.panicActive) throw new Error('A liquidation request is already running');
+    this.panicActive = true;
+    let locked = false;
     try {
-      const snap = await snapshot(this.market, this.wallet.account.address);
       if (kind === 'live') {
+        this.disarm();
+        if (!liveEnabled() || this.liveFault) throw new Error(this.liveFault ?? 'Live broadcasting is disabled by configuration');
+      }
+      const waitUntil = Date.now() + 10_000;
+      while (this.busy && Date.now() < waitUntil) await sleep(250);
+      if (this.busy) throw new Error('The active tick is still settling. New automated sends are disarmed. Retry Panic after it settles.');
+      this.busy = true;
+      locked = true;
+      const pf = this.state[kind];
+      if (!pf.positions.length && (kind === 'paper' || (!this.state.pending && await this.walletSettled()))) {
+        this.log(`[${kind}] Panic: no open positions.`, 'warn');
+        return;
+      }
+      let snap = await snapshot(this.market, this.wallet.account.address);
+      if (!this.isCurrent(snap)) throw new Error('Cannot liquidate using a stale Ethereum snapshot');
+      if (kind === 'live') {
+        if (!await this.walletSettled()) throw new Error('A wallet transaction is still settling. Retry Panic after it settles.');
         const settled = await this.reconcilePending(snap);
-        this.syncLive(snap, settled);
         if (this.state.pending) throw new Error('A transaction is still settling on chain; try again in a minute.');
+        if (!settled) throw new Error('Wallet settlement just completed. Retry Panic with a fresh balance snapshot.');
+        this.syncLive(snap, true);
       }
-      for (const pos of [...pf.positions]) {
-        const ok = await this.sell(pf, kind === 'live' ? this.liveExec : this.paperExec, snap, pos, 'panic sell by user', RISK.panicSlippageBps);
+      const failed: string[] = [];
+      const positions = [...pf.positions];
+      for (const [index, pos] of positions.entries()) {
+        const ok = await this.sell(pf, kind === 'live' ? this.liveExec : this.paperExec, snap, pos, 'panic sell by user', RISK.panicSlippageBps, true);
         if (!ok) failed.push(pos.symbol);
-        if (this.state.pending) break;
+        if (kind === 'live' && this.state.pending) throw new Error('A liquidation transaction is still settling. Review the wallet before retrying.');
+        if (ok && kind === 'live' && index + 1 < positions.length) snap = await snapshot(this.market, this.wallet.account.address);
       }
+      if (failed.length) throw new Error(`Panic sell failed for ${failed.join(', ')}. See the activity log.`);
     } finally {
-      this.busy = false;
-      this.saveState();
+      if (locked) {
+        this.busy = false;
+        this.saveState();
+      }
+      this.panicActive = false;
     }
-    if (failed.length) throw new Error(`Panic sell failed for ${failed.join(', ')} — see the activity log. Stop-loss rules keep protecting them.`);
   }
 }

@@ -4,13 +4,16 @@ import { CONFIG } from './config.js';
 
 export const publicClient = createPublicClient({
   chain: mainnet,
-  transport: http(CONFIG.rpcUrl, { batch: { batchSize: 25, wait: 10 }, retryCount: 3, retryDelay: 400, timeout: 25_000 }),
+  transport: http(CONFIG.rpcUrl, {
+    batch: { batchSize: 25, wait: 10 }, retryCount: 3, retryDelay: 400, timeout: 25_000,
+    fetchOptions: CONFIG.forkMode ? { redirect: 'error' } : undefined,
+  }),
 });
 
 /** Client used only to broadcast signed transactions (Flashbots Protect by default). */
 export const sendClient = createClient({
   chain: mainnet,
-  transport: http(CONFIG.sendRpcUrl, { retryCount: 1, timeout: 20_000 }),
+  transport: http(CONFIG.sendRpcUrl, { retryCount: 1, timeout: 20_000, fetchOptions: { redirect: 'error' } }),
 });
 
 /** Median priority fee of the last 10 blocks, clamped to a sane range. */

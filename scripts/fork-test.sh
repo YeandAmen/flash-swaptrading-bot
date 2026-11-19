@@ -1,32 +1,76 @@
 #!/usr/bin/env bash
-# Runs the live-trading code path against a local anvil fork of Ethereum mainnet with fake funds.
-# Never touches the real bot wallet or real money.
+# Runs integration tests with a throwaway wallet on an isolated Anvil instance.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-RPC_URL="$(grep -E '^RPC_URL=' .env | head -1 | cut -d= -f2-)"
-ANVIL="${ANVIL:-$(command -v anvil || echo "$HOME/.foundry/bin/anvil")}"
-TMP="$(mktemp -d)"
-PORT=8546
-TEST="${1:-cli-forktest}"
-case "$TEST" in cli-forktest|cli-mev-forktest) ;; *) echo "unknown test $TEST"; exit 1;; esac
-ANVIL_PID=""
-# (the temp dir only holds a throwaway fork-only key and test state; macOS cleans its temp folder)
-cleanup() { [ -n "$ANVIL_PID" ] && kill "$ANVIL_PID" 2>/dev/null || true; }
-trap cleanup EXIT
 
-"$ANVIL" --fork-url "$RPC_URL" --chain-id 1 --port $PORT --silent &
-ANVIL_PID=$!
-up=0
-for _ in $(seq 1 60); do
-  if curl -s -o /dev/null -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:$PORT; then up=1; break; fi
+suite="${1:-cli-forktest}"
+mode="${2:-}"
+case "$suite:$mode" in
+  cli-forktest:|cli-mev-forktest:|cli-wallet-forktest:|cli-wallet-forktest:--standalone) ;;
+  *) echo "Unknown test or mode: $suite $mode" >&2; exit 1 ;;
+esac
+
+anvil_bin="${ANVIL:-$(command -v anvil || true)}"
+if [[ -z "$anvil_bin" || ! -x "$anvil_bin" ]]; then
+  echo "Anvil is required. Install Foundry or set ANVIL to the Anvil executable." >&2
+  exit 1
+fi
+test_node="$(command -v node)"
+test_path="$PATH"
+test_file="${DIST:-dist}/$suite.js"
+if [[ ! -f "$test_file" ]]; then
+  echo "Run npm run build before running the fork tests." >&2
+  exit 1
+fi
+
+anvil_args=(--host 127.0.0.1 --port 0 --chain-id 1 --accounts 0 --color never)
+if [[ "$mode" != "--standalone" ]]; then
+  if [[ ! "${FORK_RPC_URL:-}" =~ ^https?:// ]]; then
+    echo "Set FORK_RPC_URL to an Ethereum mainnet archive RPC URL for Anvil's read-only upstream." >&2
+    exit 1
+  fi
+  anvil_args+=(--fork-url "$FORK_RPC_URL" --no-storage-caching)
+  if [[ -n "${FORK_BLOCK_NUMBER:-}" ]]; then
+    if [[ ! "$FORK_BLOCK_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+      echo "FORK_BLOCK_NUMBER must be a positive decimal block number." >&2
+      exit 1
+    fi
+    anvil_args+=(--fork-block-number "$FORK_BLOCK_NUMBER")
+  fi
+fi
+
+umask 077
+test_dir="$(mktemp -d "${TMPDIR:-/tmp}/eth-token-fork.XXXXXXXX")"
+anvil_pid=""
+cleanup() {
+  if [[ -n "$anvil_pid" ]]; then
+    kill "$anvil_pid" 2>/dev/null || true
+    wait "$anvil_pid" 2>/dev/null || true
+  fi
+  rm -rf "$test_dir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+env -i PATH="$test_path" "$anvil_bin" "${anvil_args[@]}" > "$test_dir/anvil.log" 2>&1 &
+anvil_pid=$!
+port=""
+for ((i = 0; i < 120; i++)); do
+  if ! kill -0 "$anvil_pid" 2>/dev/null; then break; fi
+  port="$(sed -n 's/^Listening on 127\.0\.0\.1:\([0-9][0-9]*\)$/\1/p' "$test_dir/anvil.log")"
+  if [[ -n "$port" ]]; then break; fi
   sleep 0.5
 done
-[ "$up" = 1 ] || { echo "anvil did not start"; exit 1; }
+if [[ -z "$port" ]]; then
+  echo "Anvil did not start. Check Anvil and access to the fork upstream." >&2
+  exit 1
+fi
 
-# throwaway key for the test wallet
-node -e "import('viem/accounts').then(a=>process.stdout.write(a.generatePrivateKey()))" > "$TMP/test.key"
-chmod 600 "$TMP/test.key"
+loopback="http://127.0.0.1:$port"
+env -i PATH="$test_path" "$test_node" --input-type=module -e \
+  "import { generatePrivateKey } from 'viem/accounts'; process.stdout.write(generatePrivateKey());" > "$test_dir/test.key"
 
-RPC_URL=http://127.0.0.1:$PORT SEND_RPC_URL=http://127.0.0.1:$PORT FORK_MODE=1 \
-WALLET_KEY_FILE="$TMP/test.key" DATA_DIR="$TMP/data" LOOP_SECONDS=5 \
-  node "${DIST:-dist}/${TEST}.js"
+env -i PATH="$test_path" RPC_URL="$loopback" SEND_RPC_URL="$loopback" \
+  FORK_MODE=1 ALLOW_LIVE_TRADING=off WALLET_KEY_FILE="$test_dir/test.key" \
+  DATA_DIR="$test_dir/data" LOOP_SECONDS=5 TOKEN_MODE=core "$test_node" "$test_file"

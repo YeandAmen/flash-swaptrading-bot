@@ -148,9 +148,10 @@ export interface Cycle {
  * Two x*y=k swaps compose into out = K·dx / (C + D·dx); profit is maximal at dx* = (√(K·C) − C) / D.
  * For v3 pools this is an estimate (it ignores tick crossings); the exact on-chain simulation decides.
  */
-export function bestCycle(pools: ArbPool[], res: (Reserves | null)[]): { gap: number; cycle: Cycle | null } {
+export function bestCycle(pools: ArbPool[], res: (Reserves | null)[]): { gap: number; cycle: Cycle | null; cycles: Cycle[] } {
   let gapBest = -Infinity;
   let cycle: Cycle | null = null;
+  const cycles: Cycle[] = [];
   for (let i = 0; i < pools.length; i++) {
     for (let j = 0; j < pools.length; j++) {
       const A = res[i];
@@ -160,14 +161,17 @@ export function bestCycle(pools: ArbPool[], res: (Reserves | null)[]): { gap: nu
       const gb = 1 - pools[j].fee;
       const gap = (gb * (B.w / B.t)) / (A.w / A.t / ga) - 1;
       if (gap > gapBest) gapBest = gap;
-      const K = ga * gb * A.t * B.w;
-      const C = A.w * B.t;
-      const D = ga * (B.t + gb * A.t);
-      if (!(K > C) || !(D > 0)) continue;
-      const dx = (Math.sqrt(K * C) - C) / D;
-      const profit = (K * dx) / (C + D * dx) - dx;
-      if (dx > 0 && Number.isFinite(profit) && (!cycle || profit > cycle.profit)) cycle = { buy: i, sell: j, dx, profit, gap };
+      if (!(gap > 0)) continue;
+      // Normalize by C and avoid subtracting nearly equal numbers when the spread is small.
+      const relativeSlope = ga * (1 + gb * (A.t / B.t)) / A.w;
+      const sqrtGap = gap / (Math.sqrt(1 + gap) + 1);
+      const dx = sqrtGap / relativeSlope;
+      const profit = dx * sqrtGap;
+      if (!(dx > 0 && profit > 0 && Number.isFinite(profit))) continue;
+      const route = { buy: i, sell: j, dx, profit, gap };
+      cycles.push(route);
+      if (!cycle || profit > cycle.profit) cycle = route;
     }
   }
-  return { gap: gapBest, cycle };
+  return { gap: gapBest, cycle, cycles };
 }

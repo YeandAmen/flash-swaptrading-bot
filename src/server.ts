@@ -4,26 +4,63 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import QRCode from 'qrcode';
 import { formatUnits } from 'viem';
 import { CONFIG, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from './config.js';
+import { createDashboardCredentialCheck } from './dashboard-auth.js';
+import { endpointOrigin, redactDiagnostic } from './diagnostics.js';
 import { Engine } from './engine.js';
 import type { PortfolioState } from './types.js';
 
 const engine = new Engine();
 const app = express();
+const dashboardCredentialMatches = createDashboardCredentialCheck();
+const liveTradingAllowed = CONFIG.allowLiveTrading || CONFIG.forkMode;
 app.disable('x-powered-by');
 
 // Only this machine, only this dashboard: block other hosts (DNS rebinding) and cross-site requests (CSRF).
 const allowed = new Set([`127.0.0.1:${CONFIG.port}`, `localhost:${CONFIG.port}`]);
+const allowedOrigins = new Set([...allowed].map((host) => `http://${host}`));
 app.use((req: Request, res: Response, next: NextFunction) => {
   if (!allowed.has(req.headers.host ?? '')) { res.status(403).send('Forbidden host'); return; }
-  if (req.method !== 'GET') {
-    const origin = (req.headers.origin ?? '').replace(/^https?:\/\//, '');
-    if (!allowed.has(origin) || req.headers['x-bot-ui'] !== '1') { res.status(403).json({ error: 'Forbidden' }); return; }
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    if (!allowedOrigins.has(req.headers.origin ?? '') || req.headers['x-bot-ui'] !== '1') {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
   }
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'");
   next();
+});
+
+function readiness(): { ready: boolean; reason: string } {
+  if (engine.stopping) return { ready: false, reason: 'Shutting down' };
+  if (engine.liveFault) return { ready: false, reason: 'Live transaction recovery requires review' };
+  if (engine.status !== 'running') return { ready: false, reason: engine.status === 'error' ? 'Startup failed' : 'Starting' };
+  if (engine.lastError) return { ready: false, reason: 'Market cycle failed' };
+  if (!engine.walletReady || engine.state.pending || engine.mev?.walletPending()) {
+    return { ready: false, reason: 'Waiting for wallet transaction settlement' };
+  }
+  if (!engine.lastTickAt || Date.now() - engine.lastTickAt > Math.max(90, CONFIG.loopSeconds * 3) * 1000) {
+    return { ready: false, reason: 'Market cycle is stale' };
+  }
+  if (!engine.snap || (!CONFIG.forkMode && Math.abs(Date.now() - engine.snap.timestamp * 1000) > 90_000)) {
+    return { ready: false, reason: 'Ethereum market data is stale' };
+  }
+  return { ready: true, reason: 'Market cycle is healthy' };
+}
+
+// Minimal loopback probes for launchd and monitoring. Dashboard data and controls require authentication.
+app.get('/api/health', (_req, res) => { res.json({ status: 'ok' }); });
+app.get('/api/ready', (_req, res) => {
+  const health = readiness();
+  res.status(health.ready ? 200 : 503).json(health);
+});
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (dashboardCredentialMatches(req.headers.authorization)) { next(); return; }
+  res.setHeader('WWW-Authenticate', 'Basic realm="ETH Token Bot", charset="UTF-8"');
+  res.status(401).json({ error: 'Sign in as operator with the password from npm run service:token.' });
 });
 app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(ROOT, 'public')));
@@ -57,6 +94,7 @@ function portfolioView(pf: PortfolioState) {
     }),
     maxPositions: RISK.maxPositions,
     trades: pf.trades.slice(-60).reverse(),
+    recordedTrades: pf.trades.length,
     equityHistory: downsample(pf.equityHistory, 300),
   };
 }
@@ -65,18 +103,24 @@ app.get('/api/state', (_req, res) => {
   const snap = engine.snap;
   const b = snap?.balances;
   const w = engine.wallet;
+  const mev = engine.mev?.view();
   res.json({
     now: Date.now(),
     status: engine.status,
     startupStep: engine.startupStep,
-    lastError: engine.lastError,
+    lastError: engine.lastError && redactDiagnostic(engine.lastError),
+    liveFault: engine.liveFault && redactDiagnostic(engine.liveFault),
+    walletReady: engine.walletReady,
+    health: readiness(),
+    liveTradingAllowed,
+    forkMode: CONFIG.forkMode,
     lastTickAt: engine.lastTickAt,
     loopSeconds: CONFIG.loopSeconds,
-    sendRpc: CONFIG.sendRpcUrl.replace(/\/\/([^/]+).*/, '//$1'),
+    sendRpc: endpointOrigin(CONFIG.sendRpcUrl),
     wallet: w
       ? {
           address: w.account.address,
-          storage: w.storage,
+          storage: w.storage === 'macOS Keychain' ? w.storage : 'local key file',
           eth: b ? Number(formatUnits(b.eth, 18)) : null,
           usdc: b ? Number(formatUnits(b.usdc, USDC_DECIMALS)) : null,
           tokens: b && engine.market
@@ -111,7 +155,7 @@ app.get('/api/state', (_req, res) => {
     gas: {
       autoTopup: GAS_TOPUP,
       topups: engine.state.topups.filter((x) => x.usd > 0).slice(-5).reverse(),
-      topupsToday: engine.state.topups.filter((x) => x.usd > 0 && Date.now() - x.t < 86_400_000).length,
+      topupsToday: engine.state.topups.filter((x) => Date.now() - x.t < 86_400_000).length,
     },
     paper: portfolioView(engine.state.paper),
     live: portfolioView(engine.state.live),
@@ -123,9 +167,14 @@ app.get('/api/state', (_req, res) => {
       ranAt: engine.research?.ranAt ?? null,
       ml: engine.research ? { ...engine.research.ml, rulesOos: slimBt(engine.research.ml.rulesOos), mlOos: slimBt(engine.research.ml.mlOos) } : null,
     },
-    events: engine.events.slice(-150).reverse(),
-    mev: engine.mev?.view() ?? null,
-    params: { risk: RISK, strategy: STRATEGY, tokens: TOKENS },
+    events: engine.events.slice(-150).reverse().map((event) => ({ ...event, msg: redactDiagnostic(event.msg) })),
+    mev: mev ? {
+      ...mev,
+      status: redactDiagnostic(mev.status),
+      lastError: mev.lastError && redactDiagnostic(mev.lastError),
+      recent: mev.recent.map((opportunity) => ({ ...opportunity, note: opportunity.note && redactDiagnostic(opportunity.note) })),
+    } : null,
+    params: { risk: RISK, strategy: STRATEGY, tokens: { ...TOKENS, listUrls: TOKENS.listUrls.map(endpointOrigin) } },
   });
 });
 
@@ -163,35 +212,44 @@ app.get('/api/qr.svg', async (_req, res) => {
 
 const kindOf = (req: Request) => (req.body?.kind === 'live' ? 'live' : 'paper') as 'paper' | 'live';
 
+function allowArming(res: Response): boolean {
+  if (!liveTradingAllowed) { res.status(403).json({ error: 'Live signing is disabled in settings' }); return false; }
+  const health = readiness();
+  if (!health.ready) { res.status(503).json({ error: health.reason }); return false; }
+  return true;
+}
+
+function control(operation: (req: Request) => void | Promise<void>) {
+  return async (req: Request, res: Response) => {
+    try {
+      await operation(req);
+      res.json({ ok: true });
+    } catch (error) {
+      const message = redactDiagnostic(String((error as Error)?.message ?? error).split('\n')[0]);
+      engine.log(`${req.path}: ${message}`, 'warn');
+      res.status(409).json({ error: 'The request could not complete. See the activity log.' });
+    }
+  };
+}
+
 app.post('/api/arm', (req, res) => {
   if (req.body?.confirm !== 'LIVE') { res.status(400).json({ error: 'Type LIVE to confirm' }); return; }
-  engine.arm();
-  res.json({ ok: true });
+  if (allowArming(res)) void control(() => engine.arm())(req, res);
 });
-app.post('/api/disarm', (_req, res) => { engine.disarm(); res.json({ ok: true }); });
+app.post('/api/disarm', control(() => engine.disarm()));
 app.post('/api/mev/arm', (req, res) => {
   if (req.body?.confirm !== 'MEV') { res.status(400).json({ error: 'Type MEV to confirm' }); return; }
-  if (!engine.mev) { res.status(503).json({ error: 'The bot is still starting; try again in a minute.' }); return; }
-  try {
-    engine.mev.arm();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ error: (e as Error).message });
-  }
+  if (!allowArming(res)) return;
+  const mev = engine.mev;
+  if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
+  void control(() => mev.arm())(req, res);
 });
-app.post('/api/mev/disarm', (_req, res) => { engine.mev?.disarm(); res.json({ ok: true }); });
-app.post('/api/pause', (req, res) => { engine.setPaused(!!req.body?.paused); res.json({ ok: true }); });
-app.post('/api/resume', (req, res) => { engine.resume(kindOf(req)); res.json({ ok: true }); });
-app.post('/api/paper/reset', (_req, res) => { engine.resetPaper(); res.json({ ok: true }); });
-app.post('/api/backtest', (_req, res) => { void engine.runResearchNow(); res.json({ ok: true }); });
-app.post('/api/panic', async (req, res) => {
-  try {
-    await engine.panic(kindOf(req));
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
-  }
-});
+app.post('/api/mev/disarm', control(() => engine.mev?.disarm()));
+app.post('/api/pause', control((req) => engine.setPaused(!!req.body?.paused)));
+app.post('/api/resume', control((req) => engine.resume(kindOf(req))));
+app.post('/api/paper/reset', control(() => engine.resetPaper()));
+app.post('/api/backtest', control(() => { void engine.runResearchNow(); }));
+app.post('/api/panic', control((req) => engine.panic(kindOf(req))));
 
 const server = app.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`Dashboard: http://localhost:${CONFIG.port}`);
@@ -219,4 +277,4 @@ const shutdown = async () => {
 };
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
-process.on('unhandledRejection', (e) => console.error('unhandledRejection', e));
+process.on('unhandledRejection', (e) => console.error('Unhandled promise rejection:', redactDiagnostic(String(e).split('\n')[0])));

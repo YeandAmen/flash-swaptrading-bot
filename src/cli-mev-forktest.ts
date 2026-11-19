@@ -2,23 +2,22 @@
 // Run via: npm run build && npm run mev-fork-test   (scripts/fork-test.sh starts anvil and sets the env)
 // A "whale" creates real price gaps between pools with big swaps; the searcher must find, simulate and capture them.
 import assert from 'node:assert/strict';
-import { createTestClient, createWalletClient, http, maxUint256, parseAbi, parseEther, type Address } from 'viem';
+import { createTestClient, createWalletClient, decodeFunctionData, http, maxUint256, parseAbi, parseEther, type Address } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
-import { ADDR, CONFIG, CORE_TOKENS } from './config.js';
+import { ADDR, CONFIG, CORE_TOKENS, MEV } from './config.js';
 import { erc20Abi, publicClient } from './chain.js';
 import { LiveExecutor } from './executor.js';
+import { assertForkTestEnvironment } from './forktest-env.js';
 import { FLASH_ARB_ABI } from './mev/artifact.js';
 import type { ArbPool, ArbToken } from './mev/pools.js';
 import { MevSearcher, type MevHost, type MevOpp } from './mev/searcher.js';
 import { loadOrCreateWallet } from './wallet.js';
 
-assert.ok(CONFIG.forkMode, 'FORK_MODE=1 required');
-assert.ok(/127\.0\.0\.1|localhost/.test(CONFIG.rpcUrl) && /127\.0\.0\.1|localhost/.test(CONFIG.sendRpcUrl), 'fork test must only talk to a local node');
-assert.ok(CONFIG.walletKeyFile, 'WALLET_KEY_FILE required (throwaway test key)');
+await assertForkTestEnvironment();
 
 const testClient = createTestClient({ chain: mainnet, mode: 'anvil', transport: http(CONFIG.rpcUrl) });
-const wc = createWalletClient({ chain: mainnet, transport: http(CONFIG.rpcUrl) });
+const wc = createWalletClient({ chain: mainnet, transport: http(CONFIG.rpcUrl, { timeout: 60_000, retryCount: 0 }) });
 const wait = async (hash: `0x${string}`) => {
   const r = await publicClient.waitForTransactionReceipt({ hash });
   assert.equal(r.status, 'success', `tx ${hash} succeeded`);
@@ -39,7 +38,7 @@ const host: MevHost = {
   tokens: () => CORE_TOKENS,
   tradePending: () => false,
 };
-const mev = new MevSearcher(host);
+let mev = new MevSearcher(host);
 await mev.refreshPools();
 const poolCount = mev.tokens.reduce((s, t) => s + t.pools.length, 0);
 for (const t of mev.tokens) console.log(`  ${t.token.symbol}: ${t.pools.map((p) => p.venue).join(', ')}`);
@@ -88,14 +87,45 @@ async function dump(t: ArbToken, p: ArbPool) {
 
 const latestOpp = (sym: string): MevOpp | undefined => mev.file.recent.find((o) => o.symbol === sym);
 const gasByRoute: Record<string, bigint> = {};
+let testBundleRestart = true;
+
+async function scan(searcher = mev) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await searcher.scanOnce();
+      return;
+    } catch (error) {
+      // Anvil may need to retry the upstream reads for a fresh local block. This guard runs
+      // before the scan can evaluate routes or sign anything, so repeating the read is safe.
+      if (attempt === 3 || !(error instanceof Error) || error.message !== 'pool snapshot did not match the block header') throw error;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+    }
+  }
+}
 
 /** Scan block after block (fork: each bundle is mined at once) until no bundle is pending and nothing new was sent. */
 async function settle(): Promise<MevOpp[]> {
   const before = new Set(mev.file.recent.filter((o) => o.hash).map((o) => o.hash));
   for (let i = 0; i < 8; i++) {
     const n = mev.file.stats.bundles;
-    await mev.scanOnce();
-    if (!(mev as unknown as { pending: unknown }).pending && mev.file.stats.bundles === n) break;
+    await scan();
+    if (testBundleRestart && mev.file.pending) {
+      const { hash } = mev.file.pending;
+      const restarted = new MevSearcher(host);
+      assert.equal(restarted.file.armed, false);
+      assert.equal(restarted.file.pending?.hash, hash, 'an unsettled bundle must survive restart');
+      await restarted.refreshPools();
+      await scan(restarted);
+      assert.equal(restarted.file.pending, null, 'the restarted paper searcher resolves the bundle');
+      assert.equal(restarted.file.recent.find((o) => o.hash === hash)?.status, 'landed', 'the restarted searcher books the verified receipt');
+      restarted.arm();
+      for (let i = 0; i < 500 && restarted.deploying; i++) await new Promise((r) => setTimeout(r, 100));
+      assert.equal(restarted.view().mode, 'live', 'explicit test rearm adopts the deployed contract');
+      mev = restarted;
+      testBundleRestart = false;
+      console.log('✓ Pending bundle survived restart and reconciled by receipt while disarmed');
+    }
+    if (!mev.file.pending && mev.file.stats.bundles === n) break;
   }
   return mev.file.recent.filter((o) => o.hash && !before.has(o.hash)).reverse(); // oldest first
 }
@@ -108,7 +138,17 @@ async function captures(t: ArbToken, label: string, buy: ArbPool, sell: ArbPool)
   const o = opps[0];
   assert.equal(o.status, 'landed', `${label}: landed (${o.note ?? ''})`);
   assert.ok(o.symbol === t.token.symbol && (o.buy === buy.venue || o.sell === sell.venue), `${label}: route ${o.buy} → ${o.sell}`);
-  for (const x of opps) assert.ok(x.status === 'landed' && x.netEth > 0, `${label}: every bundle landed with profit (${x.status} ${x.netEth})`);
+  for (const x of opps) {
+    assert.ok(x.status === 'landed' && x.netUsd >= MEV.minNetUsd, `${label}: every included bundle clears the minimum net profit`);
+    assert.ok(x.hash);
+    const tx = await publicClient.getTransaction({ hash: x.hash });
+    assert.equal(tx.type, 'eip1559');
+    const call = decodeFunctionData({ abi: FLASH_ARB_ABI, data: tx.input });
+    assert.equal(call.functionName, 'execute');
+    const order = call.args[0];
+    const minProfitWei = BigInt(Math.ceil(MEV.minNetUsd / host.ethUsd()! * 1e18));
+    assert.ok(order.minProfit >= order.tip + tx.gas * tx.maxFeePerGas + minProfitWei, `${label}: signed order enforces padded gas, builder tip, and minimum net on-chain`);
+  }
   const ethAfter = await publicClient.getBalance({ address: me });
   const diff = Number(ethAfter - ethBefore) / 1e18;
   const booked = opps.reduce((s, x) => s + x.netEth, 0);
@@ -134,7 +174,7 @@ const v2Of = (t: ArbToken, venue: string) => t.pools.find((p) => p.venue === ven
 const s1 = pick((t) => (v2Of(t, 'Uniswap v2') && v3Pools(t).length ? [v2Of(t, 'Uniswap v2')!, v3Pools(t)[0]] : null));
 await pump(s1.t, s1.a, 0.04); // TOKEN dearer on Uniswap v2 -> buy on v3, sell on v2
 const nonce0 = await publicClient.getTransactionCount({ address: me });
-await mev.scanOnce();
+await scan();
 const paper = latestOpp(s1.t.token.symbol);
 assert.ok(paper && paper.status === 'would send' && paper.sell === 'Uniswap v2', `paper: gap found and simulated (got ${paper?.status} ${paper?.note ?? ''})`);
 assert.equal(await publicClient.getTransactionCount({ address: me }), nonce0, 'paper mode sent nothing');
@@ -142,7 +182,7 @@ console.log(`✓ paper mode: ${s1.t.token.symbol} gap found, simulated profit ${
 
 // ---- 2. arm: deploys the contract once and verifies it
 mev.arm();
-for (let i = 0; i < 100 && (mev.deploying || !mev.file.contract); i++) await new Promise((r) => setTimeout(r, 100));
+for (let i = 0; i < 500 && (mev.deploying || !mev.file.contract); i++) await new Promise((r) => setTimeout(r, 100));
 const contract = mev.file.contract!;
 assert.ok(contract, 'contract deployed');
 assert.equal(String(await publicClient.readContract({ address: contract, abi: FLASH_ARB_ABI, functionName: 'owner' })).toLowerCase(), me.toLowerCase(), 'owner is the bot wallet');
@@ -154,14 +194,15 @@ await dump(s1.t, s1.a); // TOKEN now cheaper on Uniswap v2 -> buy on v2 (flash s
 await captures(s1.t, 'cheap on Uniswap v2', s1.a, s1.b);
 
 // every contract path explicitly (the scanner picks whichever pair pays most, so check v3->v3 and v2->v2 directly too)
-const s3 = pick((t) => (t !== s1.t && v3Pools(t).length >= 2 ? [v3Pools(t)[1], v3Pools(t)[0]] : null));
+const s3 = pick((t) => (t.token.address !== s1.t.token.address && v3Pools(t).length >= 2 ? [v3Pools(t)[1], v3Pools(t)[0]] : null));
 await pump(s3.t, s3.a, 0.05); // dearer in the pumped v3 tier
 {
   const sim = await mev.simulate(s3.t, s3.b, s3.a, parseEther('0.3'), (await publicClient.getBlockNumber()) + 5n);
   assert.ok(sim.ok && sim.profit > 0n, `v3→v3 contract path works (${JSON.stringify(sim, (_, v) => (typeof v === 'bigint' ? v.toString() : v))})`);
 }
 await captures(s3.t, 'dear in one v3 fee tier', s3.b, s3.a);
-const s4 = pick((t) => (t !== s1.t && t !== s3.t && v2Of(t, 'Uniswap v2') && v2Of(t, 'SushiSwap') ? [v2Of(t, 'SushiSwap')!, v2Of(t, 'Uniswap v2')!] : null));
+const s4 = pick((t) => (t.token.address !== s1.t.token.address && t.token.address !== s3.t.token.address
+  && v2Of(t, 'Uniswap v2') && v2Of(t, 'SushiSwap') ? [v2Of(t, 'SushiSwap')!, v2Of(t, 'Uniswap v2')!] : null));
 await pump(s4.t, s4.a, 0.04); // dearer on SushiSwap
 {
   const sim = await mev.simulate(s4.t, s4.b, s4.a, parseEther('0.1'), (await publicClient.getBlockNumber()) + 5n);
@@ -197,7 +238,7 @@ console.log(`✓ paper simulation matches the deployed contract exactly (${(Numb
 
 // ---- 6. disarm: back to paper mode
 mev.disarm();
-await mev.scanOnce();
+await scan();
 assert.equal(latestOpp(s3.t.token.symbol)?.status, 'would send', 'disarmed: only simulates');
 console.log('✓ disarmed: gap simulated, no bundle');
 
@@ -206,9 +247,15 @@ mev.arm();
 for (let i = 0; i < 50 && mev.deploying; i++) await new Promise((r) => setTimeout(r, 100));
 const again = new MevSearcher(host);
 assert.equal(again.file.contract, contract, 'state survives a restart');
-(again as any).ensureDeployed && (await (again as any).ensureDeployed());
+assert.equal(again.file.armed, false, 'MEV restarts in paper even when previously armed');
+const nonceBeforeRearm = await publicClient.getTransactionCount({ address: me });
+again.arm();
+for (let i = 0; i < 500 && again.deploying; i++) await new Promise((r) => setTimeout(r, 100));
+assert.equal(again.view().mode, 'live', 'explicit rearm verifies prior deployment');
 assert.equal(again.file.contract, contract, 'restart keeps the same contract');
-console.log('✓ restart: same contract, no redeploy');
+assert.equal(await publicClient.getTransactionCount({ address: me }), nonceBeforeRearm, 'valid deployment is reused without a transaction');
+again.disarm();
+console.log('✓ restart: paper mode by default, explicit rearm verified the existing contract');
 
 // ---- 8. nonce gate: a normal transaction waits while a bundle may still land
 assert.ok(exec.reserveForBundle(Date.now() + 1_500), 'bundle reservation');

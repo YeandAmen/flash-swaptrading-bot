@@ -1,12 +1,15 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   encodeFunctionData, keccak256, maxUint256, parseAbi, parseEventLogs, parseGwei,
   type Address, type Hex, type TransactionReceipt,
 } from 'viem';
 import { sendRawTransaction } from 'viem/actions';
 import type { PrivateKeyAccount } from 'viem/accounts';
-import { ADDR, CONFIG, RISK } from './config.js';
+import { ADDR, CONFIG, DATA_DIR, RISK } from './config.js';
 import { erc20Abi, publicClient, sendClient, suggestTipWei, swapRouter02Abi } from './chain.js';
 import { quoteExactIn } from './market.js';
+import { syncDirectory, writeJson } from './persistence.js';
 
 export interface SwapRequest {
   path: Hex;
@@ -19,6 +22,8 @@ export interface SwapRequest {
   ethUsd: number;
   /** Called with the swap tx hash and deadline right BEFORE it is broadcast, so it can be journaled. */
   onSwapSigned?: (hash: Hex, deadline: number) => void;
+  onApprovalSigned?: (hash: Hex) => void;
+  canSend?: () => boolean;
 }
 
 export interface Fill {
@@ -39,6 +44,46 @@ export class UncertainTxError extends Error {
   constructor(public hash: Hex, msg: string) {
     super(msg);
   }
+}
+
+export class LiveSendBlocked extends Error {
+  constructor() { super('Live transaction canceled before broadcast'); }
+}
+
+function checkSendAllowed(canSend?: () => boolean) {
+  if ((!CONFIG.allowLiveTrading && !CONFIG.forkMode) || (canSend && !canSend())) throw new LiveSendBlocked();
+}
+
+type Settlement = { status: 'receipt'; receipt: TransactionReceipt } | { status: 'dropped' } | { status: 'pending' };
+
+interface WalletIntent {
+  owner: Address;
+  hash: Hex;
+  nonce: number;
+  signedAt: number;
+}
+
+const WALLET_INTENT = path.join(DATA_DIR, 'wallet-transaction.json');
+
+function usesProtect() {
+  return !CONFIG.forkMode && new URL(CONFIG.sendRpcUrl).hostname === 'rpc.flashbots.net';
+}
+
+/** Use the transaction hash and canonical receipt. Elapsed swap deadlines do not settle a nonce. */
+export async function transactionSettlement(hash: Hex, checkProtect = true): Promise<Settlement> {
+  const receipt = await publicClient.getTransactionReceipt({ hash }).catch(() => null);
+  if (receipt) {
+    if (CONFIG.forkMode) return { status: 'receipt', receipt };
+    const head = await publicClient.getBlockNumber({ cacheTime: 0 }).catch(() => null);
+    if (head === null || head < receipt.blockNumber + 2n) return { status: 'pending' };
+    const canonical = await publicClient.getBlock({ blockNumber: receipt.blockNumber }).catch(() => null);
+    return canonical?.hash === receipt.blockHash ? { status: 'receipt', receipt } : { status: 'pending' };
+  }
+  if (checkProtect && usesProtect()) {
+    const status = await flashbotsStatus(hash);
+    if (status === 'FAILED' || status === 'CANCELLED') return { status: 'dropped' };
+  }
+  return { status: 'pending' };
 }
 
 /** USD cost of `units` gas at an effective gas price (base fee + tip). */
@@ -103,36 +148,75 @@ export function fillFromReceipt(receipt: TransactionReceipt, tokenIn: Address, t
 export class LiveExecutor implements Executor {
   kind = 'live' as const;
   private nextNonce = 0;
-  // Nonce gate shared with the MEV searcher: a Flashbots bundle signed with our next nonce may land until
-  // `bundleUntil`, so normal transactions wait for it; and no bundle is signed while a normal one is pending.
+  // Wallet operations queue as a unit, including their approvals. A bundle reserves the same writer.
   private bundleUntil = 0;
-  private txActive = 0;
+  private txActive = false;
   private txWaiting = 0;
+  private tail: Promise<void> = Promise.resolve();
   constructor(private account: PrivateKeyAccount) {}
 
   get address(): Address {
     return this.account.address;
   }
 
-  /** Runs one wallet operation (approve + swap, top-up, deploy) without overlapping a pending MEV bundle. */
+  private readIntent(): WalletIntent | null {
+    let raw: string;
+    try { raw = fs.readFileSync(WALLET_INTENT, 'utf8'); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    const intent: WalletIntent = JSON.parse(raw);
+    if (intent?.owner?.toLowerCase() !== this.address.toLowerCase() ||
+        !/^0x[0-9a-f]{64}$/i.test(intent.hash) || !Number.isSafeInteger(intent.nonce) ||
+        intent.nonce < 0 || !Number.isFinite(intent.signedAt)) {
+      throw new Error('Wallet transaction journal is invalid or belongs to a different wallet');
+    }
+    return intent;
+  }
+
+  private clearIntent(intent: WalletIntent) {
+    if (this.readIntent()?.hash !== intent.hash) return;
+    fs.unlinkSync(WALLET_INTENT);
+    syncDirectory(DATA_DIR);
+  }
+
+  private async recoverIntent(intent: WalletIntent): Promise<boolean> {
+    const result = await transactionSettlement(intent.hash, Date.now() - intent.signedAt > 45_000);
+    if (result.status === 'pending') return false;
+    if (result.status === 'receipt') this.noteNonceUsed(intent.nonce);
+    this.clearIntent(intent);
+    return true;
+  }
+
+  async reconcileWallet(): Promise<boolean> {
+    const intent = this.readIntent();
+    return !intent || (!this.txActive && await this.recoverIntent(intent));
+  }
+
   private async exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => { release = resolve; });
     this.txWaiting++;
     try {
-      while (Date.now() < this.bundleUntil) await sleep(CONFIG.forkMode ? 50 : 500);
-    } finally {
-      this.txWaiting--;
-    }
-    this.txActive++; // no await between the wait above and this line: the MEV searcher can't slip in
-    try {
+      await previous;
+      const until = Date.now() + 25_000;
+      while (Date.now() < this.bundleUntil && Date.now() < until) await sleep(CONFIG.forkMode ? 50 : 500);
+      if (Date.now() < this.bundleUntil) throw new Error('Waiting for the outstanding MEV bundle to settle');
+      this.txActive = true;
+      const intent = this.readIntent();
+      if (intent && !await this.recoverIntent(intent)) throw new UncertainTxError(intent.hash, 'An earlier wallet transaction is still settling');
       return await fn();
     } finally {
-      this.txActive--;
+      this.txActive = false;
+      this.txWaiting--;
+      release();
     }
   }
 
   /** MEV: block normal transactions until `untilMs` so a bundle can use our next nonce. False if one is in progress. */
   reserveForBundle(untilMs: number): boolean {
-    if (this.txActive > 0 || this.txWaiting > 0) return false;
+    if (this.txActive || this.txWaiting > 0 || this.readIntent()) return false;
     this.bundleUntil = Math.max(this.bundleUntil, untilMs);
     return true;
   }
@@ -143,7 +227,7 @@ export class LiveExecutor implements Executor {
 
   /** Next nonce for a bundle (a lagging RPC node may not know our last mined transaction yet). */
   async bundleNonce(): Promise<number> {
-    const chainNonce = await publicClient.getTransactionCount({ address: this.account.address, blockTag: 'latest' });
+    const chainNonce = await this.chainNonce();
     return Math.max(chainNonce, this.nextNonce);
   }
 
@@ -151,33 +235,43 @@ export class LiveExecutor implements Executor {
     this.nextNonce = Math.max(this.nextNonce, nonce + 1);
   }
 
+  private async chainNonce() {
+    const [latest, pending] = await Promise.all([
+      publicClient.getTransactionCount({ address: this.address, blockTag: 'latest' }),
+      publicClient.getTransactionCount({ address: this.address, blockTag: 'pending' }),
+    ]);
+    if (pending > latest) throw new Error('Wallet has an external pending transaction');
+    return latest;
+  }
+
   /** Deploys a contract from the bot wallet (privately, like every transaction). */
-  async deployContract(bytecode: Hex, log: (m: string) => void, onSigned?: (hash: Hex) => void): Promise<{ address: Address; hash: Hex; gasWei: bigint }> {
+  async deployContract(bytecode: Hex, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean): Promise<{ address: Address; hash: Hex; gasWei: bigint }> {
     return this.exclusive(async () => {
-      const { hash, receipt } = await this.sendTx(null, bytecode, 'deploy', log, onSigned);
+      const { hash, receipt } = await this.sendTx(null, bytecode, 'deploy', log, onSigned, canSend);
       if (!receipt.contractAddress) throw new Error(`deploy ${hash} mined but created no contract`);
       return { address: receipt.contractAddress, hash, gasWei: receipt.gasUsed * receipt.effectiveGasPrice };
     });
   }
 
   /** Approve the router for exactly `amount` (resetting a partial allowance first). Returns gas spent in wei. */
-  private async ensureAllowance(token: Address, amount: bigint, hashes: Hex[], log: (m: string) => void): Promise<bigint> {
+  private async ensureAllowance(token: Address, amount: bigint, hashes: Hex[], log: (m: string) => void, onSigned?: (hash: Hex) => void, canSend?: () => boolean): Promise<bigint> {
+    checkSendAllowed(canSend);
     const owner = this.account.address;
     let gasWei = 0n;
     const allowance = await publicClient.readContract({
       address: token, abi: erc20Abi, functionName: 'allowance', args: [owner, ADDR.swapRouter02],
     });
-    if (allowance >= amount) return 0n;
+    if (allowance === amount || (RISK.approvalMode === 'unlimited' && allowance >= amount)) return 0n;
     // Some tokens (e.g. LDO, USDT) refuse to change a non-zero allowance directly: reset to 0 first.
     if (allowance > 0n) {
       const zero = encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [ADDR.swapRouter02, 0n] });
-      const z = await this.sendTx(token, zero, 'approve-reset', log);
+      const z = await this.sendTx(token, zero, 'approve-reset', log, onSigned, canSend);
       hashes.push(z.hash);
       gasWei += z.receipt.gasUsed * z.receipt.effectiveGasPrice;
     }
     const value = RISK.approvalMode === 'unlimited' ? maxUint256 : amount;
     const data = encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [ADDR.swapRouter02, value] });
-    const a = await this.sendTx(token, data, 'approve', log);
+    const a = await this.sendTx(token, data, 'approve', log, onSigned, canSend);
     hashes.push(a.hash);
     gasWei += a.receipt.gasUsed * a.receipt.effectiveGasPrice;
     return gasWei;
@@ -187,14 +281,14 @@ export class LiveExecutor implements Executor {
    * Gas top-up: swap `usdcIn` USDC -> WETH and unwrap to native ETH in one transaction.
    * Returns USDC spent and ETH received (read from the WETH Withdrawal event).
    */
-  async topUpGas(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void) {
-    return this.exclusive(() => this.topUpGasNow(usdcIn, path, slippageBps, ethUsd, onSigned, log));
+  async topUpGas(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void, onApprovalSigned?: (hash: Hex) => void, canSend?: () => boolean) {
+    return this.exclusive(() => this.topUpGasNow(usdcIn, path, slippageBps, ethUsd, onSigned, log, onApprovalSigned, canSend));
   }
 
-  private async topUpGasNow(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void) {
+  private async topUpGasNow(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void, onApprovalSigned?: (hash: Hex) => void, canSend?: () => boolean) {
     const owner = this.account.address;
     const hashes: Hex[] = [];
-    let gasWei = await this.ensureAllowance(ADDR.usdc, usdcIn, hashes, log);
+    let gasWei = await this.ensureAllowance(ADDR.usdc, usdcIn, hashes, log, onApprovalSigned, canSend);
     const q = await quoteExactIn(path, usdcIn);
     const minOut = (q.amountOut * BigInt(10_000 - slippageBps)) / 10_000n;
     const deadline = Math.floor(Date.now() / 1000) + 300;
@@ -204,11 +298,11 @@ export class LiveExecutor implements Executor {
     });
     const unwrap = encodeFunctionData({ abi: swapRouter02Abi, functionName: 'unwrapWETH9', args: [minOut, owner] });
     const data = encodeFunctionData({ abi: swapRouter02Abi, functionName: 'multicall', args: [BigInt(deadline), [swap, unwrap]] });
-    const { hash, receipt } = await this.sendTx(ADDR.swapRouter02, data, 'gas-topup', log, (h) => onSigned(h, deadline));
+    const { hash, receipt } = await this.sendTx(ADDR.swapRouter02, data, 'gas-topup', log, (h) => onSigned(h, deadline), canSend);
     hashes.push(hash);
     const t = topUpFromReceipt(receipt, owner);
     gasWei += t.gasWei;
-    if (t.ethOut === 0n) throw new Error(`gas top-up ${hash} mined but no ETH was unwrapped`);
+    if (t.ethOut === 0n || t.usdcIn === 0n) throw new Error(`gas top-up ${hash} mined but receipt amounts could not be verified`);
     return { usdcIn: t.usdcIn, ethOut: t.ethOut, gasUsd: (Number(gasWei) / 1e18) * ethUsd, txHashes: hashes, blockNumber: receipt.blockNumber };
   }
 
@@ -219,7 +313,7 @@ export class LiveExecutor implements Executor {
   private async swapNow(r: SwapRequest, log: (m: string) => void): Promise<Fill> {
     const owner = this.account.address;
     const hashes: Hex[] = [];
-    let gasWei = await this.ensureAllowance(r.tokenIn, r.amountIn, hashes, log);
+    let gasWei = await this.ensureAllowance(r.tokenIn, r.amountIn, hashes, log, r.onApprovalSigned, r.canSend);
 
     const q = await quoteExactIn(r.path, r.amountIn);
     const minOut = (q.amountOut * BigInt(10_000 - r.slippageBps)) / 10_000n;
@@ -230,20 +324,21 @@ export class LiveExecutor implements Executor {
       args: [{ path: r.path, recipient: owner, amountIn: r.amountIn, amountOutMinimum: minOut }],
     });
     const data = encodeFunctionData({ abi: swapRouter02Abi, functionName: 'multicall', args: [BigInt(deadline), [inner]] });
-    const { hash, receipt } = await this.sendTx(ADDR.swapRouter02, data, 'swap', log, (h) => r.onSwapSigned?.(h, deadline));
+    const { hash, receipt } = await this.sendTx(ADDR.swapRouter02, data, 'swap', log, (h) => r.onSwapSigned?.(h, deadline), r.canSend);
     hashes.push(hash);
     const f = fillFromReceipt(receipt, r.tokenIn, r.tokenOut, owner);
     gasWei += f.gasWei;
-    if (f.amountOut === 0n) throw new Error(`swap ${hash} mined but no output transfer found`);
+    if (f.amountOut === 0n || f.amountIn === 0n) throw new Error(`swap ${hash} mined but receipt amounts could not be verified`);
 
     return { amountIn: f.amountIn, amountOut: f.amountOut, gasUsd: (Number(gasWei) / 1e18) * r.ethUsd, txHashes: hashes, blockNumber: receipt.blockNumber };
   }
 
   /** `to: null` deploys a contract (`data` = creation code). */
-  private async sendTx(to: Address | null, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex) => void) {
+  private async sendTx(to: Address | null, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean) {
+    checkSendAllowed(canSend);
     const from = this.account.address;
     const [chainNonce, block, maxPriorityFeePerGas] = await Promise.all([
-      publicClient.getTransactionCount({ address: from, blockTag: 'latest' }),
+      this.chainNonce(),
       publicClient.getBlock({ blockTag: 'latest' }),
       suggestTipWei(),
     ]);
@@ -254,11 +349,21 @@ export class LiveExecutor implements Executor {
     // estimateGas executes the tx against current state: it throws (and we abort) if it would revert.
     const gasEst = await publicClient.estimateGas({ account: from, to: to ?? undefined, data });
     const gas = (gasEst * 130n) / 100n;
+    checkSendAllowed(canSend);
     const serializedTransaction = await this.account.signTransaction({
       chainId: publicClient.chain.id, type: 'eip1559', to, data, nonce, gas, maxFeePerGas, maxPriorityFeePerGas, value: 0n,
     });
+    checkSendAllowed(canSend);
     const hash = keccak256(serializedTransaction);
-    onSigned?.(hash);
+    const intent = { owner: from, hash, nonce, signedAt: Date.now() };
+    writeJson(WALLET_INTENT, intent, true);
+    try {
+      onSigned?.(hash, nonce);
+      checkSendAllowed(canSend);
+    } catch (error) {
+      this.clearIntent(intent);
+      throw error;
+    }
 
     let sendErr: unknown = null;
     try {
@@ -269,50 +374,28 @@ export class LiveExecutor implements Executor {
       log(`${label} broadcast error (${errMsg(e)}) — checking whether it landed anyway`);
     }
 
-    let receipt: TransactionReceipt;
-    try {
-      receipt = await this.waitReceipt(hash, sendErr ? 90_000 : 6 * 60_000);
-    } catch (e) {
-      if (e instanceof Error && e.message.startsWith('Flashbots reports')) throw e; // definitively dropped
-      const rejected = /nonce too low|insufficient funds|intrinsic gas|underpriced|fee cap|less than block base fee|invalid sender|exceeds block gas limit/i;
-      if (sendErr && rejected.test(errMsg(sendErr) + ' ' + String((sendErr as { details?: string }).details ?? ''))) {
-        throw new Error(`${label} rejected by RPC: ${errMsg(sendErr)}`); // node refused it: nothing was broadcast
-      }
-      throw new UncertainTxError(hash, `${label} outcome unknown (${sendErr ? 'broadcast error' : 'not mined in time'}): ${hash}`);
-    }
-    this.nextNonce = nonce + 1;
+    const result = await this.waitSettlement(intent, sendErr ? 90_000 : 6 * 60_000);
+    if (result.status === 'pending') throw new UncertainTxError(hash, `${label} outcome unknown (${sendErr ? 'broadcast error' : 'receipt timeout'}): ${hash}`);
+    if (result.status === 'receipt') this.noteNonceUsed(nonce);
+    this.clearIntent(intent);
+    if (result.status === 'dropped') throw new Error(`Flashbots dropped ${label} transaction ${hash}`);
+    const { receipt } = result;
     if (receipt.status !== 'success') throw new Error(`${label} tx reverted: ${hash}`);
     log(`${label} confirmed in block ${receipt.blockNumber}`);
-    await this.waitForNode(receipt.blockNumber);
     return { hash, receipt };
   }
 
-  /** Wait until our read RPC has caught up to `bn`, so follow-up reads/simulations see the new state. */
-  private async waitForNode(bn: bigint) {
-    for (let i = 0; i < 20; i++) {
-      try {
-        if ((await publicClient.getBlockNumber({ cacheTime: 0 })) >= bn) return;
-      } catch { /* retry */ }
-      await sleep(CONFIG.forkMode ? 100 : 1_500);
-    }
-  }
-
-  private async waitReceipt(hash: Hex, timeoutMs: number): Promise<TransactionReceipt> {
-    const start = Date.now();
+  private async waitSettlement(intent: WalletIntent, timeoutMs: number): Promise<Settlement> {
     let lastStatusCheck = 0;
-    const usesFlashbots = CONFIG.sendRpcUrl.includes('flashbots') && !CONFIG.forkMode;
-    while (Date.now() - start < timeoutMs) {
-      try {
-        return await publicClient.getTransactionReceipt({ hash });
-      } catch { /* not mined yet */ }
-      if (usesFlashbots && Date.now() - start > 45_000 && Date.now() - lastStatusCheck > 30_000) {
-        lastStatusCheck = Date.now();
-        const status = await flashbotsStatus(hash);
-        if (status === 'FAILED' || status === 'CANCELLED') throw new Error(`Flashbots reports tx ${status}: ${hash}`);
-      }
+    while (Date.now() - intent.signedAt < timeoutMs) {
+      const now = Date.now();
+      const checkProtect = now - intent.signedAt > 45_000 && now - lastStatusCheck > 30_000;
+      if (checkProtect) lastStatusCheck = now;
+      const result = await transactionSettlement(intent.hash, checkProtect);
+      if (result.status !== 'pending') return result;
       await sleep(CONFIG.forkMode ? 300 : 3_000);
     }
-    throw new Error(`tx not mined within ${Math.round(timeoutMs / 1000)}s: ${hash}`);
+    return { status: 'pending' };
   }
 }
 

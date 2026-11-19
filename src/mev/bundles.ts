@@ -30,22 +30,30 @@ export interface BuilderResult {
   detail: string;
 }
 
-const errMsg = (e: unknown) => ((e as Error)?.message ?? String(e)).split('\n')[0].slice(0, 120);
+function bundleHashOf(value: unknown): Hex | null {
+  if (!value || typeof value !== 'object') return null;
+  const reply = value as { jsonrpc?: unknown; id?: unknown; error?: unknown; result?: { bundleHash?: unknown } };
+  const hash = reply.result?.bundleHash;
+  return reply.jsonrpc === '2.0' && reply.id === 1 && !reply.error && typeof hash === 'string' && /^0x[0-9a-f]{64}$/i.test(hash)
+    ? hash as Hex : null;
+}
 
 /**
- * Sends a bundle to several block builders for ONE target block. A bundle is all-or-nothing: if any transaction in it
- * would revert, builders drop it, so an arbitrage that is no longer profitable simply never lands (and costs nothing).
- * On a local fork (tests) the transactions are sent directly instead.
+ * Ask each builder to include the bundle for one target block, with no permitted reverts. The caller checks settlement
+ * independently by transaction hash. The local fork uses raw transactions to exercise the contract and settlement path.
  */
-export async function sendBundle(signedTxs: Hex[], targetBlock: bigint): Promise<BuilderResult[]> {
+export async function sendBundle(signedTxs: Hex[], targetBlock: bigint, canSend: () => boolean): Promise<BuilderResult[]> {
+  const allowed = () => (CONFIG.allowLiveTrading || CONFIG.forkMode) && canSend();
+  if (!allowed()) return [];
   if (CONFIG.forkMode) {
     const out: BuilderResult[] = [];
     for (const tx of signedTxs) {
+      if (!allowed()) break;
       try {
         const hash = await publicClient.request({ method: 'eth_sendRawTransaction', params: [tx] });
         out.push({ builder: 'fork', ok: true, detail: String(hash) });
-      } catch (e) {
-        out.push({ builder: 'fork', ok: false, detail: errMsg(e) });
+      } catch {
+        out.push({ builder: 'fork', ok: false, detail: 'local submission outcome unknown' });
       }
     }
     return out;
@@ -54,18 +62,18 @@ export async function sendBundle(signedTxs: Hex[], targetBlock: bigint): Promise
   const signer = authSigner();
   // Flashbots auth: EIP-191 signature of the hex string of keccak256(body), sent as "address:signature"
   const signature = await signer.signMessage({ message: keccak256(stringToHex(body)) });
+  if (!allowed()) return [];
   const headers = { 'content-type': 'application/json', 'x-flashbots-signature': `${signer.address}:${signature}` };
   return Promise.all(MEV.builders.map(async (url): Promise<BuilderResult> => {
     const builder = new URL(url).hostname;
     try {
-      const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(4_000) });
-      const text = await res.text();
-      let j: { error?: { message?: string } } | null = null;
-      try { j = JSON.parse(text); } catch { /* not JSON */ }
-      if (!res.ok || j?.error) return { builder, ok: false, detail: (j?.error?.message ?? (text || res.statusText)).slice(0, 120) };
-      return { builder, ok: true, detail: 'accepted' };
-    } catch (e) {
-      return { builder, ok: false, detail: errMsg(e) };
+      const res = await fetch(url, { method: 'POST', redirect: 'error', headers, body, signal: AbortSignal.timeout(4_000) });
+      if (!res.ok) return { builder, ok: false, detail: `HTTP ${res.status}` };
+      const reply: unknown = await res.json().catch(() => null);
+      const hash = bundleHashOf(reply);
+      return hash ? { builder, ok: true, detail: hash } : { builder, ok: false, detail: 'no valid bundle acknowledgement' };
+    } catch {
+      return { builder, ok: false, detail: 'submission outcome unknown' };
     }
   }));
 }

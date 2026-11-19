@@ -46,9 +46,11 @@ for (const g of [gasNow, 0.3]) {
   log(`\n=== gas ${g.toPrecision(2)} gwei (${g === gasNow ? 'now' : 'cheap-gas scenario'}) — ${((Date.now() - t0) / 1000).toFixed(0)}s ===`);
   show(r.rules);
   const m = r.ml;
-  log(`  ML walk-forward: AUC ${m.auc === null ? 'n/a' : m.auc.toFixed(3)} on ${m.oosRows} unseen token-hours (base rate ${m.baseRate === null ? 'n/a' : pct(m.baseRate)}), ${m.folds} re-trains, out-of-sample from ${new Date(m.oosFrom).toISOString().slice(0, 10)}`);
+  const holdoutFrom = m.oosFrom ? new Date(m.oosFrom).toISOString().slice(0, 10) : 'n/a';
+  log(`  ML final holdout: AUC ${m.auc === null ? 'n/a' : m.auc.toFixed(3)} on ${m.oosRows} labelled token-hours (base rate ${m.baseRate === null ? 'n/a' : pct(m.baseRate)}), ${m.folds} walk-forward re-trains, holdout from ${holdoutFrom}`);
   show(m.rulesOos);
-  for (const x of m.thresholds) log(`  ML ${x.threshold}x base rate`.padEnd(25) + `${pct(x.returnPct)} | trades ${x.trades} | max DD ${pct(x.maxDrawdownPct)}`);
+  show(m.mlOos);
+  for (const x of m.thresholds) log(`  Calibration ${x.threshold}x base rate`.padEnd(31) + `${pct(x.returnPct)} | trades ${x.trades} | max DD ${pct(x.maxDrawdownPct)}`);
   log(`  → ${m.active ? 'ML ACTIVE' : 'rules stay in charge'}: ${m.reason}`);
   if (g === gasNow) {
     log(`  Top features: ${m.importance.map((f) => `${f.name} ${f.weight >= 0 ? '+' : ''}${f.weight.toFixed(2)}`).join(', ')}`);

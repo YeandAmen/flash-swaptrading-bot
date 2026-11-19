@@ -46,6 +46,7 @@ export interface PortfolioState {
   gasSpentUsd: number;
   netDepositsUsd: number;
   cooldowns: Record<string, number>;
+  lastEntryHour?: number | null;
   consecutiveFailures: number;
   retryAfter: number | null; // entries
   exitRetryAfter?: number | null; // exits (short backoff)
@@ -73,6 +74,7 @@ export const newPortfolio = (kind: 'paper' | 'live', cash: number): PortfolioSta
   gasSpentUsd: 0,
   netDepositsUsd: kind === 'paper' ? cash : 0,
   cooldowns: {},
+  lastEntryHour: null,
   consecutiveFailures: 0,
   retryAfter: null,
   exitRetryAfter: null,

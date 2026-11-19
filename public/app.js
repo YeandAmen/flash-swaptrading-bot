@@ -12,6 +12,7 @@ const ago = (t) => { const s = Math.round((Date.now() - t) / 1000); return s < 6
 let S = null;
 let tab = 'live';
 let qrLoaded = false;
+let panicPending = false;
 
 async function api(path, body) {
   const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-bot-ui': '1' }, body: JSON.stringify(body || {}) });
@@ -23,6 +24,12 @@ async function api(path, body) {
 async function refresh() {
   try {
     const r = await fetch('/api/state', { cache: 'no-store' });
+    if (r.status === 401) {
+      $('banner').className = 'banner warn';
+      $('bannerText').textContent = 'Sign in as operator with the password from npm run service:token.';
+      return;
+    }
+    if (!r.ok) throw new Error(r.statusText);
     S = await r.json();
     render();
   } catch (e) {
@@ -49,12 +56,21 @@ function render() {
   // mode + banner
   const pill = $('modePill');
   const banner = $('banner');
-  if (S.status === 'starting') {
+  if (S.liveFault) {
+    pill.className = 'pill err'; pill.textContent = 'RECOVERY';
+    banner.className = 'banner bad'; $('bannerText').textContent = S.liveFault;
+  } else if (S.status === 'starting') {
     pill.className = 'pill wait'; pill.textContent = 'STARTING';
     banner.className = 'banner warn'; $('bannerText').textContent = 'Starting: ' + S.startupStep + '…';
   } else if (S.status === 'error' || S.lastError) {
     pill.className = 'pill err'; pill.textContent = S.status === 'error' ? 'ERROR' : (S.armed ? 'LIVE' : 'PAPER');
     banner.className = 'banner bad'; $('bannerText').textContent = 'Problem: ' + (S.lastError || 'unknown') + ' — the bot retries automatically.';
+  } else if (!S.health.ready) {
+    pill.className = 'pill err'; pill.textContent = 'UNREADY';
+    banner.className = 'banner bad'; $('bannerText').textContent = S.health.reason;
+  } else if (S.forkMode) {
+    pill.className = 'pill paper'; pill.textContent = 'LOCAL FORK';
+    banner.className = 'banner'; $('bannerText').textContent = 'Connected to a local Ethereum fork with test funds.';
   } else if (S.armed && S.liveStatus.ready) {
     pill.className = 'pill live'; pill.textContent = 'LIVE';
     banner.className = 'banner ok'; $('bannerText').textContent = 'Live trading active. ' + (S.live.lastDecision || '');
@@ -63,7 +79,9 @@ function render() {
     banner.className = 'banner warn'; $('bannerText').textContent = S.liveStatus.reason;
   } else {
     pill.className = 'pill paper'; pill.textContent = 'PAPER';
-    banner.className = 'banner'; $('bannerText').textContent = 'Paper trading with real on-chain prices. Live trading is off until you arm it.';
+    banner.className = 'banner'; $('bannerText').textContent = S.liveTradingAllowed
+      ? 'Paper trading with on-chain prices. Live modes start disarmed.'
+      : 'Paper trading with on-chain prices. Live signing is disabled in settings.';
   }
 
   // wallet
@@ -83,11 +101,13 @@ function render() {
     const a = G.autoTopup;
     const last = G.topups && G.topups[0];
     $('wGas').textContent = a.enabled
-      ? `ON · buys ${usd(a.usd)} of ETH when < ${a.belowEth} ETH · today ${G.topupsToday}/${a.maxPerDay}` + (last ? ` · last ${last.eth.toFixed(5)} ETH ${time(last.t)}` : '')
+      ? `When spot is armed · buys ${usd(a.usd)} of ETH below ${a.belowEth} ETH · ${G.topupsToday}/${a.maxPerDay} attempts in 24h` + (last ? ` · last ${last.eth.toFixed(5)} ETH ${time(last.t)}` : '')
       : 'OFF';
   }
   $('armBtn').hidden = S.armed;
-  $('disarmBtn').hidden = !S.armed;
+  $('armBtn').disabled = !S.liveTradingAllowed || !S.health.ready;
+  $('disarmBtn').hidden = !S.armed && !S.mev?.armed;
+  $('wNote').hidden = !S.liveTradingAllowed || S.forkMode;
 
   // live
   const L = S.live;
@@ -107,7 +127,7 @@ function render() {
   $('pPos').innerHTML = posList(P.positions, P.maxPositions);
   $('pReal').innerHTML = `<span class="${cls(P.realizedPnlUsd)}">${usd(P.realizedPnlUsd)}</span>`;
   $('pGas').textContent = usd(P.gasSpentUsd);
-  $('pTrades').textContent = P.trades.length;
+  $('pTrades').textContent = P.recordedTrades;
   $('pDecision').textContent = (P.halted ? 'HALTED: ' + P.halted + ' · ' : '') + P.lastDecision;
 
   // brain
@@ -176,12 +196,12 @@ function render() {
     const aucTxt = M.auc == null ? 'n/a' : M.auc.toFixed(3);
     $('mlMode').innerHTML = M.active ? '<span class="tag buy">AI ACTIVE</span>' : '<span class="tag flat">RULES IN CHARGE</span>';
     $('mlSummary').innerHTML = `${esc(M.reason)}.` +
-      `<div class="sub" style="margin-top:6px">Out-of-sample since ${M.oosFrom ? new Date(M.oosFrom).toLocaleDateString() : '–'} · ${M.folds} re-trains · ${(M.oosRows || 0).toLocaleString()} unseen token-hours · base rate ${M.baseRate == null ? '–' : pct(M.baseRate, 1).replace('+', '')} · last run ${SG.ranAt ? time(SG.ranAt) : '–'}${SG.researching ? ' · re-training…' : ''}</div>`;
+      `<div class="sub" style="margin-top:6px">Final holdout since ${M.oosFrom ? new Date(M.oosFrom).toLocaleDateString() : '–'} · ${M.folds} re-trains · ${(M.oosRows || 0).toLocaleString()} labelled holdout token-hours · base rate ${M.baseRate == null ? '–' : pct(M.baseRate, 1).replace('+', '')} · last run ${SG.ranAt ? time(SG.ranAt) : '–'}${SG.researching ? ' · re-training…' : ''}</div>`;
     $('mlAuc').textContent = aucTxt;
     $('mlAuc').className = 'v ' + (M.auc != null && M.auc >= 0.55 ? 'pos' : 'amb');
     $('mlRules').innerHTML = M.rulesOos ? `<span class="${cls(M.rulesOos.returnPct)}">${pct(M.rulesOos.returnPct)}</span>` : '–';
     $('mlBest').innerHTML = M.mlOos ? `<span class="${cls(M.mlOos.returnPct)}">${pct(M.mlOos.returnPct)}</span> <span class="sub">${M.threshold}× base rate</span>` : '–';
-    $('mlThr').innerHTML = (M.thresholds || []).map((x) => `<span>AI ≥ ${x.threshold}× base rate</span><span><span class="${cls(x.returnPct)}">${pct(x.returnPct)}</span> · ${x.trades} trades · DD ${pct(-x.maxDrawdownPct, 1)}</span>`).join('');
+    $('mlThr').innerHTML = (M.thresholds || []).map((x) => `<span>Calibration ≥ ${x.threshold}× base rate</span><span><span class="${cls(x.returnPct)}">${pct(x.returnPct)}</span> · ${x.trades} trades · DD ${pct(-x.maxDrawdownPct, 1)}</span>`).join('');
     $('mlFeat').textContent = (M.importance || []).map((f) => `${f.name} ${f.weight >= 0 ? '+' : ''}${f.weight.toFixed(2)}`).join(' · ');
   }
 
@@ -213,6 +233,7 @@ function render() {
       <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}</td></tr>`).join('')
       : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
     $('mevArmBtn').hidden = X.armed || X.mode === 'off';
+    $('mevArmBtn').disabled = !S.liveTradingAllowed || !S.health.ready || Boolean(X.pending);
     $('mevDisarmBtn').hidden = !X.armed;
     $('mevDeploy').textContent = X.contract
       ? `contract ${X.contract.slice(0, 8)}…${X.contract.slice(-4)}`
@@ -224,7 +245,7 @@ function render() {
 
   // controls
   $('pauseBtn').textContent = S.entriesPaused ? 'Resume new entries' : 'Pause new entries';
-  $('panicLiveBtn').disabled = !(L.positions && L.positions.length);
+  $('panicLiveBtn').disabled = !S.liveTradingAllowed || panicPending;
   $('panicPaperBtn').disabled = !(P.positions && P.positions.length);
   $('sendRpc').textContent = S.sendRpc;
   const r = S.params.risk;
@@ -268,7 +289,11 @@ $('armConfirm').onclick = async () => {
   if (typed !== 'LIVE') return;
   try { await api('/api/arm', { confirm: typed }); dlg.close(); refresh(); } catch (e) { alert(e.message); }
 };
-$('disarmBtn').onclick = async () => { if (confirm('Disarm live trading? Open positions are kept. MEV bundles stop too.')) { await api('/api/disarm'); refresh(); } };
+$('disarmBtn').onclick = async () => {
+  if (!confirm('Disarm spot and MEV? Open positions stay in the wallet. Submitted transactions can still settle.')) return;
+  try { await api('/api/disarm'); } catch (e) { alert(e.message); }
+  refresh();
+};
 const mevDlg = $('mevDlg');
 $('mevArmBtn').onclick = () => {
   const X = S?.mev;
@@ -286,14 +311,20 @@ $('mevConfirm').onclick = async () => {
   if (typed !== 'MEV') return;
   try { await api('/api/mev/arm', { confirm: typed }); mevDlg.close(); refresh(); } catch (e) { alert(e.message); }
 };
-$('mevDisarmBtn').onclick = async () => { if (confirm('Disarm MEV? Scanning continues in paper mode.')) { await api('/api/mev/disarm'); refresh(); } };
+$('mevDisarmBtn').onclick = async () => {
+  if (!confirm('Disarm MEV? Paper scanning continues. A submitted bundle can still settle.')) return;
+  try { await api('/api/mev/disarm'); } catch (e) { alert(e.message); }
+  refresh();
+};
 $('pauseBtn').onclick = async () => { await api('/api/pause', { paused: !S.entriesPaused }); refresh(); };
 $('resumeLiveBtn').onclick = async () => { await api('/api/resume', { kind: 'live' }); refresh(); };
 $('resumePaperBtn').onclick = async () => { await api('/api/resume', { kind: 'paper' }); refresh(); };
 $('panicLiveBtn').onclick = async () => {
-  if (!confirm('Sell the LIVE position to USDC now (up to 2% slippage) and disarm live trading?')) return;
+  if (!confirm('Disarm spot and MEV and request liquidation of tracked spot positions to USDC? A submitted transaction must settle first.')) return;
+  panicPending = true;
   $('panicLiveBtn').disabled = true;
   try { await api('/api/panic', { kind: 'live' }); } catch (e) { alert(e.message); }
+  panicPending = false;
   refresh();
 };
 $('panicPaperBtn').onclick = async () => { await api('/api/panic', { kind: 'paper' }); refresh(); };

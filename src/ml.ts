@@ -241,7 +241,13 @@ export function auc(scores: number[], labels: number[]): number | null {
   const idx = scores.map((_, i) => i).sort((a, b) => scores[a] - scores[b]);
   let nPos = 0;
   let rankSum = 0;
-  for (let r = 0; r < idx.length; r++) if (labels[idx[r]] === 1) { nPos++; rankSum += r + 1; }
+  for (let start = 0; start < idx.length;) {
+    let end = start + 1;
+    while (end < idx.length && scores[idx[end]] === scores[idx[start]]) end++;
+    const rank = (start + 1 + end) / 2;
+    for (let r = start; r < end; r++) if (labels[idx[r]] === 1) { nPos++; rankSum += rank; }
+    start = end;
+  }
   const nNeg = idx.length - nPos;
   if (nPos === 0 || nNeg === 0) return null;
   return (rankSum - (nPos * (nPos + 1)) / 2) / (nPos * nNeg);

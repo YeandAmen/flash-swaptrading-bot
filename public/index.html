@@ -119,9 +119,9 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
           </div>
         </div>
       </div>
-      <div class="note">Send <b>USDC</b> + a tiny bit of <b>ETH once (~0.001)</b>, on <b>Ethereum mainnet (ERC-20)</b> only. After that the bot buys its own gas with USDC.</div>
+      <div class="note" id="wNote" hidden>Live spot consumes Ethereum mainnet USDC and ETH for gas.</div>
       <div class="row">
-        <button id="armBtn" class="primary">Arm live trading</button>
+        <button id="armBtn" class="primary" disabled>Arm live trading</button>
         <button id="disarmBtn" class="danger" hidden>Disarm</button>
       </div>
     </div>
@@ -147,7 +147,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
       <div class="kv">
         <span>Realized P&amp;L</span><span id="pReal">–</span>
         <span>Simulated gas</span><span id="pGas">–</span>
-        <span>Trades</span><span id="pTrades">–</span>
+        <span>Trades recorded</span><span id="pTrades">–</span>
       </div>
       <div class="note" id="pDecision">–</div>
     </div>
@@ -170,9 +170,9 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     <h2>AI signal model · walk-forward tested <span id="mlMode"></span></h2>
     <div id="mlSummary">Waiting for the first training run…</div>
     <div class="stats">
-      <div class="stat"><div class="l">AUC on unseen data</div><div class="v" id="mlAuc">–</div></div>
-      <div class="stat"><div class="l">Rules, same period</div><div class="v" id="mlRules">–</div></div>
-      <div class="stat"><div class="l">Best AI setting</div><div class="v" id="mlBest">–</div></div>
+      <div class="stat"><div class="l">Final holdout AUC</div><div class="v" id="mlAuc">–</div></div>
+      <div class="stat"><div class="l">Rules holdout</div><div class="v" id="mlRules">–</div></div>
+      <div class="stat"><div class="l">ML holdout</div><div class="v" id="mlBest">–</div></div>
     </div>
     <div class="kv" id="mlThr"></div>
     <div class="note">Strongest features: <span id="mlFeat">–</span></div>
@@ -238,7 +238,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
         <button id="resumePaperBtn">Reset paper circuit breaker</button>
       </div>
       <div class="row">
-        <button id="panicLiveBtn" class="danger">Panic: sell live position → USDC</button>
+        <button id="panicLiveBtn" class="danger" disabled>Panic: disarm and request sell</button>
         <button id="panicPaperBtn">Sell paper position</button>
       </div>
       <div class="row">
@@ -246,7 +246,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
         <button id="btBtn" class="ghost">Re-run backtest</button>
       </div>
       <div class="kv" id="params"></div>
-      <div class="note">Transactions go privately through <span id="sendRpc">Flashbots Protect</span>, so other bots can’t sandwich them. Every token is re-checked for honeypots / hidden taxes right before each buy.</div>
+      <div class="note">Spot send endpoint <span id="sendRpc">–</span>. The bot rechecks each long-tail token with a simulated round trip before a new buy.</div>
     </div>
   </section>
 </main>
@@ -256,9 +256,9 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
 <dialog id="armDlg">
   <h3>Arm live trading?</h3>
   <ul>
-    <li>The bot will trade the <b>real USDC</b> in its wallet automatically, 24/7, with no further confirmation.</li>
+    <li>The bot will trade the <b>real USDC</b> in its wallet until disarm, a restart, or a risk limit intervenes.</li>
     <li>It needs <b>USDC + a tiny bit of ETH once</b> (Ethereum mainnet). After that it <b>buys its own gas with USDC</b> (small amounts, capped per day).</li>
-    <li>It may buy <b>any token that passes the safety checks</b> (deep Uniswap pool, 14+ days of history, simulated buy→sell). Smaller tokens are riskier: at most 50% of equity in one of them.</li>
+    <li>It may buy tokens that pass the pool, history and strategy checks. Long-tail candidates also pass a simulated round trip. New buys are capped by aggregate long-tail exposure.</li>
     <li>Losses are possible. It can hold up to 3 tokens at once (max 45% of equity each). Risk limits: ~2.5% of equity per trade, daily loss stop 6%, max drawdown halt 25%.</li>
     <li>Back up the private key first. It is stored in your macOS Keychain (see README).</li>
   </ul>
@@ -274,9 +274,9 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
   <h3>Arm MEV arbitrage?</h3>
   <ul>
     <li id="mevDlgDeploy">First, one transaction deploys the bot's own arbitrage contract (owner = the bot wallet).</li>
-    <li>Then, whenever a price gap still pays after gas, the bot sends a private Flashbots bundle. It uses a flash swap, so <b>your USDC is not used</b>; profits arrive as <b>ETH</b> in the bot wallet.</li>
-    <li>A bundle that is no longer profitable is simply not included, and <b>costs nothing</b>. The contract reverts any trade that wouldn't cover its gas and the builder's tip.</li>
-    <li>Half of each after-gas profit is bid to the block builder (MEV_BUILDER_TIP_PCT in .env).</li>
+    <li>When a qualifying gap appears, the bot submits a bundle to configured builders. The flash swap supplies the principal, and profit is paid in <b>ETH</b>.</li>
+    <li>The contract enforces a profit floor. Gas is still at risk if a builder includes a transaction that reverts.</li>
+    <li>The builder tip is set by MEV_BUILDER_TIP_PCT in .env.</li>
     <li>Expect few or no wins: professional searchers with faster infrastructure take most gaps first.</li>
   </ul>
   <label class="sub">Type <b>MEV</b> to confirm</label>

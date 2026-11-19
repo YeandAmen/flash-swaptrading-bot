@@ -16,7 +16,8 @@ function loadEnv(file: string) {
     if (process.env[m[1]] === undefined) process.env[m[1]] = v;
   }
 }
-loadEnv(path.join(ROOT, '.env'));
+// Fork tests use only their explicit loopback endpoints and isolated data.
+if (process.env.FORK_MODE !== '1') loadEnv(path.join(ROOT, '.env'));
 
 const num = (k: string, d: number) => {
   const v = process.env[k];
@@ -26,28 +27,51 @@ const num = (k: string, d: number) => {
   return n;
 };
 const str = (k: string, d = '') => process.env[k] ?? d;
+const liveTradingSetting = str('ALLOW_LIVE_TRADING', 'off');
+const forkSetting = str('FORK_MODE', '0');
 
-export const DATA_DIR = path.resolve(ROOT, str('DATA_DIR', 'data'));
-fs.mkdirSync(DATA_DIR, { recursive: true });
+function isLocalForkRpc(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(url.hostname)
+      && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+const dataDirSetting = str('DATA_DIR');
+export const DATA_DIR = path.resolve(ROOT, dataDirSetting || 'data');
 
 export const CONFIG = {
   rpcUrl: str('RPC_URL'),
-  /** Where signed live transactions are sent. Flashbots Protect = private mempool, no sandwiches, reverted txs cost nothing. */
+  /** Where signed spot transactions are sent. Flashbots Protect is the default. */
   sendRpcUrl: str('SEND_RPC_URL', 'https://rpc.flashbots.net/fast'),
   port: num('PORT', 7777),
   host: '127.0.0.1',
   loopSeconds: num('LOOP_SECONDS', 30),
   historyDays: num('HISTORY_DAYS', 60),
   paperStartUsd: num('PAPER_START_USD', 50),
+  /** Mainnet signing requires this opt-in in addition to an explicit arming action. */
+  allowLiveTrading: liveTradingSetting === 'on',
   keychainService: str('KEYCHAIN_SERVICE', 'eth-token-bot'),
   keychainAccount: str('KEYCHAIN_ACCOUNT', 'bot-wallet'),
   /** Only for tests on a local fork: read the key from this file instead of the macOS Keychain. */
   walletKeyFile: str('WALLET_KEY_FILE'),
   /** Test mode for a local anvil fork: skip Flashbots status checks. */
-  forkMode: str('FORK_MODE') === '1',
+  forkMode: forkSetting === '1',
 };
 
 if (!CONFIG.rpcUrl) throw new Error('RPC_URL missing. Put it in .env');
+if (liveTradingSetting !== 'off' && liveTradingSetting !== 'on') throw new Error('ALLOW_LIVE_TRADING must be on or off');
+if (forkSetting !== '0' && forkSetting !== '1') throw new Error('FORK_MODE must be 0 or 1');
+if (CONFIG.forkMode && (!isLocalForkRpc(CONFIG.rpcUrl) || !isLocalForkRpc(CONFIG.sendRpcUrl))) {
+  throw new Error('FORK_MODE requires loopback HTTP RPC_URL and SEND_RPC_URL (127.0.0.1 or [::1])');
+}
+if (CONFIG.forkMode && (CONFIG.allowLiveTrading || !CONFIG.walletKeyFile || !dataDirSetting || DATA_DIR === path.join(ROOT, 'data'))) {
+  throw new Error('FORK_MODE requires ALLOW_LIVE_TRADING=off, a throwaway WALLET_KEY_FILE and a separate DATA_DIR');
+}
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 const a = (x: string): Address => getAddress(x.toLowerCase());
 
@@ -172,8 +196,10 @@ export const RISK = {
  * profitable, otherwise it costs nothing. Arbitrage only: it never front-runs or sandwiches anyone.
  * Scanning is always on (paper mode); real bundles need "Arm MEV" in the dashboard.
  */
+const configuredMevContract = str('MEV_CONTRACT_ADDRESS').trim();
 export const MEV = {
   enabled: str('MEV', 'on') !== 'off',
+  contractAddress: configuredMevContract ? getAddress(configuredMevContract) : null,
   minPoolWeth: num('MEV_MIN_POOL_WETH', 2), // ignore pools holding less WETH than this
   builderTipPct: num('MEV_BUILDER_TIP_PCT', 0.5), // share of the after-gas profit paid to the block builder
   minNetUsd: num('MEV_MIN_NET_USD', 0.05), // smallest after-gas, after-tip profit worth a bundle

@@ -1,26 +1,28 @@
 // End-to-end test of the LIVE trading path against a local anvil mainnet fork (fake money).
 // Run via scripts/fork-test.sh — it starts anvil and sets RPC_URL/SEND_RPC_URL/FORK_MODE/WALLET_KEY_FILE/DATA_DIR.
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createTestClient, createWalletClient, formatUnits, http, parseEther, parseUnits, type Address } from 'viem';
 import { mainnet } from 'viem/chains';
-import { ADDR, CONFIG, CORE_TOKENS, USDC_DECIMALS } from './config.js';
+import { ADDR, CONFIG, CORE_TOKENS, DATA_DIR, USDC_DECIMALS } from './config.js';
 import { erc20Abi, publicClient } from './chain.js';
 import { Engine } from './engine.js';
-import { LiveExecutor } from './executor.js';
+import { LiveExecutor, PaperExecutor } from './executor.js';
+import { assertForkTestEnvironment } from './forktest-env.js';
 import { discoverMarkets } from './market.js';
 import { roundTripCheck } from './safety.js';
 import type { Analysis } from './strategy.js';
+import { newPortfolio } from './types.js';
 import { loadOrCreateWallet } from './wallet.js';
 
-assert.ok(CONFIG.forkMode, 'FORK_MODE=1 required');
-assert.ok(/127\.0\.0\.1|localhost/.test(CONFIG.rpcUrl) && /127\.0\.0\.1|localhost/.test(CONFIG.sendRpcUrl), 'fork test must only talk to a local node');
-assert.ok(CONFIG.walletKeyFile, 'WALLET_KEY_FILE required (throwaway test key)');
+await assertForkTestEnvironment();
 
 const test = createTestClient({ chain: mainnet, mode: 'anvil', transport: http(CONFIG.rpcUrl) });
 const wc = createWalletClient({ chain: mainnet, transport: http(CONFIG.rpcUrl) });
 const bal = (token: Address, who: Address) => publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [who] });
 
-const engine = new Engine();
+let engine = new Engine();
 engine.wallet = loadOrCreateWallet();
 const me = engine.wallet.account.address;
 (engine as any).liveExec = new LiveExecutor(engine.wallet.account);
@@ -65,6 +67,7 @@ const buy = (sym: string, usdAmt: string) => {
 };
 
 for (const [symbol, amount] of [['LINK', '20'], ['WETH', '15']] as const) {
+  engine.arm(); // the preceding case's Panic leaves spot disarmed
   const t = engine.market.tokens.find((x) => x.token.symbol === symbol)!;
   const usdcBefore = await bal(ADDR.usdc, me);
   const ethBefore = await publicClient.getBalance({ address: me });
@@ -102,6 +105,8 @@ for (const [symbol, amount] of [['LINK', '20'], ['WETH', '15']] as const) {
 {
   engine.arm();
   await buy('LINK', '11');
+  assert.equal(await buy('UNI', '11'), false, 'the post-fill wallet must be resampled before another order');
+  await engine.tick();
   await buy('UNI', '11');
   assert.equal(live().positions.length, 2, 'two positions open');
   await engine.tick();
@@ -119,19 +124,24 @@ for (const [symbol, amount] of [['LINK', '20'], ['WETH', '15']] as const) {
   console.log('✓ two positions held at once; panic sold both');
 }
 
-// 6. exits keep running while DISARMED and HALTED (stop-loss protection never switches off)
+// 6. Disarm stops automatic sends; a circuit breaker only blocks entries while explicitly armed.
 {
   const t = engine.market.tokens.find((x) => x.token.symbol === 'LINK')!;
   engine.arm();
   await buy('LINK', '12');
   assert.ok(held('LINK'), 'position opened for exit test');
-  engine.disarm();
-  live().halted = 'test halt';
   held('LINK')!.stopPrice = engine.snap!.prices['LINK'] * 1.5; // force a stop-loss
+  const nonceBeforeDisarm = await publicClient.getTransactionCount({ address: me });
+  engine.disarm();
   await engine.tick();
-  assert.equal(live().positions.length, 0, 'stop-loss exit executed while disarmed + halted');
+  assert.ok(held('LINK'), 'position stays tracked while disarmed');
+  assert.equal(await publicClient.getTransactionCount({ address: me }), nonceBeforeDisarm, 'disarm stops automatic exits');
+  engine.arm();
+  live().halted = 'test halt';
+  await engine.tick();
+  assert.equal(live().positions.length, 0, 'stop-loss exit executed while armed + halted');
   assert.equal(await bal(t.token.address, me), 0n, 'LINK sold by stop-loss');
-  console.log('✓ stop-loss still executes while disarmed and halted:', live().trades.at(-1)!.reason);
+  console.log('✓ Disarm stops automatic sends; a circuit breaker permits exits after explicit rearm');
   engine.resume('live');
 }
 
@@ -141,16 +151,32 @@ for (const [symbol, amount] of [['LINK', '20'], ['WETH', '15']] as const) {
   const amountIn = parseUnits('11', USDC_DECIMALS);
   await engine.tick();
   const depBefore = live().netDepositsUsd;
-  const pending: any = {
+  const pending: NonNullable<Engine['state']['pending']> = {
     side: 'BUY', symbol: 'UNI', amountIn: amountIn.toString(), startedAt: Date.now(), hash: null, deadline: null,
-    reason: 'crash test', stopPct: 0.06, targetPct: 0.15, mid: engine.snap!.prices['UNI'],
+    approvalHashes: [], reason: 'crash test', stopPct: 0.06, targetPct: 0.15, mid: engine.snap!.prices['UNI'],
   };
-  engine.state.pending = pending; // journal written before broadcast; the bot then "dies" right after the swap lands
-  await (engine as any).liveExec.swap({
+  engine.state.pending = pending;
+  engine.saveState(true);
+  await new LiveExecutor(engine.wallet.account).swap({
     path: t.buyPath, tokenIn: ADDR.usdc, tokenOut: t.token.address, amountIn, hops: t.hops, slippageBps: 50,
-    gasPriceGwei: 1, ethUsd: engine.snap!.ethUsd, onSwapSigned: (h: string, d: number) => { pending.hash = h; pending.deadline = d; },
+    gasPriceGwei: 1, ethUsd: engine.snap!.ethUsd,
+    onApprovalSigned: (hash) => {
+      pending.approvalHashes!.push(hash);
+      engine.saveState(true);
+    },
+    onSwapSigned: (hash, deadline) => {
+      pending.hash = hash;
+      pending.deadline = deadline;
+      engine.saveState(true);
+    },
   }, () => {});
   assert.equal(live().positions.length, 0, 'engine has not recorded the trade yet');
+  const restarted = new Engine();
+  restarted.wallet = engine.wallet;
+  restarted.market = engine.market;
+  (restarted as any).liveExec = new LiveExecutor(restarted.wallet.account);
+  engine = restarted;
+  assert.equal(engine.state.armed, false, 'spot remains disarmed while reconciling after restart');
   await engine.tick(); // reconcile from chain
   assert.ok(held('UNI'), 'pending swap reconciled into a UNI position');
   assert.equal(engine.state.pending, null, 'journal cleared');
@@ -214,6 +240,56 @@ await publicClient.waitForTransactionReceipt({
 await engine.tick();
 assert.ok(live().netDepositsUsd < 30, `withdrawal reduces net deposits (${live().netDepositsUsd})`);
 console.log(`✓ withdrawal detected, net deposits now $${live().netDepositsUsd.toFixed(2)}`);
+
+// 10. Test the entry rules using the same fork quotes and a paper executor.
+{
+  const decisionEngine = new Engine();
+  decisionEngine.market = engine.market;
+  decisionEngine.regime = { riskOn: true, reason: 'test' };
+  decisionEngine.analyses = [fakeSignal('WETH')];
+  const paper = decisionEngine.state.paper = newPortfolio('paper', 50);
+  const exec = new PaperExecutor();
+  const current = engine.snap!;
+  const incomplete = { ...current, prices: { ...current.prices } };
+  delete incomplete.prices.WETH;
+  const enter = (snap: typeof current, now = Date.now()) =>
+    (decisionEngine as any).tryEntry(paper, snap, exec, now) as Promise<string>;
+  await enter(incomplete);
+  assert.equal(paper.positions.length, 0, 'missing token prices must not create positions');
+  const decision = await enter(current);
+  assert.equal(paper.positions.length, 1, `the same signal with a valid price can enter (${decision})`);
+  assert.ok(Number.isInteger(paper.lastEntryHour));
+  decisionEngine.analyses = [fakeSignal('UNI')];
+  assert.match(await enter(current, paper.lastEntryHour! * 3_600_000 + 1), /hour/);
+  assert.equal(paper.positions.length, 1, 'another signal in the same hour cannot enter');
+  console.log('✓ Missing token price prevented entry; the hourly entry cap held on the next signal');
+}
+
+// 11. A real persistence fault in the disposable test data must stop the spot order before approval.
+{
+  engine.arm();
+  const stateFile = path.join(DATA_DIR, 'state.json');
+  const backup = path.join(DATA_DIR, 'test-state-backup.json');
+  const nonceBefore = await publicClient.getTransactionCount({ address: me });
+  const usdcBefore = await bal(ADDR.usdc, me);
+  fs.renameSync(stateFile, backup);
+  fs.mkdirSync(stateFile);
+  try {
+    let bought = false;
+    try {
+      bought = await buy('LINK', '11');
+    } catch { /* the spot journal can surface a storage error directly */ }
+    assert.equal(bought, false);
+    assert.equal(await publicClient.getTransactionCount({ address: me }), nonceBefore);
+    assert.equal(await bal(ADDR.usdc, me), usdcBefore);
+    assert.equal(live().positions.length, 0);
+  } finally {
+    fs.rmdirSync(stateFile);
+    fs.renameSync(backup, stateFile);
+  }
+  engine.disarm();
+  console.log('✓ Spot journal storage failure blocked approval and swap');
+}
 
 console.log('\nALL FORK TESTS PASSED');
 process.exit(0);
