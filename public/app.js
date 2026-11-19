@@ -212,8 +212,13 @@ function render() {
     $('mevMode').innerHTML = `<span class="tag ${tag}">${esc(String(X.mode).toUpperCase())}</span>`;
     const venues = Object.entries(X.venues || {}).map(([k, v]) => `${v} ${k}`).join(', ');
     const lb = X.lastBlock;
+    const C = X.coverage;
+    const coverage = C?.mode === 'all'
+      ? ` · discovery ${C.phase}: ${C.checked.toLocaleString()}/${C.candidates.toLocaleString()} addresses checked, ${C.eligible.toLocaleString()} eligible, ${C.maxPools} pool limit`
+      : '';
+    const timing = lb?.decisionMs == null ? '' : ` · ${lb.readMs} ms pool reads, ${lb.decisionMs} ms decisions`;
     $('mevStatus').textContent = `${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
-      (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + (X.lastError ? ` · last error: ${X.lastError}` : '');
+      coverage + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + (X.lastError ? ` · last error: ${X.lastError}` : '');
     const st = X.stats;
     $('mevBlocks').textContent = st.blocks.toLocaleString();
     const B = X.bestThisHour;

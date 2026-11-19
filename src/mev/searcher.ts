@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { decodeFunctionResult, encodeFunctionData, keccak256, pad, parseEventLogs, parseGwei, TransactionReceiptNotFoundError, type Address, type Hex } from 'viem';
+import { BaseError, decodeFunctionResult, encodeFunctionData, ExecutionRevertedError, keccak256, pad, parseEventLogs, parseGwei, TransactionReceiptNotFoundError, type Address, type Hex } from 'viem';
 import type { PrivateKeyAccount } from 'viem/accounts';
-import { CONFIG, DATA_DIR, MEV, type TokenCfg } from '../config.js';
+import { CONFIG, CORE_TOKENS, DATA_DIR, MEV, type TokenCfg } from '../config.js';
 import { publicClient } from '../chain.js';
 import { redactDiagnostic } from '../diagnostics.js';
 import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../executor.js';
@@ -10,7 +10,9 @@ import { BIG_BATCH, type McResult } from '../market.js';
 import { writeJson } from '../persistence.js';
 import { FLASH_ARB_ABI, FLASH_ARB_BYTECODE, FLASH_ARB_RUNTIME } from './artifact.js';
 import { sendBundle } from './bundles.js';
-import { arbGas, bestCycle, buildStateReads, discoverArbPools, MEV_EXTRA_TOKENS, reservesOf, type ArbPool, type ArbToken } from './pools.js';
+import { routeInputSizes } from './sizing.js';
+import { arbGas, bestCycle, buildStateReads, MEV_EXTRA_TOKENS, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
+import { MevUniverse } from './universe.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'mev.json');
 /** Address where paper-mode simulations place the contract code (eth_call state override; nothing is deployed). */
@@ -67,6 +69,7 @@ export interface MevOpp {
   count?: number; // times seen (repeats are merged)
   note?: string;
   hash?: Hex;
+  ownerPayoutEth?: number; // successful contract payout before the owner's transaction fee
 }
 
 interface MevStats {
@@ -126,6 +129,7 @@ interface BlockRead {
   tokens: ArbToken[];
   at: number[][];
   results: McResult[];
+  readMs: number;
 }
 
 interface Candidate {
@@ -163,21 +167,25 @@ export class MevSearcher {
   tokens: ArbToken[] = [];
   status = 'starting';
   lastError: string | null = null;
-  lastBlock: { number: number; at: number; candidates: number } | null = null;
+  lastBlock: { number: number; at: number; candidates: number; readMs: number; decisionMs: number | null } | null = null;
   deploying = false;
   deployGas: number | null = null;
   private reads: ReturnType<typeof buildStateReads> | null = null;
   private poolsAt = 0;
+  private universe: MevUniverse;
+  private refreshingPools: Promise<void> | null = null;
   private stateReadError: string | null = null;
   private recovery: Promise<void> | null = null;
   private bundleReserved = false;
   private contractReady = false;
   private armGeneration = 0;
   private cooldown = new Map<string, { until: number; est: number; grow: number }>();
+  private previousSizes = new Map<string, { amount: bigint; at: number }>();
   private stopping = false;
 
   constructor(private host: MevHost, private persist = true) {
     this.file = this.load();
+    this.universe = new MevUniverse(persist, (message, level) => this.host.log(`[mev] ${message}`, level));
   }
 
   private get pending() { return this.file.pending; }
@@ -264,6 +272,7 @@ export class MevSearcher {
     }
     if (!this.file.contract && !MEV.contractAddress) void this.estimateDeployGas();
     void this.loop();
+    if (this.universe.broad && !this.stopping) void this.discoverMorePools();
   }
 
   stop() {
@@ -272,17 +281,47 @@ export class MevSearcher {
     this.save();
   }
 
-  /** Re-discovers pools (daily, and after the trading universe changes). */
+  /** Start with core and recently watched tokens. Broader discovery runs alongside block scanning. */
   async refreshPools() {
     if (!MEV.enabled) return;
-    const tokens = await discoverArbPools([...this.host.tokens(), ...MEV_EXTRA_TOKENS], MEV.minPoolWeth);
-    this.file.stats.rpcCalls += 3;
+    if (!this.refreshingPools) this.refreshingPools = this.warmupPools().finally(() => { this.refreshingPools = null; });
+    await this.refreshingPools;
+  }
+
+  private priorityTokens() {
+    return [...CORE_TOKENS, ...MEV_EXTRA_TOKENS, ...this.host.tokens()];
+  }
+
+  private async warmupPools() {
+    await this.universe.warmup(this.priorityTokens());
+    this.poolsAt = Date.now();
+    this.updatePools(true);
+    this.status = this.modeText();
+  }
+
+  private updatePools(log = false) {
+    const tokens = this.universe.active();
     this.tokens = tokens;
     this.reads = buildStateReads(tokens);
-    this.poolsAt = Date.now();
-    const pools = tokens.reduce((s, t) => s + t.pools.length, 0);
-    this.host.log(`MEV: watching ${tokens.length} tokens in ${pools} pools (Uniswap v3 fee tiers, Uniswap v2, SushiSwap) for arbitrage — ${this.file.armed ? 'ARMED' : 'paper mode'}`);
-    this.status = this.modeText();
+    if (log) {
+      const pools = tokens.flatMap((t) => t.pools);
+      const venues = [...new Set(pools.map(poolVenue))].join(', ');
+      this.host.log(`MEV: watching ${tokens.length} tokens in ${pools.length} pools${venues ? ` (${venues})` : ''} — ${this.file.armed ? 'ARMED' : 'paper mode'}`);
+    }
+  }
+
+  private async discoverMorePools() {
+    while (!this.stopping) {
+      let delayMs = 24 * HOUR;
+      try {
+        await this.universe.sweep(this.priorityTokens(), () => this.updatePools(), () => this.stopping);
+        if (!this.stopping) this.updatePools(true);
+      } catch (error) {
+        this.host.log(`[mev] Expanded pool discovery paused: ${errMsg(error)}`, 'warn');
+        delayMs = 5 * 60_000;
+      }
+      if (!this.stopping) await sleep(delayMs);
+    }
   }
 
   private async loop() {
@@ -290,7 +329,7 @@ export class MevSearcher {
     let backoff = 0;
     while (!this.stopping) {
       try {
-        if (Date.now() - this.poolsAt > 24 * HOUR) await this.refreshPools();
+        if (!this.universe.broad && Date.now() - this.poolsAt > 24 * HOUR) await this.refreshPools();
         const head = await this.head();
         if (head.hash === lastHash) { await sleep(1_500); continue; }
         const r = await this.read(head);
@@ -326,15 +365,17 @@ export class MevSearcher {
     const reads = this.reads;
     const tokens = this.tokens;
     if (!reads) throw new Error('pools not loaded');
+    const start = performance.now();
     const results = (await publicClient.multicall({ contracts: reads.contracts as any, allowFailure: true, blockNumber: head.number, batchSize: BIG_BATCH })) as McResult[];
     this.file.stats.rpcCalls++;
     if (results[0]?.status !== 'success' || results[0].result !== head.number || results[1]?.status !== 'success' || results[1].result !== head.timestamp) {
       throw new Error('pool snapshot did not match the block header');
     }
-    return { blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash, tokens, at: reads.at, results };
+    return { blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash, tokens, at: reads.at, results, readMs: Math.round(performance.now() - start) };
   }
 
   private async onBlock(r: BlockRead) {
+    const started = performance.now();
     const generation = this.armGeneration;
     this.file.stats.blocks++;
     await this.reconcileWallet(r.blockNumber);
@@ -358,14 +399,23 @@ export class MevSearcher {
         cands.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet, gasUnits });
       }
     }
-    this.lastBlock = { number: Number(r.blockNumber), at: now, candidates: cands.length };
+    const block = { number: Number(r.blockNumber), at: now, candidates: cands.length, readMs: r.readMs, decisionMs: null as number | null };
+    this.lastBlock = block;
     if (est) {
       const hb = this.hourBest();
       if (hb.estGross < 0 || est.net > hb.estGross - hb.estGas) Object.assign(hb, { estGross: est.gross, estGas: est.gas, estSymbol: est.symbol });
     }
     cands.sort((x, y) => y.estimatedNet - x.estimatedNet);
-    const shortlisted = await Promise.all(cands.slice(0, MEV.maxSimsPerBlock).map((c) => this.evaluate(c, r, nextMaxBase)));
+    const selected = cands.slice(0, MEV.maxSimsPerBlock);
+    const selectedTokens = new Set(selected.map((c) => c.t.token.address));
+    const alternative = cands.find((c) => !selectedTokens.has(c.t.token.address));
+    // Several pools can price the same spread. Give a competitive independent route a probe.
+    if (selected.length > 1 && selectedTokens.size === 1 && alternative && alternative.estimatedNet > Math.max(0, selected.at(-1)!.estimatedNet / 2)) {
+      selected[selected.length - 1] = alternative;
+    }
+    const shortlisted = await Promise.all(selected.map((c) => this.evaluate(c, r, nextMaxBase)));
     const offers = shortlisted.filter((offer) => offer !== null).sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
+    block.decisionMs = Math.round(performance.now() - started);
     const canTryLive = () => this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending();
     if (canTryLive()) {
       for (const offer of offers) {
@@ -402,7 +452,7 @@ export class MevSearcher {
   }
 
   /** Exact profit of one route at `amountIn`, from an eth_call of the contract (the real one, or its code injected). */
-  async simulate(t: ArbToken, A: ArbPool, B: ArbPool, amountIn: bigint, maxBlock: bigint, blockNumber?: bigint): Promise<{ ok: true; profit: bigint } | { ok: false; reason: string }> {
+  async simulate(t: ArbToken, A: ArbPool, B: ArbPool, amountIn: bigint, maxBlock: bigint, blockNumber?: bigint): Promise<{ ok: true; profit: bigint } | { ok: false; reason: string; reverted: boolean }> {
     const contract = this.contractReady ? this.file.contract : null;
     const data = encodeFunctionData({
       abi: FLASH_ARB_ABI, functionName: 'execute',
@@ -418,17 +468,21 @@ export class MevSearcher {
           ? undefined
           : [{ address: SIM_ADDR, code: FLASH_ARB_RUNTIME, stateDiff: [{ slot: pad('0x0'), value: pad(this.host.account.address) }] }],
       });
-      if (!res.data) return { ok: false, reason: 'no result' };
+      if (!res.data) return { ok: false, reason: 'no result', reverted: false };
       return { ok: true, profit: decodeFunctionResult({ abi: FLASH_ARB_ABI, functionName: 'execute', data: res.data }) as bigint };
     } catch (e) {
-      return { ok: false, reason: reasonOf(e) };
+      const reverted = e instanceof BaseError && e.walk((cause) => cause instanceof ExecutionRevertedError) instanceof ExecutionRevertedError;
+      return { ok: false, reason: reasonOf(e), reverted };
     }
   }
 
   private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint): Promise<Offer | null> {
     const st = this.file.stats;
     st.candidates++;
-    const sizes = [...new Set([1, 0.75, 0.5, 0.25, 0.1].map((f) => BigInt(Math.max(1, Math.floor(c.dx * f * 1e18)))))];
+    const key = `${c.A.address}|${c.B.address}`;
+    const previous = this.previousSizes.get(key);
+    const sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previous && Date.now() - previous.at < 10 * 60_000 ? previous.amount : undefined);
+    if (!sizes.length) return null;
     const sims = await Promise.all(sizes.map((amt) => this.simulate(c.t, c.A, c.B, amt, r.blockNumber + 1n, r.blockNumber)));
     st.rpcCalls += sims.length;
     st.simulated++;
@@ -439,20 +493,25 @@ export class MevSearcher {
     }
     const ethUsd = this.host.ethUsd();
     const gasWei = BigInt(c.gasUnits) * nextMaxBase;
-    const key = `${c.A.address}|${c.B.address}`;
     const opp: MevOpp = {
       t: Date.now(), block: Number(r.blockNumber), symbol: c.t.token.symbol, buy: c.A.venue, sell: c.B.venue,
       sizeEth: c.dx, grossEth: 0, gasEth: eth(gasWei), tipEth: 0, netEth: 0, netUsd: 0, status: 'failed',
     };
     if (!best) {
-      // the quick estimate liked it but the exact simulation didn't (thin liquidity past the current tick,
-      // transfer tax, odd token): such pools stay odd, so look again only after an hour or a much bigger gap
-      this.cooldown.set(key, { until: Date.now() + HOUR, est: c.est, grow: 3 });
-      opp.note = `simulation: ${sims.find((s): s is { ok: false; reason: string } => !s.ok)?.reason ?? 'reverted'}`;
+      const allReverted = sims.every((s) => !s.ok && s.reverted);
+      // RPC outages are transient. Reserve the long cooldown for confirmed contract reverts.
+      this.cooldown.set(key, { until: Date.now() + (allReverted ? HOUR : 30_000), est: c.est, grow: allReverted ? 3 : 1.5 });
+      opp.note = `simulation: ${sims.find((s) => !s.ok)?.reason ?? 'reverted'}`;
       this.record(opp);
       return null;
     }
     const b = best;
+    this.previousSizes.delete(key);
+    this.previousSizes.set(key, { amount: b.amount, at: Date.now() });
+    if (this.previousSizes.size > 512) {
+      const oldest = this.previousSizes.keys().next().value;
+      if (oldest !== undefined) this.previousSizes.delete(oldest);
+    }
     const net = b.profit - gasWei;
     this.trackSim(eth(b.profit), eth(gasWei), c.t.token.symbol);
     opp.sizeEth = eth(b.amount);
@@ -634,6 +693,7 @@ export class MevSearcher {
         outcome.status = 'landed';
         outcome.grossEth = eth(ev.args.profit);
         outcome.tipEth = eth(ev.args.tip);
+        outcome.ownerPayoutEth = eth(ev.args.profit - ev.args.tip);
         outcome.netEth = eth(ev.args.profit - ev.args.tip - gasWei);
         outcome.note = `block ${receipt.blockNumber}`;
       } else {
@@ -858,7 +918,10 @@ export class MevSearcher {
   view() {
     const f = this.file;
     const venues: Record<string, number> = {};
-    for (const t of this.tokens) for (const p of t.pools) venues[p.v2 ? p.venue : 'Uniswap v3'] = (venues[p.v2 ? p.venue : 'Uniswap v3'] ?? 0) + 1;
+    for (const t of this.tokens) for (const p of t.pools) {
+      const name = poolVenue(p);
+      venues[name] = (venues[name] ?? 0) + 1;
+    }
     const gp = this.host.gasPriceGwei();
     const ethUsd = this.host.ethUsd();
     const hour = Math.floor(Date.now() / HOUR) * HOUR;
@@ -875,6 +938,7 @@ export class MevSearcher {
       tokens: this.tokens.length,
       pools: this.tokens.reduce((s, t) => s + t.pools.length, 0),
       venues,
+      coverage: this.universe.view(),
       lastBlock: this.lastBlock,
       bestThisHour: (() => {
         const b = f.best.find((x) => x.h === hour);

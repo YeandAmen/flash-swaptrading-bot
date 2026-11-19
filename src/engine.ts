@@ -1,12 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { encodePacked, formatUnits, parseEther, parseUnits, type Hex } from 'viem';
 import { ADDR, CONFIG, DATA_DIR, GAS_TOPUP, ML, RISK, STRATEGY, TOKENS, USDC_DECIMALS, type TokenCfg } from './config.js';
 import { publicClient } from './chain.js';
 import { appendRotatingLog, readLogTail, redactDiagnostic } from './diagnostics.js';
 import { writeJson } from './persistence.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
-import { runResearch, type BacktestResult, type Research } from './backtest.js';
+import type { BacktestResult, Research } from './backtest.js';
+import type { ResearchInput } from './research-worker.js';
 import {
   fillFromReceipt, gasUsd, LiveExecutor, LiveSendBlocked, PaperExecutor, swapGasUnits, topUpFromReceipt, transactionSettlement, type Executor, type Fill, type SwapRequest,
 } from './executor.js';
@@ -99,6 +101,7 @@ export class Engine {
   private lastHourSaved = 0;
   private lastEquityPoint = 0;
   private lastResearchAt = 0;
+  private researchWorker: Worker | null = null;
   private lastGasWarn = 0;
   private liveActed = false; // a live buy/sell was attempted this tick
   private entryEpoch = 0;
@@ -308,12 +311,12 @@ export class Engine {
         });
         this.startupStep = 'First market snapshot';
         await this.tick();
-        this.startupStep = 'Backtesting rules and training the ML model (walk-forward)';
-        await this.runResearchNow();
         this.status = 'running';
+        this.startupStep = 'Ready';
         this.lastError = null;
         this.log(`Bot running. Scanning ${this.market.tokens.length} tokens, up to ${RISK.maxPositions} positions. Signals: ${this.mlActive ? 'ML' : 'rules'}. Live trading starts disarmed.`);
         void this.mev.start();
+        void this.runResearchNow();
         break;
       } catch (e) {
         this.status = 'error';
@@ -329,6 +332,7 @@ export class Engine {
   async stop() {
     this.stopping = true;
     this.mev?.stop();
+    await this.researchWorker?.terminate();
     for (let i = 0; i < 100 && this.busy; i++) await sleep(250);
     this.saveState();
   }
@@ -353,12 +357,28 @@ export class Engine {
 
   /** Rules backtest + walk-forward ML training/evaluation + the gate deciding whether ML drives entries. */
   async runResearchNow() {
-    if (!this.snap || this.researching) return;
+    if (!this.snap || this.researching || this.stopping) return;
     this.researching = true;
     this.lastResearchAt = Date.now();
     try {
       const t0 = Date.now();
-      const r = await runResearch(this.history, this.market, this.snap.baseFeeGwei + this.snap.tipGwei, this.snap.ethUsd, CONFIG.paperStartUsd);
+      const market = this.market;
+      const input: ResearchInput = {
+        bars: this.history.bars, market, gasPriceGwei: this.snap.baseFeeGwei + this.snap.tipGwei,
+        ethUsd: this.snap.ethUsd, startUsd: CONFIG.paperStartUsd,
+      };
+      const worker = new Worker(new URL('./research-worker.js', import.meta.url), { workerData: input });
+      this.researchWorker = worker;
+      const r = await new Promise<Research>((resolve, reject) => {
+        worker.once('message', resolve);
+        worker.once('error', reject);
+        worker.once('exit', (code) => reject(new Error(`Research worker exited before returning results (${code})`)));
+      });
+      if (this.stopping) return;
+      if (this.market !== market) {
+        this.lastResearchAt = 0;
+        return;
+      }
       this.research = r;
       this.backtest = r.rules;
       this.mlModel = r.model;
@@ -374,8 +394,9 @@ export class Engine {
           `best ML ${m.mlOos ? (m.mlOos.returnPct * 100).toFixed(2) + '%' : 'n/a'} (${m.threshold}x base rate) vs rules ${m.rulesOos ? (m.rulesOos.returnPct * 100).toFixed(2) + '%' : 'n/a'} → ${this.mlActive ? 'ML drives entries' : 'rules drive entries'} (${m.reason}). [${((Date.now() - t0) / 1000).toFixed(0)}s]`);
       }
     } catch (e) {
-      this.log(`Research/backtest failed: ${errMsg(e)}`, 'warn');
+      if (!this.stopping) this.log(`Research/backtest failed: ${errMsg(e)}`, 'warn');
     } finally {
+      this.researchWorker = null;
       this.researching = false;
     }
   }

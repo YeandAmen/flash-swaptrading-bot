@@ -10,6 +10,11 @@ const V2_VENUES = [
   { venue: 'Uniswap v2', factory: a('0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f') },
   { venue: 'SushiSwap', factory: a('0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac') },
 ];
+/** These factories deploy pools that call FlashArb's existing uniswapV3SwapCallback. */
+const V3_VENUES = [
+  { venue: 'Uniswap v3', factory: ADDR.uniFactory },
+  { venue: 'SushiSwap v3', factory: a('0xbACEB8eC6b9355Dfc0269C18bac9d6E2Bdc29C4F') },
+];
 const V3_FEES = [100, 500, 3000, 10000];
 
 /** Liquid tokens worth watching for arbitrage even though the trading strategy skips them (stablecoins). */
@@ -21,9 +26,15 @@ export const MEV_EXTRA_TOKENS: TokenCfg[] = [
 
 export interface ArbPool {
   address: Address;
-  venue: string; // "Uniswap v3 0.3%", "Uniswap v2", "SushiSwap"
+  venue: string; // Includes the fee tier for concentrated-liquidity pools.
   v2: boolean;
   fee: number; // fraction per swap, e.g. 0.003
+  depthWeth?: number; // WETH depth measured at discovery, capped by reserves for v2 pairs
+}
+
+export function poolVenue(pool: ArbPool): string {
+  if (pool.v2) return pool.venue === 'SushiSwap' ? 'SushiSwap v2' : pool.venue;
+  return pool.venue.replace(/ \d+(?:\.\d+)?%$/, '');
 }
 
 export interface ArbToken {
@@ -47,22 +58,24 @@ export const arbGas = (A: ArbPool, B: ArbPool) =>
   A.v2 ? (B.v2 ? ARB_GAS.v2v2 : ARB_GAS.v2v3) : B.v2 ? ARB_GAS.v3v2 : ARB_GAS.v3v3;
 
 /**
- * Every WETH pool of each token on Uniswap v3 (all fee tiers), Uniswap v2 and SushiSwap holding at least `minWeth`.
+ * Every WETH pool of each token on the supported canonical factories holding at least `minWeth`.
  * Only tokens with two or more such pools can be arbitraged. A few multicalls in total.
  */
 export async function discoverArbPools(tokens: TokenCfg[], minWeth: number): Promise<ArbToken[]> {
   const seen = new Set<string>();
   const list = tokens.filter((t) => {
     const k = t.address.toLowerCase();
-    if (t.address === ADDR.weth || seen.has(k)) return false;
+    if (k === ADDR.weth.toLowerCase() || seen.has(k)) return false;
     seen.add(k);
     return true;
   });
   type Lookup = { ti: number; venue: string; v2: boolean; fee: number; call: object };
   const lookups: Lookup[] = [];
   list.forEach((t, ti) => {
-    for (const fee of V3_FEES) {
-      lookups.push({ ti, venue: `Uniswap v3 ${fee / 1e4}%`, v2: false, fee: fee / 1e6, call: { address: ADDR.uniFactory, abi: factoryAbi, functionName: 'getPool', args: [t.address, ADDR.weth, fee] } });
+    for (const v of V3_VENUES) {
+      for (const fee of V3_FEES) {
+        lookups.push({ ti, venue: `${v.venue} ${fee / 1e4}%`, v2: false, fee: fee / 1e6, call: { address: v.factory, abi: factoryAbi, functionName: 'getPool', args: [t.address, ADDR.weth, fee] } });
+      }
     }
     for (const v of V2_VENUES) {
       lookups.push({ ti, venue: v.venue, v2: true, fee: 0.003, call: { address: v.factory, abi: v2FactoryAbi, functionName: 'getPair', args: [t.address, ADDR.weth] } });
@@ -79,15 +92,23 @@ export async function discoverArbPools(tokens: TokenCfg[], minWeth: number): Pro
     { address: ADDR.weth, abi: erc20Abi, functionName: 'balanceOf', args: [p.address] },
     p.v2 ? { address: p.address, abi: v2PairAbi, functionName: 'getReserves' } : { address: p.address, abi: poolAbi, functionName: 'liquidity' },
   ]));
+  if (depth.filter((r) => r.status !== 'success').length > depth.length * 0.02) throw new Error('RPC error while checking arbitrage pool depth');
   const byToken = new Map<number, ArbPool[]>();
   pools.forEach((p, i) => {
     const bal = depth[2 * i];
     const second = depth[2 * i + 1];
     if (bal.status !== 'success' || second.status !== 'success') return;
-    if (Number(bal.result as bigint) / 1e18 < minWeth) return;
-    if (!p.v2 && (second.result as bigint) === 0n) return;
+    let wethDepth = bal.result as bigint;
+    if (p.v2) {
+      const [reserve0, reserve1] = second.result as readonly [bigint, bigint, number];
+      if (reserve0 === 0n || reserve1 === 0n) return;
+      const wethReserve = BigInt(ADDR.weth) < BigInt(list[p.ti].address) ? reserve0 : reserve1;
+      if (wethReserve < wethDepth) wethDepth = wethReserve;
+    } else if ((second.result as bigint) === 0n) return;
+    const depthWeth = Number(wethDepth) / 1e18;
+    if (depthWeth < minWeth) return;
     const arr = byToken.get(p.ti) ?? [];
-    arr.push({ address: getAddress(p.address), venue: p.venue, v2: p.v2, fee: p.fee });
+    arr.push({ address: getAddress(p.address), venue: p.venue, v2: p.v2, fee: p.fee, depthWeth });
     byToken.set(p.ti, arr);
   });
   const out: ArbToken[] = [];

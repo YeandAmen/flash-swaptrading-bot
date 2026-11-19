@@ -2,7 +2,7 @@
 // Run via: npm run build && npm run mev-fork-test   (scripts/fork-test.sh starts anvil and sets the env)
 // A "whale" creates real price gaps between pools with big swaps; the searcher must find, simulate and capture them.
 import assert from 'node:assert/strict';
-import { createTestClient, createWalletClient, decodeFunctionData, http, maxUint256, parseAbi, parseEther, type Address } from 'viem';
+import { createTestClient, createWalletClient, decodeFunctionData, http, maxUint256, parseAbi, parseEther, parseEventLogs, type Address } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import { ADDR, CONFIG, CORE_TOKENS, MEV } from './config.js';
@@ -10,7 +10,7 @@ import { erc20Abi, publicClient } from './chain.js';
 import { LiveExecutor } from './executor.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
 import { FLASH_ARB_ABI } from './mev/artifact.js';
-import type { ArbPool, ArbToken } from './mev/pools.js';
+import { poolVenue, type ArbPool, type ArbToken } from './mev/pools.js';
 import { MevSearcher, type MevHost, type MevOpp } from './mev/searcher.js';
 import { loadOrCreateWallet } from './wallet.js';
 
@@ -59,6 +59,12 @@ const v2RouterAbi = parseAbi([
 ]);
 const routerAbi = parseAbi([
   'struct ExactInputSingleParams { address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96; }',
+  'function exactInputSingle(ExactInputSingleParams params) payable returns (uint256 amountOut)',
+]);
+// Canonical Sushi v3 periphery on Ethereum. Its struct includes a deadline, unlike SwapRouter02.
+const SUSHI_V3_ROUTER = '0x2E6cd2d30aa43f40aa81619ff4b6E0a41479B13F';
+const sushiV3RouterAbi = parseAbi([
+  'struct ExactInputSingleParams { address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 deadline; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96; }',
   'function exactInputSingle(ExactInputSingleParams params) payable returns (uint256 amountOut)',
 ]);
 const deadline = () => BigInt(Math.floor(Date.now() / 1000) + 3600);
@@ -154,7 +160,7 @@ async function captures(t: ArbToken, label: string, buy: ArbPool, sell: ArbPool)
   const booked = opps.reduce((s, x) => s + x.netEth, 0);
   assert.ok(Math.abs(diff - booked) < 1e-9, `${label}: wallet ETH grew by exactly the reported net (${diff} vs ${booked})`);
   const rc = await publicClient.getTransactionReceipt({ hash: o.hash! });
-  const kind = (venue: string) => (venue.startsWith('Uniswap v3') ? 'v3' : 'v2');
+  const kind = (venue: string) => (venue.includes(' v3 ') ? 'v3' : 'v2');
   gasByRoute[`${kind(o.buy)}→${kind(o.sell)}`] = rc.gasUsed;
   console.log(`✓ ${label}: ${t.token.symbol} buy ${o.buy} → sell ${o.sell}, size ${o.sizeEth.toFixed(3)} ETH, gross ${o.grossEth.toFixed(5)}, tip ${o.tipEth.toFixed(5)}, gas ${rc.gasUsed} units → net +${o.netEth.toFixed(5)} ETH` +
     (opps.length > 1 ? ` (+${opps.length - 1} follow-up arb${opps.length > 2 ? 's' : ''} on the leftover gap)` : ''));
@@ -167,7 +173,7 @@ const pick = (want: (t: ArbToken) => [ArbPool, ArbPool] | null): { t: ArbToken; 
   }
   throw new Error('no suitable token on this fork');
 };
-const v3Pools = (t: ArbToken) => t.pools.filter((p) => !p.v2);
+const v3Pools = (t: ArbToken) => t.pools.filter((p) => poolVenue(p) === 'Uniswap v3');
 const v2Of = (t: ArbToken, venue: string) => t.pools.find((p) => p.venue === venue);
 
 // ---- 1. paper mode: finds and simulates the gap, sends nothing
@@ -264,6 +270,40 @@ await exec.deployContract('0x6001600c60003960016000f300', () => {}); // tiny con
 assert.ok(Date.now() - t0 >= 1_400, 'normal tx waited for the bundle window');
 exec.releaseBundle();
 console.log('✓ nonce gate: wallet transactions never collide with a pending bundle');
+
+// Force a known Sushi v3 route on the fork so this test cannot pass via another venue.
+const sushiV3 = pick((t) => {
+  if (t.token.symbol !== 'USDC') return null;
+  const sushi = t.pools.find((p) => poolVenue(p) === 'SushiSwap v3' && p.fee === 0.003);
+  const uni = t.pools.find((p) => poolVenue(p) === 'Uniswap v3' && p.fee === 0.0005);
+  return sushi && uni ? [uni, sushi] : null;
+});
+const sushiWei = parseEther(((await wethIn(sushiV3.b)) * 0.04).toFixed(6));
+await wait(await wc.writeContract({
+  account: whale, chain: mainnet, address: SUSHI_V3_ROUTER, abi: sushiV3RouterAbi, functionName: 'exactInputSingle', value: sushiWei,
+  args: [{ tokenIn: ADDR.weth, tokenOut: sushiV3.t.token.address, fee: 3000, recipient: whale, deadline: deadline(), amountIn: sushiWei, amountOutMinimum: 0n, sqrtPriceLimitX96: 0n }],
+}));
+const sushiAmount = parseEther('0.3');
+const sushiExpiry = (await publicClient.getBlockNumber({ cacheTime: 0 })) + 5n;
+const sushiSim = await mev.simulate(sushiV3.t, sushiV3.a, sushiV3.b, sushiAmount, sushiExpiry);
+assert.ok(sushiSim.ok && sushiSim.profit > 0n, 'the canonical Sushi v3 route simulates successfully');
+const ownerBeforeSushi = await publicClient.getBalance({ address: me });
+const sushiReceipt = await wait(await wc.writeContract({
+  account: wallet.account, chain: mainnet, address: contract, abi: FLASH_ARB_ABI, functionName: 'execute',
+  args: [{ poolA: sushiV3.a.address, poolB: sushiV3.b.address, token: sushiV3.t.token.address, aIsV2: false, bIsV2: false, amountIn: sushiAmount, minProfit: sushiSim.profit, tip: 0n, maxBlock: sushiExpiry }],
+}));
+const [sushiPayout] = parseEventLogs({ abi: FLASH_ARB_ABI, eventName: 'Arbitrage', logs: sushiReceipt.logs });
+assert.ok(sushiPayout, 'the Sushi v3 route emitted its payout');
+assert.equal(sushiPayout.args.poolB, sushiV3.b.address);
+assert.equal(sushiPayout.args.profit, sushiSim.profit);
+const sushiNet = sushiPayout.args.profit - sushiReceipt.gasUsed * sushiReceipt.effectiveGasPrice;
+assert.ok(sushiNet > 0n, 'the simulated gap clears execution gas on the fork');
+assert.equal((await publicClient.getBalance({ address: me })) - ownerBeforeSushi, sushiNet, 'the exact fork proceeds reach the owner');
+for (const token of [ADDR.weth, sushiV3.t.token.address]) {
+  assert.equal(await publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [contract] }), 0n, 'Sushi v3 route leaves no token balance');
+}
+assert.equal(await publicClient.getBalance({ address: contract }), 0n, 'Sushi v3 route leaves no ETH balance');
+console.log('✓ canonical SushiSwap v3 callback, exact simulation, and owner payout with no residual ETH or tokens');
 
 console.log('\nGas used per route:', Object.entries(gasByRoute).map(([k, v]) => `${k} ${v}`).join(', '));
 console.log('ALL MEV FORK TESTS PASSED');
