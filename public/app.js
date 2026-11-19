@@ -15,7 +15,16 @@ let qrLoaded = false;
 let panicPending = false;
 
 async function api(path, body) {
-  const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-bot-ui': '1' }, body: JSON.stringify(body || {}) });
+  const send = (authorization) => fetch(path, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-bot-ui': '1', ...(authorization ? { authorization } : {}) },
+    body: JSON.stringify(body || {}),
+  });
+  let r = await send();
+  if (r.status === 401) {
+    const password = window.prompt('Authorize this live wallet action with the local operator password (npm run --silent dashboard:password).');
+    if (!password) throw new Error('Live wallet action canceled.');
+    r = await send(`Basic ${btoa(`operator:${password.trim()}`)}`);
+  }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
@@ -24,17 +33,12 @@ async function api(path, body) {
 async function refresh() {
   try {
     const r = await fetch('/api/state', { cache: 'no-store' });
-    if (r.status === 401) {
-      $('banner').className = 'banner warn';
-      $('bannerText').textContent = 'Sign in as operator with the password from npm run service:token.';
-      return;
-    }
     if (!r.ok) throw new Error(r.statusText);
     S = await r.json();
     render();
   } catch (e) {
     $('banner').className = 'banner bad';
-    $('bannerText').textContent = 'Cannot reach the bot server on this Mac. Is it running? (npm run service:status)';
+    $('bannerText').textContent = 'Cannot reach the local bot. Start it with npm start and check the terminal output.';
   }
 }
 
@@ -232,7 +236,7 @@ function render() {
     $('mevRpc').textContent = st.rpcCalls.toLocaleString();
     const rTag = { landed: 'buy', 'would send': 'buy', sent: 'sell', failed: 'down' };
     $('mevBody').innerHTML = (X.recent || []).length ? X.recent.map((o) => `<tr><td>${hm(o.t)}</td><td><b>${esc(o.symbol)}</b></td>
-      <td class="why">${esc(o.buy)} → ${esc(o.sell)}</td><td class="r">${o.sizeEth.toFixed(3)}</td><td class="r">${o.grossEth.toFixed(5)}</td>
+      <td class="why">${esc(o.buy)} → ${esc(o.sell)}${o.funding ? `<div class="sub">${esc(o.funding)}</div>` : ''}</td><td class="r">${o.sizeEth.toFixed(3)}</td><td class="r">${o.grossEth.toFixed(5)}</td>
       <td class="r">${o.gasEth.toFixed(5)}</td><td class="r ${cls(o.netEth)}">${o.netEth.toFixed(5)}</td>
       <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
       <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}</td></tr>`).join('')
@@ -242,7 +246,9 @@ function render() {
     $('mevDisarmBtn').hidden = !X.armed;
     $('mevDeploy').textContent = X.contract
       ? `contract ${X.contract.slice(0, 8)}…${X.contract.slice(-4)}`
-      : X.deployEstimateUsd != null ? `arming deploys the contract once (~${usd(X.deployEstimateUsd)} gas)` : '';
+      : X.contractVersion === 'v2' ? 'FlashArbV2 · paper simulation · manual deployment required for execution'
+        : X.deployEstimateUsd != null ? `arming deploys the contract once (~${usd(X.deployEstimateUsd)} gas)` : '';
+    if (X.contractVersion === 'v2' && !X.contract) $('mevArmBtn').disabled = true;
   }
 
   // log
@@ -303,7 +309,7 @@ const mevDlg = $('mevDlg');
 $('mevArmBtn').onclick = () => {
   const X = S?.mev;
   $('mevDlgDeploy').innerHTML = X?.contract
-    ? 'The arbitrage contract is already deployed (owner = the bot wallet): no extra cost.'
+    ? 'Arming verifies the configured contract bytecode and wallet ownership.'
     : `First, one transaction deploys the bot's own arbitrage contract (owner = the bot wallet): about <b>${X?.deployEstimateUsd != null ? usd(X.deployEstimateUsd) : 'a few dollars'}</b> of ETH gas, once.`;
   $('mevInput').value = '';
   $('mevConfirm').disabled = true;

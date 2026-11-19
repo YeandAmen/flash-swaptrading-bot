@@ -11,17 +11,18 @@ import type { PortfolioState } from './types.js';
 
 const engine = new Engine();
 const app = express();
-const dashboardCredentialMatches = createDashboardCredentialCheck();
+const dashboardCredentialMatches = CONFIG.allowLiveTrading ? createDashboardCredentialCheck() : null;
+const publicDir = path.join(ROOT, 'public');
 const liveTradingAllowed = CONFIG.allowLiveTrading || CONFIG.forkMode;
 app.disable('x-powered-by');
 
 // Only this machine, only this dashboard: block other hosts (DNS rebinding) and cross-site requests (CSRF).
 const allowed = new Set([`127.0.0.1:${CONFIG.port}`, `localhost:${CONFIG.port}`]);
-const allowedOrigins = new Set([...allowed].map((host) => `http://${host}`));
 app.use((req: Request, res: Response, next: NextFunction) => {
-  if (!allowed.has(req.headers.host ?? '')) { res.status(403).send('Forbidden host'); return; }
+  const host = req.headers.host ?? '';
+  if (!allowed.has(host)) { res.status(403).send('Forbidden host'); return; }
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    if (!allowedOrigins.has(req.headers.origin ?? '') || req.headers['x-bot-ui'] !== '1') {
+    if (req.headers.origin !== `http://${host}` || req.headers['x-bot-ui'] !== '1') {
       res.status(403).json({ error: 'Forbidden' });
       return;
     }
@@ -50,20 +51,15 @@ function readiness(): { ready: boolean; reason: string } {
   return { ready: true, reason: 'Market cycle is healthy' };
 }
 
-// Minimal loopback probes for launchd and monitoring. Dashboard data and controls require authentication.
+// Minimal loopback probes for monitoring. Wallet writes have a separate operator check.
 app.get('/api/health', (_req, res) => { res.json({ status: 'ok' }); });
 app.get('/api/ready', (_req, res) => {
   const health = readiness();
   res.status(health.ready ? 200 : 503).json(health);
 });
 
-app.use((req: Request, res: Response, next: NextFunction) => {
-  if (dashboardCredentialMatches(req.headers.authorization)) { next(); return; }
-  res.setHeader('WWW-Authenticate', 'Basic realm="ETH Token Bot", charset="UTF-8"');
-  res.status(401).json({ error: 'Sign in as operator with the password from npm run service:token.' });
-});
 app.use(express.json({ limit: '10kb' }));
-app.use(express.static(path.join(ROOT, 'public')));
+app.use(express.static(publicDir));
 
 function downsample<T>(arr: T[], max: number): T[] {
   if (arr.length <= max) return arr;
@@ -212,8 +208,17 @@ app.get('/api/qr.svg', async (_req, res) => {
 
 const kindOf = (req: Request) => (req.body?.kind === 'live' ? 'live' : 'paper') as 'paper' | 'live';
 
-function allowArming(res: Response): boolean {
+function allowLiveControl(req: Request, res: Response): boolean {
   if (!liveTradingAllowed) { res.status(403).json({ error: 'Live signing is disabled in settings' }); return false; }
+  if (!CONFIG.forkMode && !dashboardCredentialMatches?.(req.headers.authorization)) {
+    res.status(401).json({ error: 'This live wallet action requires the local operator password.' });
+    return false;
+  }
+  return true;
+}
+
+function allowArming(req: Request, res: Response): boolean {
+  if (!allowLiveControl(req, res)) return false;
   const health = readiness();
   if (!health.ready) { res.status(503).json({ error: health.reason }); return false; }
   return true;
@@ -234,25 +239,34 @@ function control(operation: (req: Request) => void | Promise<void>) {
 
 app.post('/api/arm', (req, res) => {
   if (req.body?.confirm !== 'LIVE') { res.status(400).json({ error: 'Type LIVE to confirm' }); return; }
-  if (allowArming(res)) void control(() => engine.arm())(req, res);
+  if (allowArming(req, res)) void control(() => engine.arm())(req, res);
 });
 app.post('/api/disarm', control(() => engine.disarm()));
 app.post('/api/mev/arm', (req, res) => {
   if (req.body?.confirm !== 'MEV') { res.status(400).json({ error: 'Type MEV to confirm' }); return; }
-  if (!allowArming(res)) return;
+  if (!allowArming(req, res)) return;
   const mev = engine.mev;
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
   void control(() => mev.arm())(req, res);
 });
 app.post('/api/mev/disarm', control(() => engine.mev?.disarm()));
-app.post('/api/pause', control((req) => engine.setPaused(!!req.body?.paused)));
-app.post('/api/resume', control((req) => engine.resume(kindOf(req))));
+app.post('/api/pause', (req, res) => {
+  const paused = Boolean(req.body?.paused);
+  if (paused || !liveTradingAllowed || allowLiveControl(req, res)) void control(() => engine.setPaused(paused))(req, res);
+});
+app.post('/api/resume', (req, res) => {
+  const kind = kindOf(req);
+  if (kind === 'paper' || allowLiveControl(req, res)) void control(() => engine.resume(kind))(req, res);
+});
 app.post('/api/paper/reset', control(() => engine.resetPaper()));
 app.post('/api/backtest', control(() => { void engine.runResearchNow(); }));
-app.post('/api/panic', control((req) => engine.panic(kindOf(req))));
+app.post('/api/panic', (req, res) => {
+  const kind = kindOf(req);
+  if (kind === 'paper' || allowLiveControl(req, res)) void control(() => engine.panic(kind))(req, res);
+});
 
 const server = app.listen(CONFIG.port, CONFIG.host, () => {
-  console.log(`Dashboard: http://localhost:${CONFIG.port}`);
+  console.log(`Dashboard: http://127.0.0.1:${CONFIG.port}`);
   void engine.start();
 });
 
