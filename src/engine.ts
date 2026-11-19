@@ -305,7 +305,7 @@ export class Engine {
       const m = r.ml;
       if (m.enabled) {
         this.log(`ML walk-forward: AUC ${m.auc === null ? 'n/a' : m.auc.toFixed(3)} on ${m.oosRows} unseen hours, ${m.folds} re-trains; ` +
-          `best ML ${m.mlOos ? (m.mlOos.returnPct * 100).toFixed(2) + '%' : 'n/a'} (p≥${m.threshold}) vs rules ${m.rulesOos ? (m.rulesOos.returnPct * 100).toFixed(2) + '%' : 'n/a'} → ${this.mlActive ? 'ML drives entries' : 'rules drive entries'} (${m.reason}). [${((Date.now() - t0) / 1000).toFixed(0)}s]`);
+          `best ML ${m.mlOos ? (m.mlOos.returnPct * 100).toFixed(2) + '%' : 'n/a'} (${m.threshold}x base rate) vs rules ${m.rulesOos ? (m.rulesOos.returnPct * 100).toFixed(2) + '%' : 'n/a'} → ${this.mlActive ? 'ML drives entries' : 'rules drive entries'} (${m.reason}). [${((Date.now() - t0) / 1000).toFixed(0)}s]`);
       }
     } catch (e) {
       this.log(`Research/backtest failed: ${errMsg(e)}`, 'warn');
