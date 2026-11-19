@@ -208,7 +208,7 @@ export const MEV = {
   builderTipPct: num('MEV_BUILDER_TIP_PCT', 0.5), // share of the after-gas profit paid to the block builder
   minNetUsd: num('MEV_MIN_NET_USD', 0.05), // smallest after-gas, after-tip profit worth a bundle
   maxSimsPerBlock: num('MEV_MAX_SIMS_PER_BLOCK', 3),
-  builders: str('MEV_BUILDERS', 'https://relay.flashbots.net,https://rpc.titanbuilder.xyz,https://rpc.beaverbuild.org,https://rsync-builder.xyz')
+  builders: str('MEV_BUILDERS', 'https://relay.flashbots.net,https://rpc.titanbuilder.xyz,https://rpc.beaverbuild.org')
     .split(',').map((s) => s.trim()).filter(Boolean),
 };
 

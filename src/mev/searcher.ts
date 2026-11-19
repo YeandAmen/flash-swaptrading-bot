@@ -10,7 +10,7 @@ import { BIG_BATCH, type McResult } from '../market.js';
 import { writeJson } from '../persistence.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
-import { sendBundle } from './bundles.js';
+import { sendBundle, type BuilderResult } from './bundles.js';
 import { routeInputSizes } from './sizing.js';
 import { arbGas, bestCycle, buildStateReads, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
 import { MevUniverse } from './universe.js';
@@ -20,6 +20,8 @@ const STATE_FILE = path.join(DATA_DIR, 'mev.json');
 const SIM_ADDR: Address = '0x00000000000000000000000000000000000ab1e5';
 const HOUR = 3_600_000;
 const MAX_BLOCK_AGE_SECONDS = 45;
+const SLOT_MS = 12_000;
+const HEAD_RETRY_MS = 400;
 const RECEIPT_CONFIRMATIONS = 2n;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String(e)).split('\n')[0]).slice(0, 200);
@@ -60,6 +62,17 @@ export interface MevOpp {
   ownerPayoutEth?: number; // successful contract payout before the owner's transaction fee
   funding?: (typeof FUNDING_NAMES)[number];
   lenderFeeEth?: number;
+  submission?: BundleSubmission;
+}
+
+interface BundleSubmission {
+  target: number;
+  startedAt: number;
+  leadMs: number;
+  gasEth: number;
+  tipEth: number;
+  netUsd: number;
+  builders: BuilderResult[];
 }
 
 interface MevStats {
@@ -332,14 +345,18 @@ export class MevSearcher {
       try {
         if (!this.universe.broad && Date.now() - this.poolsAt > 24 * HOUR) await this.refreshPools();
         const head = await this.head();
-        if (head.hash === lastHash) { await sleep(1_500); continue; }
+        if (head.hash === lastHash) {
+          const ageMs = Date.now() - Number(head.timestamp) * 1000;
+          await sleep(ageMs < SLOT_MS + 3000 ? HEAD_RETRY_MS : 1000);
+          continue;
+        }
         const r = await this.read(head);
         this.lastError = null;
         await this.onBlock(r);
         lastHash = r.hash;
         backoff = 0;
-        // the next block is due 12 s after this one; read it shortly after it should exist
-        await sleep(Math.min(13_000, Math.max(1_000, (r.timestamp + 12) * 1000 + 1_500 - Date.now())));
+        // Start checking for the next execution head at the expected slot boundary.
+        await sleep(Math.min(SLOT_MS, Math.max(HEAD_RETRY_MS, r.timestamp * 1000 + SLOT_MS - Date.now())));
       } catch (e) {
         this.lastError = errMsg(e);
         backoff = Math.min(backoff * 2 + 5_000, 60_000);
@@ -584,22 +601,26 @@ export class MevSearcher {
       tip = this.builderTip(afterGas, minimumNet);
       if (tip === 0n) return skip('profit does not cover a builder payment above the configured floor');
       data = encode(tip, tip + worstGas + minimumNet);
-      const result = await publicClient.call({ account, to: contract, data, gas, blockNumber: r.blockNumber });
-      this.file.stats.rpcCalls++;
-      if (!result.data || decodeArbitrage(result.data) < tip + worstGas + minimumNet) {
-        return skip('final simulation returned insufficient profit');
-      }
     } catch (e) {
       opp.status = 'failed';
-      opp.note = `final check: ${reasonOf(e)}`;
+      opp.note = `gas estimate: ${reasonOf(e)}`;
       this.record(opp);
       return;
     }
     if (!canSend() || this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
     try {
-      const [nonce, head, balance] = await Promise.all([exec.bundleNonce(), this.head(), publicClient.getBalance({ address: account.address })]);
-      if (head.hash !== r.hash || !canSend()) return skip('block changed or MEV was disarmed before signing');
+      this.file.stats.rpcCalls++;
+      const [result, nonce, balance] = await Promise.all([
+        publicClient.call({ account, to: contract, data, gas, blockNumber: r.blockNumber }),
+        exec.bundleNonce(),
+        publicClient.getBalance({ address: account.address }),
+      ]);
+      if (!result.data || decodeArbitrage(result.data) < tip + worstGas + minimumNet) {
+        return skip('final simulation returned insufficient profit');
+      }
       if (balance < worstGas) return skip('wallet ETH does not cover the padded gas budget');
+      const head = await this.head();
+      if (head.hash !== r.hash || !canSend()) return skip('block changed or MEV was disarmed before signing');
       const signed = await account.signTransaction({
         chainId: publicClient.chain.id, type: 'eip1559', to: contract, data, nonce, gas,
         maxFeePerGas: nextMaxBase, maxPriorityFeePerGas: 0n, value: 0n,
@@ -607,25 +628,59 @@ export class MevSearcher {
       if (!canSend()) return skip('MEV was disarmed before sending');
       const hash = keccak256(signed);
       const net = offer.profit - tip - worstGas;
-      Object.assign(opp, { hash, status: 'sent', gasEth: eth(worstGas), tipEth: eth(tip), netEth: eth(net), netUsd: eth(net) * ethUsd, note: 'submission outcome pending' });
-      this.file.pending = { hash, nonce, target: target.toString(), contract, ethUsd, opp };
+      const startedAt = Date.now();
+      const submission: BundleSubmission = {
+        target: Number(target), startedAt, leadMs: r.timestamp * 1000 + SLOT_MS - startedAt,
+        gasEth: eth(worstGas), tipEth: eth(tip), netUsd: eth(net) * ethUsd, builders: [],
+      };
+      Object.assign(opp, {
+        hash, status: 'sent', gasEth: submission.gasEth, tipEth: submission.tipEth,
+        netEth: eth(net), netUsd: submission.netUsd, note: 'awaiting builder replies', submission,
+      });
+      const pending = { hash, nonce, target: target.toString(), contract, ethUsd, opp };
+      const recent = this.file.recent.slice();
+      this.file.pending = pending;
       this.record(opp, false);
-      this.writeState();
-      const res = await sendBundle([signed], target, () => canSend() && this.pending?.hash === hash);
-      if (this.pending?.hash !== hash) return;
-      if (!res.length) {
-        this.finishBundle({ ...opp, status: 'skipped', note: 'disarmed before relay submission' });
+      try {
+        this.writeState();
+      } catch (error) {
+        this.file.pending = null;
+        this.file.recent = recent;
+        throw error;
+      }
+      const flight = this.submitSignedBundle(pending, submission, signed, () => canSend() && this.pending === pending);
+      // The journal continues to reserve the nonce while replies arrive. The scanner can follow the next head.
+      if (CONFIG.forkMode) await flight;
+    } catch (e) {
+      if (opp.hash) throw e;
+      opp.status = 'failed';
+      opp.note = `final check: ${reasonOf(e)}`;
+      this.record(opp);
+    } finally {
+      if (!this.pending) this.releaseBundle();
+    }
+  }
+
+  private async submitSignedBundle(pending: PendingBundle, submission: BundleSubmission, signed: Hex, canSend: () => boolean) {
+    try {
+      const responses = await sendBundle([signed], BigInt(pending.target), canSend);
+      if (!responses.length) {
+        if (this.pending === pending) this.finishBundle({
+          ...pending.opp, status: 'skipped', note: 'submission canceled before contacting builders',
+          gasEth: 0, tipEth: 0, netEth: 0, netUsd: 0,
+        });
         return;
       }
       this.file.stats.bundles++;
-      const accepted = res.filter((x) => x.ok);
-      opp.note = accepted.length
-        ? `${accepted.length}/${res.length} acknowledged for block ${target}: ${accepted.map((x) => x.builder).join(', ')}`
-        : `no valid acknowledgement for block ${target}; awaiting chain confirmation`;
+      submission.builders = responses;
+      const acknowledgements = responses.filter((response) => response.ok).length;
+      if (this.pending === pending) pending.opp.note = `${acknowledgements}/${responses.length} acknowledged; awaiting on-chain settlement`;
       this.save();
-      this.host.log(`[mev] Bundle submitted for block ${target}: ${opp.note}`);
-    } finally {
-      if (!this.pending) this.releaseBundle();
+      const details = responses.map(({ builder, detail, elapsedMs }) => `${builder} ${detail} (${elapsedMs} ms)`).join(', ');
+      this.host.log(`[mev] Bundle submitted for block ${pending.target}: ${acknowledgements}/${responses.length} acknowledged, start ${submission.leadMs} ms before expected slot. ${details}`);
+    } catch {
+      // A transport or storage error does not settle the wallet intent.
+      this.host.log(`[mev] Bundle for block ${pending.target} awaiting on-chain reconciliation after a submission error.`, 'warn');
     }
   }
 
@@ -722,6 +777,7 @@ export class MevSearcher {
     this.file.stats.rpcCalls++;
     if (nonceAtTarget <= p.nonce) {
       this.finishBundle({ ...p.opp, status: 'not included', note: 'target block passed without using this nonce', netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
+      this.host.log(`[mev] Bundle for block ${target} not included. Wallet nonce was unused in the target block.`);
     } else {
       const block = await publicClient.getBlock({ blockNumber: target, includeTransactions: true });
       this.file.stats.rpcCalls++;
@@ -730,6 +786,7 @@ export class MevSearcher {
       if (tx && tx.hash.toLowerCase() !== p.hash.toLowerCase()) {
         this.host.exec.noteNonceUsed(p.nonce);
         this.finishBundle({ ...p.opp, status: 'not included', note: 'a different transaction used the nonce in the target block', netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
+        this.host.log(`[mev] Bundle for block ${target} not included. A different transaction used the wallet nonce.`);
         return;
       }
       // A changed nonce alone does not establish which hash landed.

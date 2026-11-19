@@ -241,7 +241,7 @@ function render() {
       <td class="why">${esc(o.buy)} → ${esc(o.sell)}${o.funding ? `<div class="sub">${esc(o.funding)}</div>` : ''}</td><td class="r">${o.sizeEth.toFixed(3)}</td><td class="r">${o.grossEth.toFixed(5)}</td>
       <td class="r">${o.gasEth.toFixed(5)}</td><td class="r ${cls(o.netEth)}">${o.netEth.toFixed(5)}</td>
       <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
-      <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}</td></tr>`).join('')
+      <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}${bundleDetails(o.submission)}</td></tr>`).join('')
       : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
   }
   renderMevControls(X);
@@ -260,6 +260,17 @@ function render() {
     ['Daily loss stop', pct(-r.dailyLossLimitPct, 0)], ['Drawdown halt', pct(-r.maxDrawdownPct, 0)],
     ['Max entry gas', r.maxEntryGasGwei + ' gwei'], ['Approvals', r.approvalMode === 'exact' ? 'exact amount only' : 'unlimited'],
   ].map(([a, v]) => `<span>${a}</span><span>${v}</span>`).join('');
+}
+
+function bundleDetails(submission) {
+  if (!submission) return '';
+  const { target, leadMs, netUsd, gasEth, tipEth, builders } = submission;
+  const timing = `${(Math.abs(leadMs) / 1000).toFixed(2)}s ${leadMs >= 0 ? 'before' : 'after'} expected slot`;
+  return `<details class="sub"><summary>Bundle for block ${esc(target)}</summary>
+    <div>${timing} · quoted net ${usd(netUsd)}</div>
+    <div>Gas budget ${gasEth.toFixed(6)} ETH · builder bid ${tipEth.toFixed(6)} ETH</div>
+    ${builders.map((builder) => `<div title="${esc(builder.bundleHash || '')}">${esc(builder.builder)} · ${esc(builder.detail)} · ${esc(builder.elapsedMs)} ms</div>`).join('')}
+    </details>`;
 }
 
 function renderMevControls(X) {

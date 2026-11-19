@@ -28,14 +28,22 @@ export interface BuilderResult {
   builder: string;
   ok: boolean;
   detail: string;
+  elapsedMs: number;
+  bundleHash?: Hex;
 }
 
-function bundleHashOf(value: unknown): Hex | null {
-  if (!value || typeof value !== 'object') return null;
-  const reply = value as { jsonrpc?: unknown; id?: unknown; error?: unknown; result?: { bundleHash?: unknown } };
+/** Retain only structured acknowledgements and error codes supplied by the relay. */
+export function parseBuilderReply(value: unknown): Pick<BuilderResult, 'ok' | 'detail' | 'bundleHash'> {
+  if (!value || typeof value !== 'object') return { ok: false, detail: 'no valid bundle acknowledgement' };
+  const reply = value as { jsonrpc?: unknown; id?: unknown; error?: { code?: unknown }; result?: { bundleHash?: unknown } };
   const hash = reply.result?.bundleHash;
-  return reply.jsonrpc === '2.0' && reply.id === 1 && !reply.error && typeof hash === 'string' && /^0x[0-9a-f]{64}$/i.test(hash)
-    ? hash as Hex : null;
+  if (reply.jsonrpc === '2.0' && reply.id === 1 && !reply.error && typeof hash === 'string' && /^0x[0-9a-f]{64}$/i.test(hash)) {
+    return { ok: true, detail: 'acknowledged', bundleHash: hash as Hex };
+  }
+  const code = reply.error?.code;
+  return typeof code === 'number' && Number.isSafeInteger(code)
+    ? { ok: false, detail: `JSON-RPC error ${code}` }
+    : { ok: false, detail: 'no valid bundle acknowledgement' };
 }
 
 /**
@@ -49,11 +57,12 @@ export async function sendBundle(signedTxs: Hex[], targetBlock: bigint, canSend:
     const out: BuilderResult[] = [];
     for (const tx of signedTxs) {
       if (!allowed()) break;
+      const started = performance.now();
       try {
-        const hash = await publicClient.request({ method: 'eth_sendRawTransaction', params: [tx] });
-        out.push({ builder: 'fork', ok: true, detail: String(hash) });
+        await publicClient.request({ method: 'eth_sendRawTransaction', params: [tx] });
+        out.push({ builder: 'fork', ok: true, detail: 'acknowledged', elapsedMs: Math.round(performance.now() - started) });
       } catch {
-        out.push({ builder: 'fork', ok: false, detail: 'local submission outcome unknown' });
+        out.push({ builder: 'fork', ok: false, detail: 'local submission outcome unknown', elapsedMs: Math.round(performance.now() - started) });
       }
     }
     return out;
@@ -66,14 +75,17 @@ export async function sendBundle(signedTxs: Hex[], targetBlock: bigint, canSend:
   const headers = { 'content-type': 'application/json', 'x-flashbots-signature': `${signer.address}:${signature}` };
   return Promise.all(MEV.builders.map(async (url): Promise<BuilderResult> => {
     const builder = new URL(url).hostname;
+    const started = performance.now();
+    const signal = AbortSignal.timeout(4_000);
+    const elapsedMs = () => Math.round(performance.now() - started);
     try {
-      const res = await fetch(url, { method: 'POST', redirect: 'error', headers, body, signal: AbortSignal.timeout(4_000) });
-      if (!res.ok) return { builder, ok: false, detail: `HTTP ${res.status}` };
-      const reply: unknown = await res.json().catch(() => null);
-      const hash = bundleHashOf(reply);
-      return hash ? { builder, ok: true, detail: hash } : { builder, ok: false, detail: 'no valid bundle acknowledgement' };
-    } catch {
-      return { builder, ok: false, detail: 'submission outcome unknown' };
+      const res = await fetch(url, { method: 'POST', redirect: 'error', headers, body, signal });
+      if (!res.ok) return { builder, ok: false, detail: `HTTP ${res.status}`, elapsedMs: elapsedMs() };
+      const reply: unknown = await res.json();
+      return { builder, ...parseBuilderReply(reply), elapsedMs: elapsedMs() };
+    } catch (error) {
+      const detail = signal.aborted ? 'submission timed out' : error instanceof SyntaxError ? 'invalid JSON response' : 'network error';
+      return { builder, ok: false, detail, elapsedMs: elapsedMs() };
     }
   }));
 }
