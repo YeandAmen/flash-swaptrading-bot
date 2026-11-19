@@ -16,18 +16,31 @@ export const sendClient = createClient({
   transport: http(CONFIG.sendRpcUrl, { retryCount: 1, timeout: 20_000, fetchOptions: { redirect: 'error' } }),
 });
 
-/** Median priority fee of the last 10 blocks, clamped to a sane range. */
+export const MIN_PRIORITY_FEE_WEI = parseGwei('0.03');
+
+/** Median priority fee of the last 10 blocks. */
 export async function suggestTipWei(): Promise<bigint> {
-  const lo = parseGwei('0.03');
   const hi = parseGwei('1.5');
   try {
     const fh = await publicClient.getFeeHistory({ blockCount: 10, rewardPercentiles: [50] });
     const tips = (fh.reward ?? []).map((r) => r[0]).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     const med = tips[Math.floor(tips.length / 2)] ?? parseGwei('0.1');
-    return med < lo ? lo : med > hi ? hi : med;
+    return med < MIN_PRIORITY_FEE_WEI ? MIN_PRIORITY_FEE_WEI : med > hi ? hi : med;
   } catch {
     return parseGwei('0.1');
   }
+}
+
+/** EIP-1559 computes the target block's base fee from its parent header. */
+export function nextBaseFee(parent: { baseFeePerGas: bigint | null; gasUsed: bigint; gasLimit: bigint }): bigint {
+  const baseFee = parent.baseFeePerGas;
+  const targetGas = parent.gasLimit / 2n;
+  if (baseFee === null || targetGas === 0n) throw new Error('missing EIP-1559 base-fee data');
+  if (parent.gasUsed > targetGas) {
+    const increase = baseFee * (parent.gasUsed - targetGas) / targetGas / 8n;
+    return baseFee + (increase > 0n ? increase : 1n);
+  }
+  return baseFee - (baseFee * (targetGas - parent.gasUsed) / targetGas / 8n);
 }
 
 export const erc20Abi = parseAbi([

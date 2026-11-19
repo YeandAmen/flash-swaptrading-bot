@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { BaseError, ExecutionRevertedError, keccak256, pad, parseEventLogs, parseGwei, TransactionReceiptNotFoundError, type Address, type Hex } from 'viem';
+import { BaseError, ExecutionRevertedError, keccak256, pad, parseEventLogs, TransactionReceiptNotFoundError, type Address, type Hex } from 'viem';
 import type { PrivateKeyAccount } from 'viem/accounts';
 import { CONFIG, CORE_TOKENS, DATA_DIR, MEV, type TokenCfg } from '../config.js';
-import { publicClient } from '../chain.js';
+import { nextBaseFee, publicClient } from '../chain.js';
 import { redactDiagnostic } from '../diagnostics.js';
 import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../executor.js';
 import { BIG_BATCH, type McResult } from '../market.js';
@@ -26,25 +26,12 @@ const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String
 const eth = (wei: bigint) => Number(wei) / 1e18;
 const validPrice = (price: number | null): price is number => price !== null && Number.isFinite(price) && price > 0;
 
-/** EIP-1559 computes the target block's base fee from its parent header. */
-function nextBaseFee(parent: { baseFeePerGas: bigint | null; gasUsed: bigint; gasLimit: bigint }): bigint {
-  const baseFee = parent.baseFeePerGas;
-  const targetGas = parent.gasLimit / 2n;
-  if (baseFee === null || targetGas === 0n) throw new Error('missing EIP-1559 base-fee data');
-  if (parent.gasUsed > targetGas) {
-    const increase = baseFee * (parent.gasUsed - targetGas) / targetGas / 8n;
-    return baseFee + (increase > 0n ? increase : 1n);
-  }
-  return baseFee - baseFee * (targetGas - parent.gasUsed) / targetGas / 8n;
-}
-
 /** The bits of the trading engine the searcher needs. */
 export interface MevHost {
   log(msg: string, level?: 'info' | 'warn' | 'error' | 'trade'): void;
   account: PrivateKeyAccount;
   exec: LiveExecutor;
   ethUsd(): number | null;
-  gasPriceGwei(): number | null;
   /** latest base fee from the trading loop's block header (refreshed every ~30 s); null = read it ourselves */
   baseFeeGwei(): number | null;
   tokens(): TokenCfg[];
@@ -177,7 +164,6 @@ export class MevSearcher {
   lastError: string | null = null;
   lastBlock: { number: number; at: number; candidates: number; readMs: number; decisionMs: number | null } | null = null;
   private deploying = false;
-  private deployGas: number | null = null;
   private reads: ReturnType<typeof buildStateReads> | null = null;
   private poolsAt = 0;
   private universe: MevUniverse;
@@ -286,7 +272,6 @@ export class MevSearcher {
         await sleep(Math.min(120_000, 15_000 * (i + 1)));
       }
     }
-    if (!this.selectedContract && !this.configuredContract) void this.estimateDeployGas();
     void this.loop();
     if (this.universe.broad && !this.stopping) void this.discoverMorePools();
   }
@@ -826,12 +811,6 @@ export class MevSearcher {
     return code?.toLowerCase() === FLASH_ARB_V2_RUNTIME.toLowerCase() && owner?.toLowerCase() === this.host.account.address.toLowerCase();
   }
 
-  private async estimateDeployGas() {
-    try {
-      this.deployGas = Number(await publicClient.estimateGas({ account: this.host.account.address, data: FLASH_ARB_V2_BYTECODE }));
-    } catch { /* the dashboard shows the estimate only when known */ }
-  }
-
   private clearDeployment(deployment?: { address: Address; gasWei: bigint }) {
     const f = this.file;
     const previous = {
@@ -915,6 +894,16 @@ export class MevSearcher {
     }
   }
 
+  async deploymentQuote() {
+    const { balance, minimumWei, estimatedWei, gas, maxFeePerGas } = await this.host.exec.quoteDeployment(FLASH_ARB_V2_BYTECODE);
+    return {
+      balanceEth: eth(balance),
+      minimumEth: eth(minimumWei),
+      estimatedEth: estimatedWei === null ? null : eth(estimatedWei),
+      maximumEth: estimatedWei === null ? null : eth(gas * maxFeePerGas),
+    };
+  }
+
   /** This action authorizes one deployment. Live trading stays separately controlled. */
   async deployFromDashboard(): Promise<Address> {
     if (!MEV.enabled) throw new Error('MEV is turned off in .env (MEV=off).');
@@ -932,15 +921,6 @@ export class MevSearcher {
     const canSend = () => this.deploying && this.armGeneration === generation && !this.stopping
       && !f.armed && !this.stateReadError && !this.pending && !this.host.tradePending();
     try {
-      const me = this.host.account.address;
-      const [balance, gas, block] = await Promise.all([
-        publicClient.getBalance({ address: me }),
-        publicClient.estimateGas({ account: me, data: FLASH_ARB_V2_BYTECODE }),
-        publicClient.getBlock(),
-      ]);
-      this.deployGas = Number(gas);
-      const need = ((gas * 13n) / 10n) * ((block.baseFeePerGas ?? parseGwei('1')) * 2n + parseGwei('1.5'));
-      if (balance < need) throw new Error('The bot wallet needs more ETH to cover deployment gas.');
       const r = await this.host.exec.deployContract(
         FLASH_ARB_V2_BYTECODE,
         (message) => this.host.log('[mev] ' + message),
@@ -982,7 +962,6 @@ export class MevSearcher {
       const name = poolVenue(p);
       venues[name] = (venues[name] ?? 0) + 1;
     }
-    const gp = this.host.gasPriceGwei();
     const ethUsd = this.host.ethUsd();
     const hour = Math.floor(Date.now() / HOUR) * HOUR;
     return {
@@ -997,7 +976,6 @@ export class MevSearcher {
       fundingMode: MEV.funding,
       deployedAt: f.v2DeployedAt ?? null,
       deployGasUsd: f.v2DeployGasUsd ?? 0,
-      deployEstimateUsd: this.deployGas && gp && ethUsd ? this.deployGas * gp * 1e-9 * ethUsd : null,
       tokens: this.tokens.length,
       pools: this.tokens.reduce((s, t) => s + t.pools.length, 0),
       venues,

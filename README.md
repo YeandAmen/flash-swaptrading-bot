@@ -132,7 +132,7 @@ Ethereum block `26451239` contains the canonical PancakeSwap v3 and Uniswap v4 p
 Paper scanning is available after startup. If the live controls are disabled, check `ALLOW_LIVE_TRADING` in `.env`. The default `off` blocks every broadcast, including contract deployment. Both live modes start disarmed on every restart.
 
 1. To allow a real mainnet deployment, set `ALLOW_LIVE_TRADING=on` in `.env` and restart the bot. Use `npm run service:restart` for the installed macOS service, or stop and restart `npm start` for a foreground run.
-2. Open [the local dashboard](http://127.0.0.1:7777), wait for the bot to be ready, and select **Deploy FlashArbV2**. Review the gas estimate. The bot wallet must have enough ETH to pay the real mainnet fee.
+2. Open [the local dashboard](http://127.0.0.1:7777), wait for the bot to be ready, and select **Deploy FlashArbV2**. The dialog shows the estimated fee and the maximum gas charge the transaction authorizes. If the wallet balance is too low, the dialog shows the minimum ETH needed at the quoted gas price. The bot rechecks pricing before signing.
 3. Type `DEPLOY` and authorize the action with the password from `npm run --silent dashboard:password`. The bot waits for the receipt and verifies the deployed bytecode and wallet ownership.
 4. **Arm MEV** separately when you want live arbitrage. Spot trading has its own arming control. To return to paper-only operation, set `ALLOW_LIVE_TRADING=off` and restart.
 

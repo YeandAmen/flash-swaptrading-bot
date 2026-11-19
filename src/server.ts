@@ -7,6 +7,7 @@ import { CONFIG, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from '
 import { createDashboardCredentialCheck } from './dashboard-auth.js';
 import { endpointOrigin, redactDiagnostic } from './diagnostics.js';
 import { Engine } from './engine.js';
+import { DeploymentGasError } from './executor.js';
 import type { PortfolioState } from './types.js';
 
 const engine = new Engine();
@@ -232,7 +233,7 @@ function control(operation: (req: Request) => void | Promise<void | { address: s
     } catch (error) {
       const message = redactDiagnostic(String((error as Error)?.message ?? error).split('\n')[0]);
       engine.log(`${req.path}: ${message}`, 'warn');
-      res.status(409).json({ error: 'The request could not complete. See the activity log.' });
+      res.status(409).json({ error: error instanceof DeploymentGasError ? message : 'The request could not complete. See the activity log.' });
     }
   };
 }
@@ -242,6 +243,12 @@ app.post('/api/arm', (req, res) => {
   if (allowArming(req, res)) void control(() => engine.arm())(req, res);
 });
 app.post('/api/disarm', control(() => engine.disarm()));
+app.get('/api/mev/deploy/quote', async (_req, res) => {
+  try {
+    if (engine.mev) { res.json(await engine.mev.deploymentQuote()); return; }
+  } catch { /* quotes are optional and may be unavailable while the RPC is warming up */ }
+  res.status(503).json({ error: 'The deployment gas quote is currently unavailable.' });
+});
 app.post('/api/mev/deploy', (req, res) => {
   if (req.body?.confirm !== 'DEPLOY') { res.status(400).json({ error: 'Type DEPLOY to confirm' }); return; }
   if (!allowArming(req, res)) return;

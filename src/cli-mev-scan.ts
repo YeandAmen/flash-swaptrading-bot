@@ -17,7 +17,6 @@ const mev = new MevSearcher({
   account,
   exec: new LiveExecutor(account),
   ethUsd: () => snap?.ethUsd ?? null,
-  gasPriceGwei: () => (snap ? snap.baseFeeGwei + snap.tipGwei : null),
   baseFeeGwei: () => null, // read from the block header each block
   tokens: () => (market ? market.tokens.map((t) => t.token) : CORE_TOKENS),
   tradePending: () => false,

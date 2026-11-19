@@ -2,14 +2,14 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createTestClient, http, parseEther } from 'viem';
+import { createTestClient, http, parseEther, parseGwei } from 'viem';
 import { mainnet } from 'viem/chains';
 import { publicClient } from './chain.js';
 import { CONFIG, DATA_DIR, MEV } from './config.js';
 import { Engine } from './engine.js';
-import { LiveExecutor, LiveSendBlocked } from './executor.js';
+import { DeploymentGasError, LiveExecutor, LiveSendBlocked } from './executor.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
-import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_RUNTIME } from './mev/artifact-v2.js';
+import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './mev/artifact-v2.js';
 import { MevSearcher } from './mev/searcher.js';
 import { loadOrCreateWallet } from './wallet.js';
 
@@ -35,7 +35,7 @@ assert.equal(restartedEngine.state.armed, false, 'a previous live arm must expir
 console.log('✓ Spot restarts disarmed');
 
 const mevHost = {
-  log, account, exec, ethUsd: () => null, gasPriceGwei: () => null, baseFeeGwei: () => null,
+  log, account, exec, ethUsd: () => null, baseFeeGwei: () => null,
   tokens: () => [], tradePending: () => false,
 };
 const mev = new MevSearcher(mevHost);
@@ -154,8 +154,37 @@ try {
   assert.equal(await nonce(), beforeDeploy, 'invalid configured address cannot trigger deployment');
   MEV.v2ContractAddress = null;
 
+  const baseFee = parseGwei('0.05');
+  await test.setNextBlockBaseFeePerGas({ baseFeePerGas: baseFee });
+  await test.mine({ blocks: 1 });
+  const head = await publicClient.getBlock({ blockTag: 'latest' });
+  assert.equal(head.baseFeePerGas, baseFee);
+  assert.equal(head.gasUsed, 0n, 'an empty head makes the latest base fee the higher one');
+  const estimatedGas = await publicClient.estimateGas({ account: account.address, data: FLASH_ARB_V2_BYTECODE });
+  const gasLimit = (estimatedGas * 105n + 99n) / 100n;
+  const required = gasLimit * (baseFee + parseGwei('0.03'));
+  const mevBeforeRejection = fs.readFileSync(mevStateFile, 'utf8');
+  await test.setBalance({ address: account.address, value: required - 1n });
+  await assert.rejects(paperV2.deployFromDashboard(), DeploymentGasError);
+  assert.equal(await nonce(), beforeDeploy, 'an unaffordable deploy does not consume a nonce');
+  assert.equal(await balance(), required - 1n, 'an unaffordable deploy does not spend gas');
+  assert.equal(fs.existsSync(walletJournal), false, 'the affordability error occurs before journaling');
+  assert.equal(fs.readFileSync(mevStateFile, 'utf8'), mevBeforeRejection, 'the MEV journal remains unchanged');
+  assert.equal(paperV2.view().deploymentPending, null);
+  assert.equal(paperV2.view().mode, 'paper');
+
+  const limitedBalance = required + required / 100n;
+  const oldRequirement = (estimatedGas * 13n / 10n) * (baseFee * 2n + parseGwei('1.5'));
+  assert.ok(limitedBalance < oldRequirement / 10n, 'the existing fixed-tip preflight would deny this balance');
+  await test.setBalance({ address: account.address, value: limitedBalance });
+  const quote = await exec.quoteDeployment(FLASH_ARB_V2_BYTECODE);
+  assert.equal(quote.balance, limitedBalance);
+  assert.equal(quote.minimumWei, required);
+  assert.equal(quote.gas, gasLimit);
+  assert.ok(quote.gas * quote.maxFeePerGas <= limitedBalance, 'the quoted fee cap fits available funds');
+  assert.equal(await nonce(), beforeDeploy, 'quoting does not consume a nonce');
   const [deployment, duplicate] = await Promise.allSettled([paperV2.deployFromDashboard(), paperV2.deployFromDashboard()]);
-  assert.equal(deployment.status, 'fulfilled', 'the first dashboard deployment succeeds');
+  assert.equal(deployment.status, 'fulfilled', 'a balance just above the minimum can deploy');
   assert.equal(duplicate.status, 'rejected', 'a duplicate deployment request is blocked while the first is pending');
   const v2 = deployment.value;
   assert.equal(paperV2.view().contract, v2);
@@ -191,6 +220,10 @@ try {
   const creation = transactions.find((tx) => tx.from.toLowerCase() === account.address.toLowerCase()
     && tx.nonce === beforeDeploy && tx.to === null);
   assert.ok(creation, 'find the mined dashboard deployment');
+  assert.equal(creation.type, 'eip1559');
+  assert.equal(creation.gas, gasLimit);
+  assert.ok(creation.gas * creation.maxFeePerGas <= limitedBalance, 'the signed fee cap fits available funds');
+  console.log('✓ Deployment rejects a shortfall before journaling and accepts a funded fee cap below the old threshold');
 
   // Replay the saved intent that would remain if the process stopped before recording the V2 address.
   fs.writeFileSync(mevStateFile, JSON.stringify({

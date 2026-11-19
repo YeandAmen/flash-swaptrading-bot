@@ -1,13 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  encodeFunctionData, keccak256, maxUint256, parseAbi, parseEventLogs, parseGwei,
+  encodeFunctionData, formatEther, keccak256, maxUint256, parseAbi, parseEventLogs, parseGwei,
   type Address, type Hex, type TransactionReceipt,
 } from 'viem';
 import { sendRawTransaction } from 'viem/actions';
 import type { PrivateKeyAccount } from 'viem/accounts';
 import { ADDR, CONFIG, DATA_DIR, RISK } from './config.js';
-import { erc20Abi, publicClient, sendClient, suggestTipWei, swapRouter02Abi } from './chain.js';
+import { erc20Abi, MIN_PRIORITY_FEE_WEI, nextBaseFee, publicClient, sendClient, suggestTipWei, swapRouter02Abi } from './chain.js';
 import { quoteExactIn } from './market.js';
 import { syncDirectory, writeJson } from './persistence.js';
 
@@ -48,6 +48,12 @@ export class UncertainTxError extends Error {
 
 export class LiveSendBlocked extends Error {
   constructor() { super('Live transaction canceled before broadcast'); }
+}
+
+export class DeploymentGasError extends Error {
+  constructor(balance: bigint, minimum: bigint) {
+    super(`Bot wallet has ${formatEther(balance)} ETH. Deployment needs at least ${formatEther(minimum)} ETH at current gas prices.`);
+  }
 }
 
 function checkSendAllowed(canSend?: () => boolean) {
@@ -244,6 +250,44 @@ export class LiveExecutor implements Executor {
     return latest;
   }
 
+  private async estimateFees(data: Hex, to?: Address) {
+    const [block, tip, estimatedGas] = await Promise.all([
+      publicClient.getBlock({ blockTag: 'latest' }),
+      suggestTipWei(),
+      publicClient.estimateGas({ account: this.address, to, data }),
+    ]);
+    return { block, tip, estimatedGas, base: block.baseFeePerGas ?? parseGwei('1') };
+  }
+
+  async quoteDeployment(bytecode: Hex) {
+    const [{ block, tip, estimatedGas, base }, balance] = await Promise.all([
+      this.estimateFees(bytecode),
+      publicClient.getBalance({ address: this.address, blockTag: 'latest' }),
+    ]);
+    const next = block.baseFeePerGas === null ? base : nextBaseFee(block);
+    const gas = (estimatedGas * 105n + 99n) / 100n;
+    const minimumFee = (next > base ? next : base) + MIN_PRIORITY_FEE_WEI;
+    const minimumWei = gas * minimumFee;
+    const standardCeiling = base * 2n + tip;
+    const ceiling = standardCeiling > minimumFee ? standardCeiling : minimumFee;
+    const affordableFee = balance / gas;
+    const maxFeePerGas = affordableFee < ceiling ? affordableFee : ceiling;
+    const maxPriorityFeePerGas = tip < maxFeePerGas ? tip : maxFeePerGas;
+    const effectiveFee = maxFeePerGas < next + maxPriorityFeePerGas ? maxFeePerGas : next + maxPriorityFeePerGas;
+    const estimatedWei = balance >= minimumWei ? estimatedGas * effectiveFee : null;
+    return { balance, minimumWei, estimatedWei, gas, maxFeePerGas, maxPriorityFeePerGas };
+  }
+
+  private async transactionFees(to: Address | null, data: Hex) {
+    if (to === null) {
+      const quote = await this.quoteDeployment(data);
+      if (quote.balance < quote.minimumWei) throw new DeploymentGasError(quote.balance, quote.minimumWei);
+      return quote;
+    }
+    const { base, tip, estimatedGas } = await this.estimateFees(data, to);
+    return { gas: (estimatedGas * 130n) / 100n, maxFeePerGas: base * 2n + tip, maxPriorityFeePerGas: tip };
+  }
+
   /** Deploys a contract from the bot wallet (privately, like every transaction). */
   async deployContract(bytecode: Hex, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean): Promise<{ address: Address; hash: Hex; gasWei: bigint }> {
     return this.exclusive(async () => {
@@ -337,18 +381,12 @@ export class LiveExecutor implements Executor {
   private async sendTx(to: Address | null, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean) {
     checkSendAllowed(canSend);
     const from = this.account.address;
-    const [chainNonce, block, maxPriorityFeePerGas] = await Promise.all([
+    const [chainNonce, { gas, maxFeePerGas, maxPriorityFeePerGas }] = await Promise.all([
       this.chainNonce(),
-      publicClient.getBlock({ blockTag: 'latest' }),
-      suggestTipWei(),
+      this.transactionFees(to, data),
     ]);
     // a lagging RPC node may not know our previous tx yet: never reuse a nonce we already got mined
     const nonce = Math.max(chainNonce, this.nextNonce);
-    const baseFee = block.baseFeePerGas ?? parseGwei('1');
-    const maxFeePerGas = baseFee * 2n + maxPriorityFeePerGas;
-    // estimateGas executes the tx against current state: it throws (and we abort) if it would revert.
-    const gasEst = await publicClient.estimateGas({ account: from, to: to ?? undefined, data });
-    const gas = (gasEst * 130n) / 100n;
     checkSendAllowed(canSend);
     const serializedTransaction = await this.account.signTransaction({
       chainId: publicClient.chain.id, type: 'eip1559', to, data, nonce, gas, maxFeePerGas, maxPriorityFeePerGas, value: 0n,

@@ -14,6 +14,7 @@ let tab = 'live';
 let qrLoaded = false;
 let panicPending = false;
 let mevDeploySubmitting = false;
+let mevDeployQuoteRequest = 0;
 
 async function api(path, body) {
   const send = (authorization) => fetch(path, {
@@ -330,17 +331,35 @@ const mevDeployDlg = $('mevDeployDlg');
 function updateMevDeployConfirm() {
   $('mevDeployConfirm').disabled = $('mevDeployBtn').disabled || $('mevDeployInput').value.trim() !== 'DEPLOY';
 }
-$('mevDeployBtn').onclick = () => {
+$('mevDeployBtn').onclick = async () => {
   if ($('mevDeployBtn').disabled) return;
-  const estimate = S.mev.deployEstimateUsd;
   const fee = S.forkMode
     ? 'Deployment spends test ETH from the bot wallet on this local fork.'
     : 'Deployment sends a mainnet transaction and spends real ETH from the bot wallet.';
-  $('mevDeployGas').textContent = fee + (estimate != null ? ` Current gas estimate is about ${usd(estimate)}.` : ' A gas estimate is currently unavailable.');
+  $('mevDeployGas').textContent = fee + ' Checking current gas prices…';
   $('mevDeployInput').value = '';
   $('mevDeployError').hidden = true;
   updateMevDeployConfirm();
   mevDeployDlg.showModal();
+  const request = ++mevDeployQuoteRequest;
+  try {
+    const response = await fetch('/api/mev/deploy/quote', { cache: 'no-store' });
+    if (!response.ok) throw new Error();
+    const quote = await response.json();
+    if (request !== mevDeployQuoteRequest || !mevDeployDlg.open) return;
+    const eth = (value) => {
+      const price = S.chain?.ethUsd;
+      return `${value.toFixed(8)} ETH${price ? ` (about ${usd(value * price)})` : ''}`;
+    };
+    const cost = quote.maximumEth === null
+      ? `Wallet balance is ${eth(quote.balanceEth)}. At current gas prices the wallet needs at least ${eth(quote.minimumEth)}.`
+      : `Estimated fee is ${eth(quote.estimatedEth)}. The transaction gas cap is ${eth(quote.maximumEth)}.`;
+    $('mevDeployGas').textContent = `${fee} ${cost} Gas is rechecked when you confirm.`;
+  } catch {
+    if (request === mevDeployQuoteRequest && mevDeployDlg.open) {
+      $('mevDeployGas').textContent = fee + ' Gas quote unavailable. Gas is rechecked when you confirm.';
+    }
+  }
 };
 $('mevDeployInput').oninput = updateMevDeployConfirm;
 $('mevDeployCancel').onclick = () => mevDeployDlg.close();
