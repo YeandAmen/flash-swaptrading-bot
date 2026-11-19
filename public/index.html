@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETH Token Bot</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 6 16.5 16 22l10-5.5z' fill='%237aa2ff'/%3E%3Cpath d='M16 24 6 18.5 16 30l10-11.5z' fill='%234a6fd8'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#0b0f17;--panel:#121826;--panel2:#171f30;--line:#232c40;--text:#e6ebf5;--muted:#8b96ad;
+  --accent:#7aa2ff;--green:#3ecf8e;--red:#ff6b6b;--amber:#f5b94d;--violet:#b48cff;
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif}
+header{position:sticky;top:0;z-index:5;background:rgba(11,15,23,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.bar{max-width:1320px;margin:0 auto;padding:12px 20px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.brand{font-weight:700;font-size:16px;display:flex;gap:8px;align-items:center}
+.brand svg{width:20px;height:20px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
+.chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:12px;color:var(--muted)}
+.chip b{color:var(--text);font-weight:600}
+.pill{border-radius:999px;padding:4px 12px;font-size:12px;font-weight:700;letter-spacing:.02em}
+.pill.paper{background:#1d2a47;color:var(--accent)}
+.pill.live{background:#123a2a;color:var(--green)}
+.pill.wait{background:#3a2e12;color:var(--amber)}
+.pill.err{background:#3d1a1d;color:var(--red)}
+main{max-width:1320px;margin:0 auto;padding:18px 20px 60px;display:grid;gap:16px}
+.banner{border-radius:12px;padding:12px 16px;border:1px solid var(--line);background:var(--panel);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.banner.ok{border-color:#1f5a40;background:#0f2219}
+.banner.warn{border-color:#5a4718;background:#211b0d}
+.banner.bad{border-color:#5c2228;background:#220f12}
+.grid3{display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:16px}
+.grid2{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}
+@media (max-width:1000px){.grid3,.grid2{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0}
+.card h2{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.big{font-size:28px;font-weight:700;letter-spacing:-.01em}
+.sub{color:var(--muted);font-size:12px}
+.pos{color:var(--green)}.neg{color:var(--red)}.amb{color:var(--amber)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin-top:10px;font-size:13px}
+.kv span:nth-child(odd){color:var(--muted)}
+.kv span:nth-child(even){text-align:right;font-variant-numeric:tabular-nums}
+.addr{font-family:var(--mono);font-size:12.5px;word-break:break-all;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.wallet{display:grid;grid-template-columns:120px 1fr;gap:14px;align-items:start}
+.wallet img{width:120px;height:120px;border-radius:10px;background:#fff}
+@media (max-width:520px){.wallet{grid-template-columns:1fr}}
+button{font:inherit;font-weight:600;font-size:13px;border-radius:9px;border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:8px 12px;cursor:pointer}
+button:hover{border-color:#3a4766}
+button.primary{background:#1f7a52;border-color:#2a9a69}
+button.primary:hover{background:#238a5c}
+button.danger{background:#5c1f25;border-color:#83303a}
+button.ghost{background:transparent}
+button:disabled{opacity:.45;cursor:not-allowed}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th{text-align:left;color:var(--muted);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:8px;border-bottom:1px solid #1a2233;vertical-align:top}
+td.r,th.r{text-align:right}
+.tag{display:inline-block;border-radius:6px;padding:1px 7px;font-size:11.5px;font-weight:700}
+.tag.up{background:#123a2a;color:var(--green)}.tag.down{background:#3d1a1d;color:var(--red)}.tag.flat{background:#252d40;color:var(--muted)}
+.tag.buy{background:#123a2a;color:var(--green)}.tag.sell{background:#3a2e12;color:var(--amber)}
+.why{color:var(--muted);font-size:12px;max-width:420px}
+.scroll{overflow-x:auto}
+.log{max-height:360px;overflow:auto;font-family:var(--mono);font-size:12px}
+.log div{padding:4px 0;border-bottom:1px solid #182033;display:grid;grid-template-columns:72px 1fr;gap:10px}
+.log .t{color:var(--muted)}
+.log .trade{color:var(--green)}.log .warn{color:var(--amber)}.log .error{color:var(--red)}
+.tabs{display:flex;gap:6px}
+.tabs button{padding:4px 10px;font-size:12px}
+.tabs button.on{background:#1d2a47;border-color:#2c4170;color:var(--accent)}
+svg.spark{width:100%;height:110px;display:block}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}
+.stat{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.stat .l{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+.stat .v{font-weight:700;font-size:16px;margin-top:2px}
+.note{color:var(--muted);font-size:12px;margin-top:8px}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:14px;max-width:560px;width:calc(100% - 32px);padding:20px}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+dialog h3{margin:0 0 10px}
+dialog ul{padding-left:18px;color:var(--muted)}
+dialog li{margin:6px 0}
+dialog input{font:inherit;width:100%;padding:9px 10px;border-radius:9px;border:1px solid var(--line);background:var(--panel2);color:var(--text);margin-top:6px}
+.empty{color:var(--muted);font-size:13px;padding:10px 0}
+.posbox{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-top:10px}
+footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="brand"><svg viewBox="0 0 32 32"><path d="M16 2 6 16.5 16 22l10-5.5z" fill="#7aa2ff"/><path d="M16 24 6 18.5 16 30l10-11.5z" fill="#4a6fd8"/></svg>ETH Token Bot</div>
+    <span id="modePill" class="pill paper">PAPER</span>
+    <div class="chips">
+      <span class="chip">Block <b id="cBlock">–</b></span>
+      <span class="chip">Gas <b id="cGas">–</b></span>
+      <span class="chip">ETH <b id="cEth">–</b></span>
+      <span class="chip">Updated <b id="cAgo">–</b></span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div id="banner" class="banner"><span id="bannerText">Connecting to bot…</span></div>
+
+  <section class="grid3">
+    <div class="card">
+      <h2>Bot wallet <span class="sub" id="wStorage"></span></h2>
+      <div class="wallet">
+        <img id="qr" alt="Wallet address QR code">
+        <div>
+          <div class="addr" id="wAddr">–</div>
+          <div class="row" style="margin-top:8px"><button id="copyBtn" class="ghost">Copy address</button><a id="ethLink" class="sub" target="_blank" rel="noopener noreferrer" style="align-self:center">Etherscan ↗</a></div>
+          <div class="kv">
+            <span>USDC</span><span id="wUsdc">–</span>
+            <span>ETH (gas)</span><span id="wEth">–</span>
+            <span>Tokens</span><span id="wTokens">–</span>
+            <span>Auto gas</span><span id="wGas">–</span>
+          </div>
+        </div>
+      </div>
+      <div class="note">Send <b>USDC</b> + a tiny bit of <b>ETH once (~0.001)</b>, on <b>Ethereum mainnet (ERC-20)</b> only. After that the bot buys its own gas with USDC.</div>
+      <div class="row">
+        <button id="armBtn" class="primary">Arm live trading</button>
+        <button id="disarmBtn" class="danger" hidden>Disarm</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Live portfolio <span id="liveTag"></span></h2>
+      <div class="big" id="lEq">–</div>
+      <div class="sub" id="lPnl">–</div>
+      <div id="lPos"></div>
+      <div class="kv">
+        <span>Deposited</span><span id="lDep">–</span>
+        <span>Realized P&amp;L</span><span id="lReal">–</span>
+        <span>Gas spent</span><span id="lGas">–</span>
+      </div>
+      <div class="note" id="lDecision">–</div>
+    </div>
+
+    <div class="card">
+      <h2>Paper portfolio <span class="sub">virtual $, real prices</span></h2>
+      <div class="big" id="pEq">–</div>
+      <div class="sub" id="pPnl">–</div>
+      <div id="pPos"></div>
+      <div class="kv">
+        <span>Realized P&amp;L</span><span id="pReal">–</span>
+        <span>Simulated gas</span><span id="pGas">–</span>
+        <span>Trades</span><span id="pTrades">–</span>
+      </div>
+      <div class="note" id="pDecision">–</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Strategy brain <span class="sub" id="regime"></span></h2>
+    <div class="sub" id="uniStats" style="margin:-4px 0 10px"></div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Token</th><th class="r">Price</th><th class="r">24h</th><th>Trend</th><th class="r">Momentum</th><th class="r">RSI</th><th class="r">Daily vol</th><th class="r">Stop / Target</th><th>Decision</th></tr></thead>
+        <tbody id="anaBody"></tbody>
+      </table>
+    </div>
+    <div class="note" id="costNote"></div>
+    <details class="note" id="rejectedBox"><summary>Tokens rejected by safety checks</summary><div id="rejected" class="why" style="max-width:none;margin-top:6px"></div></details>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h2>Trades <span class="tabs"><button data-tab="live" class="on">Live</button><button data-tab="paper">Paper</button></span></h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Time</th><th>Side</th><th>Token</th><th class="r">USD</th><th class="r">Price</th><th class="r">Gas</th><th class="r">P&amp;L</th><th>Reason</th></tr></thead>
+        <tbody id="tradeBody"></tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h2>Backtest <span class="sub" id="btRange"></span></h2>
+      <svg class="spark" id="btSpark" viewBox="0 0 400 110" preserveAspectRatio="none"></svg>
+      <div class="stats">
+        <div class="stat"><div class="l">Bot</div><div class="v" id="btRet">–</div></div>
+        <div class="stat"><div class="l">ETH hold</div><div class="v" id="btEth">–</div></div>
+        <div class="stat"><div class="l">Max DD</div><div class="v" id="btDD">–</div></div>
+        <div class="stat"><div class="l">Trades</div><div class="v" id="btTrades">–</div></div>
+        <div class="stat"><div class="l">Win rate</div><div class="v" id="btWin">–</div></div>
+        <div class="stat"><div class="l">Gas</div><div class="v" id="btGas">–</div></div>
+      </div>
+      <div class="note" id="btNote"></div>
+    </div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h2>Activity log</h2>
+      <div class="log" id="log"></div>
+    </div>
+    <div class="card">
+      <h2>Controls</h2>
+      <div class="row" style="margin-top:0">
+        <button id="pauseBtn">Pause new entries</button>
+        <button id="resumeLiveBtn">Reset live circuit breaker</button>
+        <button id="resumePaperBtn">Reset paper circuit breaker</button>
+      </div>
+      <div class="row">
+        <button id="panicLiveBtn" class="danger">Panic: sell live position → USDC</button>
+        <button id="panicPaperBtn">Sell paper position</button>
+      </div>
+      <div class="row">
+        <button id="resetPaperBtn" class="ghost">Reset paper to start</button>
+        <button id="btBtn" class="ghost">Re-run backtest</button>
+      </div>
+      <div class="kv" id="params"></div>
+      <div class="note">Transactions go privately through <span id="sendRpc">Flashbots Protect</span>, so other bots can’t sandwich them. Every token is re-checked for honeypots / hidden taxes right before each buy.</div>
+    </div>
+  </section>
+</main>
+
+<footer>Runs only on this Mac at http://localhost. No strategy can guarantee profit. Only trade money you can afford to lose.</footer>
+
+<dialog id="armDlg">
+  <h3>Arm live trading?</h3>
+  <ul>
+    <li>The bot will trade the <b>real USDC</b> in its wallet automatically, 24/7, with no further confirmation.</li>
+    <li>It needs <b>USDC + a tiny bit of ETH once</b> (Ethereum mainnet). After that it <b>buys its own gas with USDC</b> (small amounts, capped per day).</li>
+    <li>It may buy <b>any token that passes the safety checks</b> (deep Uniswap pool, 14+ days of history, simulated buy→sell). Smaller tokens are riskier: at most 50% of equity in one of them.</li>
+    <li>Losses are possible. Risk limits: ~2.5% of equity per trade, daily loss stop 6%, max drawdown halt 25%.</li>
+    <li>Back up the private key first. It is stored in your macOS Keychain (see README).</li>
+  </ul>
+  <label class="sub">Type <b>LIVE</b> to confirm</label>
+  <input id="armInput" autocomplete="off" spellcheck="false">
+  <div class="row" style="justify-content:flex-end">
+    <button id="armCancel" class="ghost">Cancel</button>
+    <button id="armConfirm" class="primary" disabled>Arm live trading</button>
+  </div>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

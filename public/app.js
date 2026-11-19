@@ -1,0 +1,231 @@
+'use strict';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const usd = (x, d = 2) => (x == null || !isFinite(x) ? '–' : (x < 0 ? '-$' : '$') + Math.abs(x).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }));
+const pct = (x, d = 2) => (x == null || !isFinite(x) ? '–' : (x > 0 ? '+' : '') + (x * 100).toFixed(d) + '%');
+const cls = (x) => (x > 0 ? 'pos' : x < 0 ? 'neg' : '');
+const price = (p) => (p == null ? '–' : p >= 1000 ? usd(p, 0) : p >= 1 ? usd(p, 2) : '$' + p.toPrecision(4));
+const time = (t) => new Date(t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const ago = (t) => { const s = Math.round((Date.now() - t) / 1000); return s < 60 ? s + 's ago' : Math.round(s / 60) + 'm ago'; };
+
+let S = null;
+let tab = 'live';
+let qrLoaded = false;
+
+async function api(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-bot-ui': '1' }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/state', { cache: 'no-store' });
+    S = await r.json();
+    render();
+  } catch (e) {
+    $('banner').className = 'banner bad';
+    $('bannerText').textContent = 'Cannot reach the bot server on this Mac. Is it running? (npm run service:status)';
+  }
+}
+
+function posBox(p) {
+  if (!p) return '<div class="posbox sub">No open position — holding USDC</div>';
+  return `<div class="posbox"><b>${esc(p.symbol)}</b> ${p.qty.toPrecision(5)} · value ${usd(p.valueUsd)} · <span class="${cls(p.pnlPct)}">${pct(p.pnlPct)}</span> vs breakeven
+    <div class="sub">entry ${price(p.entryMid)} · stop ${price(p.stopPrice)}${p.trailActive ? ' (trailing)' : ''} · target ${price(p.targetPrice)} · since ${time(p.entryTime)}</div></div>`;
+}
+
+function render() {
+  if (!S) return;
+  const c = S.chain;
+  $('cBlock').textContent = c ? c.block.toLocaleString() : '–';
+  const g = (x) => (x < 0.01 ? x.toPrecision(2) : x.toFixed(2));
+  $('cGas').textContent = c ? g(c.baseFeeGwei) + ' + ' + g(c.tipGwei) + ' gwei' : '–';
+  $('cEth').textContent = c ? usd(c.ethUsd, 0) : '–';
+  $('cAgo').textContent = S.lastTickAt ? ago(S.lastTickAt) : '–';
+
+  // mode + banner
+  const pill = $('modePill');
+  const banner = $('banner');
+  if (S.status === 'starting') {
+    pill.className = 'pill wait'; pill.textContent = 'STARTING';
+    banner.className = 'banner warn'; $('bannerText').textContent = 'Starting: ' + S.startupStep + '…';
+  } else if (S.status === 'error' || S.lastError) {
+    pill.className = 'pill err'; pill.textContent = S.status === 'error' ? 'ERROR' : (S.armed ? 'LIVE' : 'PAPER');
+    banner.className = 'banner bad'; $('bannerText').textContent = 'Problem: ' + (S.lastError || 'unknown') + ' — the bot retries automatically.';
+  } else if (S.armed && S.liveStatus.ready) {
+    pill.className = 'pill live'; pill.textContent = 'LIVE';
+    banner.className = 'banner ok'; $('bannerText').textContent = 'Live trading active. ' + (S.live.lastDecision || '');
+  } else if (S.armed) {
+    pill.className = 'pill wait'; pill.textContent = 'ARMED';
+    banner.className = 'banner warn'; $('bannerText').textContent = S.liveStatus.reason;
+  } else {
+    pill.className = 'pill paper'; pill.textContent = 'PAPER';
+    banner.className = 'banner'; $('bannerText').textContent = 'Paper trading with real on-chain prices. Live trading is off until you arm it.';
+  }
+
+  // wallet
+  const w = S.wallet;
+  if (w) {
+    $('wAddr').textContent = w.address;
+    $('wStorage').textContent = 'key: ' + w.storage;
+    $('ethLink').href = 'https://etherscan.io/address/' + w.address;
+    $('wUsdc').textContent = w.usdc == null ? '–' : w.usdc.toFixed(2);
+    $('wEth').textContent = w.eth == null ? '–' : w.eth.toFixed(5) + (c ? ' (' + usd(w.eth * c.ethUsd) + ')' : '');
+    const held = Object.entries(w.tokens || {}).filter(([, v]) => v > 0);
+    $('wTokens').textContent = held.length ? held.map(([k, v]) => v.toPrecision(4) + ' ' + k).join(', ') : 'none';
+    if (!qrLoaded) { $('qr').src = '/api/qr.svg'; qrLoaded = true; }
+  }
+  const G = S.gas;
+  if (G) {
+    const a = G.autoTopup;
+    const last = G.topups && G.topups[0];
+    $('wGas').textContent = a.enabled
+      ? `ON · buys ${usd(a.usd)} of ETH when < ${a.belowEth} ETH · today ${G.topupsToday}/${a.maxPerDay}` + (last ? ` · last ${last.eth.toFixed(5)} ETH ${time(last.t)}` : '')
+      : 'OFF';
+  }
+  $('armBtn').hidden = S.armed;
+  $('disarmBtn').hidden = !S.armed;
+
+  // live
+  const L = S.live;
+  $('lEq').textContent = usd(L.equity);
+  $('lPnl').innerHTML = L.netDepositsUsd > 0 ? `Net P&amp;L <span class="${cls(L.netPnlUsd)}">${usd(L.netPnlUsd)} (${pct(L.netPnlPct)})</span> after gas` : 'No deposits yet';
+  $('lPos').innerHTML = posBox(L.position);
+  $('lDep').textContent = usd(L.netDepositsUsd);
+  $('lReal').innerHTML = `<span class="${cls(L.realizedPnlUsd)}">${usd(L.realizedPnlUsd)}</span>`;
+  $('lGas').textContent = usd(L.gasSpentUsd);
+  $('lDecision').textContent = (L.halted ? 'HALTED: ' + L.halted + ' · ' : '') + (S.armed ? L.lastDecision : S.liveStatus.reason);
+  $('liveTag').innerHTML = S.armed ? '<span class="tag up">ARMED</span>' : '<span class="tag flat">OFF</span>';
+
+  // paper
+  const P = S.paper;
+  $('pEq').textContent = usd(P.equity);
+  $('pPnl').innerHTML = `Net P&amp;L <span class="${cls(P.netPnlUsd)}">${usd(P.netPnlUsd)} (${pct(P.netPnlPct)})</span> from ${usd(P.netDepositsUsd)}`;
+  $('pPos').innerHTML = posBox(P.position);
+  $('pReal').innerHTML = `<span class="${cls(P.realizedPnlUsd)}">${usd(P.realizedPnlUsd)}</span>`;
+  $('pGas').textContent = usd(P.gasSpentUsd);
+  $('pTrades').textContent = P.trades.length;
+  $('pDecision').textContent = (P.halted ? 'HALTED: ' + P.halted + ' · ' : '') + P.lastDecision;
+
+  // brain
+  $('regime').innerHTML = `Market: <span class="${S.regime.riskOn ? 'pos' : 'amb'}">${S.regime.riskOn ? 'RISK-ON' : 'RISK-OFF'}</span> — ${esc(S.regime.reason)}`;
+  const heldSet = new Set([P.position && P.position.symbol, L.position && L.position.symbol].filter(Boolean));
+  const U = S.universe;
+  if (U) {
+    const st = U.stats || {};
+    $('uniStats').textContent = `Scanning ${U.scanned} tokens (${U.core} core + ${U.scanned - U.core} from token lists) · ` +
+      `${U.eligible} with a buy signal · ${U.warming} still collecting history · ` +
+      `${st.safetyRejected ?? 0} rejected by the honeypot/tax check · from ${st.candidates ?? '?'} listed tokens (${st.withPool ?? '?'} with a Uniswap v3 WETH pool)` +
+      (U.refreshing ? ' · refreshing universe…' : ` · refreshed ${time(U.discoveredAt)}`);
+    $('rejected').innerHTML = (U.excluded || []).length
+      ? U.excluded.map((e) => `<div><b>${esc(e.symbol)}</b> — ${esc(e.reason)}</div>`).join('')
+      : 'None right now.';
+  }
+  const symCell = (a) => {
+    const [s, tag] = String(a.symbol).split('.');
+    const label = `<b>${esc(s)}</b>${tag ? `<span class="sub">.${esc(tag)}</span>` : ''}${a.core ? '' : ' <span class="tag flat" title="long-tail token: max 50% of equity">LT</span>'}`;
+    return a.address ? `<a href="https://etherscan.io/token/${esc(a.address)}" target="_blank" rel="noopener noreferrer" title="${esc(a.name || a.symbol)}" style="color:inherit;text-decoration:none">${label}</a>` : label;
+  };
+  $('anaBody').innerHTML = (S.analyses || []).map((a) => {
+    let decision;
+    if (heldSet.has(a.symbol)) decision = '<span class="tag buy">HOLDING</span>';
+    else if (a.eligible && S.regime.riskOn) decision = '<span class="tag buy">BUY SIGNAL</span>';
+    else if (a.eligible) decision = '<span class="tag sell">SIGNAL, MARKET RISK-OFF</span>';
+    else decision = '<span class="why">' + esc(a.reasons.join(' · ')) + '</span>';
+    return `<tr><td>${symCell(a)}</td><td class="r">${price(a.price)}</td><td class="r ${cls(a.change24h)}">${pct(a.change24h, 1)}</td>
+      <td><span class="tag ${a.trend}">${a.trend}</span></td><td class="r">${a.momentum.toFixed(2)}σ</td><td class="r">${a.rsi.toFixed(0)}</td>
+      <td class="r">${(a.dailyVol * 100).toFixed(1)}%</td><td class="r">-${(a.stopPct * 100).toFixed(1)}% / +${(a.targetPct * 100).toFixed(1)}%</td><td>${decision}</td></tr>`;
+  }).join('');
+  const k = S.costs;
+  $('costNote').textContent = k ? `Cost of one swap right now: ~${usd(k.gasPerSwapUsd)} gas (incl. approval). A $50 round trip costs ~${pct(k.roundTripPctAt50)} with pool fees, so the bot only buys when the target move is ≥ ${pct(k.hurdlePctAt50)}.` : '';
+
+  // trades
+  const trades = (tab === 'live' ? L : P).trades;
+  $('tradeBody').innerHTML = trades.length ? trades.map((t) => `<tr><td>${time(t.time)}</td><td><span class="tag ${t.side === 'BUY' ? 'buy' : 'sell'}">${t.side}</span></td><td>${esc(t.symbol)}</td>
+      <td class="r">${usd(t.usd)}</td><td class="r">${price(t.price)}</td><td class="r">${usd(t.gasUsd)}</td>
+      <td class="r ${cls(t.pnlUsd)}">${t.pnlUsd == null ? '' : usd(t.pnlUsd)}</td><td class="why">${esc(t.reason)}${(t.txHashes || []).map((h) => ` <a href="https://etherscan.io/tx/${esc(h)}" target="_blank" rel="noopener noreferrer">tx↗</a>`).join('')}</td></tr>`).join('')
+    : `<tr><td colspan="8" class="empty">No ${tab} trades yet. The bot waits for a strong uptrend whose expected move beats its costs.</td></tr>`;
+
+  // backtest
+  const b = S.backtest;
+  if (b) {
+    $('btRange').textContent = `${new Date(b.from).toLocaleDateString()} → ${new Date(b.to).toLocaleDateString()}`;
+    $('btRet').innerHTML = `<span class="${cls(b.returnPct)}">${pct(b.returnPct)}</span>`;
+    $('btEth').innerHTML = `<span class="${cls(b.ethHoldPct)}">${pct(b.ethHoldPct)}</span>`;
+    $('btDD').textContent = pct(-b.maxDrawdownPct);
+    $('btTrades').textContent = b.trades;
+    $('btWin').textContent = b.trades ? pct(b.winRate, 0).replace('+', '') : '–';
+    $('btGas').textContent = usd(b.gasPaidUsd);
+    $('btNote').textContent = 'Same strategy replayed on on-chain hourly prices. ' + b.assumptions + '. A short history is not proof of future results.';
+    spark($('btSpark'), b.equity, b.startUsd);
+  }
+
+  // log
+  $('log').innerHTML = (S.events || []).map((e) => `<div><span class="t">${hm(e.t)}</span><span class="${e.level}">${esc(e.msg)}</span></div>`).join('');
+
+  // controls
+  $('pauseBtn').textContent = S.entriesPaused ? 'Resume new entries' : 'Pause new entries';
+  $('panicLiveBtn').disabled = !L.position;
+  $('panicPaperBtn').disabled = !P.position;
+  $('sendRpc').textContent = S.sendRpc;
+  const r = S.params.risk;
+  $('params').innerHTML = [
+    ['Risk per trade', (r.riskPerTradePct * 100).toFixed(1) + '% of equity'], ['Max slippage', (r.maxSlippageBps / 100).toFixed(2) + '%'],
+    ['Daily loss stop', pct(-r.dailyLossLimitPct, 0)], ['Drawdown halt', pct(-r.maxDrawdownPct, 0)],
+    ['Max entry gas', r.maxEntryGasGwei + ' gwei'], ['Approvals', r.approvalMode === 'exact' ? 'exact amount only' : 'unlimited'],
+  ].map(([a, v]) => `<span>${a}</span><span>${v}</span>`).join('');
+}
+
+function spark(svg, pts, base) {
+  if (!pts || pts.length < 2) { svg.innerHTML = ''; return; }
+  const W = 400, H = 110, pad = 6;
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]).concat([base]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const X = (x) => pad + ((x - x0) / (x1 - x0 || 1)) * (W - 2 * pad);
+  const Y = (y) => H - pad - ((y - y0) / (y1 - y0 || 1)) * (H - 2 * pad);
+  const d = pts.map((p, i) => (i ? 'L' : 'M') + X(p[0]).toFixed(1) + ' ' + Y(p[1]).toFixed(1)).join(' ');
+  const end = pts[pts.length - 1][1];
+  const col = end >= base ? 'var(--green)' : 'var(--red)';
+  svg.innerHTML = `<line x1="0" x2="${W}" y1="${Y(base)}" y2="${Y(base)}" stroke="#2b3550" stroke-dasharray="4 4"/>
+    <path d="${d}" fill="none" stroke="${col}" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+}
+
+// ---- events
+$('copyBtn').onclick = async () => {
+  if (!S?.wallet) return;
+  try { await navigator.clipboard.writeText(S.wallet.address); $('copyBtn').textContent = 'Copied ✓'; setTimeout(() => ($('copyBtn').textContent = 'Copy address'), 1500); } catch { /* ignore */ }
+};
+document.querySelectorAll('.tabs button').forEach((b) => (b.onclick = () => {
+  tab = b.dataset.tab;
+  document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x === b));
+  render();
+}));
+const dlg = $('armDlg');
+$('armBtn').onclick = () => { $('armInput').value = ''; $('armConfirm').disabled = true; dlg.showModal(); };
+$('armInput').oninput = () => ($('armConfirm').disabled = $('armInput').value.trim() !== 'LIVE');
+$('armCancel').onclick = () => dlg.close();
+$('armConfirm').onclick = async () => {
+  const typed = $('armInput').value.trim();
+  if (typed !== 'LIVE') return;
+  try { await api('/api/arm', { confirm: typed }); dlg.close(); refresh(); } catch (e) { alert(e.message); }
+};
+$('disarmBtn').onclick = async () => { if (confirm('Disarm live trading? Open positions are kept.')) { await api('/api/disarm'); refresh(); } };
+$('pauseBtn').onclick = async () => { await api('/api/pause', { paused: !S.entriesPaused }); refresh(); };
+$('resumeLiveBtn').onclick = async () => { await api('/api/resume', { kind: 'live' }); refresh(); };
+$('resumePaperBtn').onclick = async () => { await api('/api/resume', { kind: 'paper' }); refresh(); };
+$('panicLiveBtn').onclick = async () => {
+  if (!confirm('Sell the LIVE position to USDC now (up to 2% slippage) and disarm live trading?')) return;
+  $('panicLiveBtn').disabled = true;
+  try { await api('/api/panic', { kind: 'live' }); } catch (e) { alert(e.message); }
+  refresh();
+};
+$('panicPaperBtn').onclick = async () => { await api('/api/panic', { kind: 'paper' }); refresh(); };
+$('resetPaperBtn').onclick = async () => { if (confirm('Reset the paper portfolio?')) { await api('/api/paper/reset'); refresh(); } };
+$('btBtn').onclick = async () => { await api('/api/backtest'); refresh(); };
+
+refresh();
+setInterval(refresh, 4000);
+setInterval(() => { if (S?.lastTickAt) $('cAgo').textContent = ago(S.lastTickAt); }, 1000);

@@ -1,0 +1,191 @@
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import express, { type NextFunction, type Request, type Response } from 'express';
+import QRCode from 'qrcode';
+import { formatUnits } from 'viem';
+import { CONFIG, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from './config.js';
+import { Engine } from './engine.js';
+import type { PortfolioState } from './types.js';
+
+const engine = new Engine();
+const app = express();
+app.disable('x-powered-by');
+
+// Only this machine, only this dashboard: block other hosts (DNS rebinding) and cross-site requests (CSRF).
+const allowed = new Set([`127.0.0.1:${CONFIG.port}`, `localhost:${CONFIG.port}`]);
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (!allowed.has(req.headers.host ?? '')) { res.status(403).send('Forbidden host'); return; }
+  if (req.method !== 'GET') {
+    const origin = (req.headers.origin ?? '').replace(/^https?:\/\//, '');
+    if (!allowed.has(origin) || req.headers['x-bot-ui'] !== '1') { res.status(403).json({ error: 'Forbidden' }); return; }
+  }
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'");
+  next();
+});
+app.use(express.json({ limit: '10kb' }));
+app.use(express.static(path.join(ROOT, 'public')));
+
+function downsample<T>(arr: T[], max: number): T[] {
+  if (arr.length <= max) return arr;
+  const step = Math.ceil(arr.length / max);
+  return arr.filter((_, i) => i % step === 0 || i === arr.length - 1);
+}
+
+function portfolioView(pf: PortfolioState) {
+  const snap = engine.snap;
+  const equity = snap ? engine.equity(pf, snap) : pf.cashUsd;
+  const netPnl = pf.kind === 'paper' ? equity - pf.netDepositsUsd : equity - pf.netDepositsUsd - pf.gasSpentUsd;
+  const pos = pf.position;
+  const price = pos && snap ? snap.prices[pos.symbol] : undefined;
+  return {
+    kind: pf.kind,
+    equity,
+    cashUsd: pf.cashUsd,
+    netDepositsUsd: pf.netDepositsUsd,
+    netPnlUsd: netPnl,
+    netPnlPct: pf.netDepositsUsd > 0 ? netPnl / pf.netDepositsUsd : 0,
+    realizedPnlUsd: pf.realizedPnlUsd,
+    gasSpentUsd: pf.gasSpentUsd,
+    halted: pf.halted,
+    pausedUntil: pf.pausedUntil,
+    lastDecision: pf.lastDecision,
+    cooldowns: Object.fromEntries(Object.entries(pf.cooldowns).filter(([, t]) => t > Date.now())),
+    position: pos
+      ? { ...pos, price, valueUsd: price ? pos.qty * price : null, pnlPct: price ? price / pos.breakevenPrice - 1 : null }
+      : null,
+    trades: pf.trades.slice(-60).reverse(),
+    equityHistory: downsample(pf.equityHistory, 300),
+  };
+}
+
+app.get('/api/state', (_req, res) => {
+  const snap = engine.snap;
+  const b = snap?.balances;
+  const w = engine.wallet;
+  res.json({
+    now: Date.now(),
+    status: engine.status,
+    startupStep: engine.startupStep,
+    lastError: engine.lastError,
+    lastTickAt: engine.lastTickAt,
+    loopSeconds: CONFIG.loopSeconds,
+    sendRpc: CONFIG.sendRpcUrl.replace(/\/\/([^/]+).*/, '//$1'),
+    wallet: w
+      ? {
+          address: w.account.address,
+          storage: w.storage,
+          eth: b ? Number(formatUnits(b.eth, 18)) : null,
+          usdc: b ? Number(formatUnits(b.usdc, USDC_DECIMALS)) : null,
+          tokens: b && engine.market
+            ? Object.fromEntries(engine.market.tokens
+              .filter((t) => (b.tokens[t.token.symbol] ?? 0n) > 0n)
+              .map((t) => [t.token.symbol, Number(formatUnits(b.tokens[t.token.symbol] ?? 0n, t.token.decimals))]))
+            : {},
+        }
+      : null,
+    chain: snap ? { block: Number(snap.blockNumber), baseFeeGwei: snap.baseFeeGwei, tipGwei: snap.tipGwei, ethUsd: snap.ethUsd, timestamp: snap.timestamp } : null,
+    armed: engine.state.armed,
+    armedAt: engine.state.armedAt,
+    entriesPaused: engine.state.entriesPaused,
+    liveStatus: engine.liveStatus,
+    regime: engine.regime,
+    costs: engine.costs,
+    analyses: topAnalyses(),
+    universe: engine.market
+      ? {
+          scanned: engine.market.tokens.length,
+          core: engine.market.tokens.filter((t) => t.token.core).length,
+          eligible: engine.analyses.filter((a) => a.eligible).length,
+          warming: engine.analyses.filter((a) => a.reasons.some((r) => r.startsWith('too new') || r.startsWith('warming'))).length,
+          stats: engine.market.stats,
+          discoveredAt: engine.market.discoveredAt,
+          refreshing: engine.refreshing,
+          mode: TOKENS.mode,
+          safetyBlocked: Object.entries(engine.safetyBlocks).filter(([, t]) => t > Date.now()).map(([s]) => s),
+          excluded: engine.market.excluded.slice(0, 40),
+        }
+      : null,
+    gas: {
+      autoTopup: GAS_TOPUP,
+      topups: engine.state.topups.filter((x) => x.usd > 0).slice(-5).reverse(),
+      topupsToday: engine.state.topups.filter((x) => x.usd > 0 && Date.now() - x.t < 86_400_000).length,
+    },
+    paper: portfolioView(engine.state.paper),
+    live: portfolioView(engine.state.live),
+    backtest: engine.backtest,
+    events: engine.events.slice(-150).reverse(),
+    params: { risk: RISK, strategy: STRATEGY, tokens: TOKENS },
+  });
+});
+
+/** Held tokens first, then buy signals, then the strongest scores — enough rows for the dashboard. */
+function topAnalyses() {
+  const held = new Set([engine.state.paper.position?.symbol, engine.state.live.position?.symbol].filter(Boolean));
+  const byKey = new Map((engine.market?.tokens ?? []).map((t) => [t.token.symbol, t]));
+  const rank = (a: (typeof engine.analyses)[number]) => (held.has(a.symbol) ? 2e9 : a.eligible ? 1e9 : 0) + (Number.isFinite(a.score) ? a.score : -1e6);
+  return [...engine.analyses]
+    .sort((x, y) => rank(y) - rank(x))
+    .slice(0, 30)
+    .map((a) => {
+      const t = byKey.get(a.symbol);
+      return { ...a, address: t?.token.address, core: t?.token.core ?? false, name: t?.token.name, wethDepth: t?.wethDepth, poolFeePct: t?.poolFeePct };
+    });
+}
+
+app.get('/api/qr.svg', async (_req, res) => {
+  if (!engine.wallet) { res.status(503).end(); return; }
+  const svg = await QRCode.toString(engine.wallet.account.address, { type: 'svg', margin: 1, color: { dark: '#0b0f17', light: '#ffffff' } });
+  res.type('image/svg+xml').send(svg);
+});
+
+const kindOf = (req: Request) => (req.body?.kind === 'live' ? 'live' : 'paper') as 'paper' | 'live';
+
+app.post('/api/arm', (req, res) => {
+  if (req.body?.confirm !== 'LIVE') { res.status(400).json({ error: 'Type LIVE to confirm' }); return; }
+  engine.arm();
+  res.json({ ok: true });
+});
+app.post('/api/disarm', (_req, res) => { engine.disarm(); res.json({ ok: true }); });
+app.post('/api/pause', (req, res) => { engine.setPaused(!!req.body?.paused); res.json({ ok: true }); });
+app.post('/api/resume', (req, res) => { engine.resume(kindOf(req)); res.json({ ok: true }); });
+app.post('/api/paper/reset', (_req, res) => { engine.resetPaper(); res.json({ ok: true }); });
+app.post('/api/backtest', (_req, res) => { engine.runBacktestNow(); res.json({ ok: true }); });
+app.post('/api/panic', async (req, res) => {
+  try {
+    await engine.panic(kindOf(req));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+const server = app.listen(CONFIG.port, CONFIG.host, () => {
+  console.log(`Dashboard: http://localhost:${CONFIG.port}`);
+  void engine.start();
+});
+
+// Keep the Mac from sleeping while the bot runs (caffeinate exits by itself when this process exits).
+if (process.platform === 'darwin') {
+  try {
+    const c = spawn('/usr/bin/caffeinate', ['-i', '-s', '-w', String(process.pid)], { stdio: 'ignore' });
+    c.on('error', () => console.error('caffeinate not available; the Mac may sleep'));
+    process.on('exit', () => { try { c.kill(); } catch { /* ignore */ } });
+  } catch { /* ignore */ }
+}
+
+let shuttingDown = false;
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('Shutting down: waiting for any in-flight trade, then saving state...');
+  server.close();
+  setTimeout(() => process.exit(0), 28_000).unref();
+  try { await engine.stop(); } catch { /* ignore */ }
+  process.exit(0);
+};
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+process.on('unhandledRejection', (e) => console.error('unhandledRejection', e));

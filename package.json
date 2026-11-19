@@ -1,0 +1,31 @@
+{
+  "name": "eth-token-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ethereum ERC-20 token trading bot (Uniswap v3) with a localhost dashboard",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit -p .",
+    "backtest": "node dist/cli-backtest.js",
+    "scan": "node dist/cli-scan.js",
+    "fork-test": "bash scripts/fork-test.sh",
+    "service:install": "bash scripts/service.sh install",
+    "service:uninstall": "bash scripts/service.sh uninstall",
+    "service:status": "bash scripts/service.sh status",
+    "service:restart": "bash scripts/service.sh restart",
+    "service:logs": "bash scripts/service.sh logs"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "qrcode": "^1.5.4",
+    "viem": "^2.58.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^18.19.130",
+    "@types/qrcode": "^1.5.6",
+    "typescript": "^5.9.3"
+  }
+}
