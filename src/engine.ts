@@ -297,7 +297,8 @@ export class Engine {
       this.backtest = r.rules;
       this.mlModel = r.model;
       this.mlActive = r.ml.active && !!r.model;
-      this.mlThreshold = r.ml.threshold ?? 0.6;
+      // research picks a lift (x base rate); live compares probabilities, so convert with the live model's base rate
+      this.mlThreshold = Math.min(0.95, (r.ml.threshold ?? 2) * (r.model?.baseRate ?? 0.3));
       this.computeMlScores(true);
       const b = r.rules;
       this.log(`Backtest rules (${(b.hours / 24).toFixed(0)}d, ${this.market.tokens.length} tokens): ${(b.returnPct * 100).toFixed(2)}% vs ETH ${(b.ethHoldPct * 100).toFixed(2)}%, ${b.trades} trades, max DD ${(b.maxDrawdownPct * 100).toFixed(1)}%`);

@@ -260,7 +260,7 @@ export interface WalkForwardResult {
   oosRows: number;
   positives: number;
   folds: number;
-  /** out-of-sample probability per token per master index (NaN = none) */
+  /** out-of-sample LIFT (probability / that fold's base rate) per token per master index (NaN = none) */
   preds: Map<string, Float32Array>;
   live: LogitModel | null;
   importance: { name: string; weight: number }[];
@@ -315,7 +315,7 @@ export async function walkForward(series: Map<string, SeriesBase>, eth: SeriesBa
     const end = Math.min(N, t + ML.retrainEveryHours);
     for (const [k, s] of series) {
       const out = preds.get(k)!;
-      for (let i = t; i < end; i++) if (featureRow(s, eth, i, tmp)) out[i] = predict(model, tmp);
+      for (let i = t; i < end; i++) if (featureRow(s, eth, i, tmp)) out[i] = predict(model, tmp) / Math.max(model.baseRate, 1e-3);
     }
     await yieldLoop();
   }

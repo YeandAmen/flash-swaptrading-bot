@@ -48,7 +48,7 @@ for (const g of [gasNow, 0.3]) {
   const m = r.ml;
   log(`  ML walk-forward: AUC ${m.auc === null ? 'n/a' : m.auc.toFixed(3)} on ${m.oosRows} unseen token-hours (base rate ${m.baseRate === null ? 'n/a' : pct(m.baseRate)}), ${m.folds} re-trains, out-of-sample from ${new Date(m.oosFrom).toISOString().slice(0, 10)}`);
   show(m.rulesOos);
-  for (const x of m.thresholds) log(`  ML p≥${x.threshold}`.padEnd(25) + `${pct(x.returnPct)} | trades ${x.trades} | max DD ${pct(x.maxDrawdownPct)}`);
+  for (const x of m.thresholds) log(`  ML ${x.threshold}x base rate`.padEnd(25) + `${pct(x.returnPct)} | trades ${x.trades} | max DD ${pct(x.maxDrawdownPct)}`);
   log(`  → ${m.active ? 'ML ACTIVE' : 'rules stay in charge'}: ${m.reason}`);
   if (g === gasNow) {
     log(`  Top features: ${m.importance.map((f) => `${f.name} ${f.weight >= 0 ? '+' : ''}${f.weight.toFixed(2)}`).join(', ')}`);

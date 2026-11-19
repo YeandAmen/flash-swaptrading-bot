@@ -180,8 +180,8 @@ function render() {
     $('mlAuc').textContent = aucTxt;
     $('mlAuc').className = 'v ' + (M.auc != null && M.auc >= 0.55 ? 'pos' : 'amb');
     $('mlRules').innerHTML = M.rulesOos ? `<span class="${cls(M.rulesOos.returnPct)}">${pct(M.rulesOos.returnPct)}</span>` : '–';
-    $('mlBest').innerHTML = M.mlOos ? `<span class="${cls(M.mlOos.returnPct)}">${pct(M.mlOos.returnPct)}</span> <span class="sub">p≥${M.threshold}</span>` : '–';
-    $('mlThr').innerHTML = (M.thresholds || []).map((x) => `<span>p ≥ ${x.threshold}</span><span><span class="${cls(x.returnPct)}">${pct(x.returnPct)}</span> · ${x.trades} trades · DD ${pct(-x.maxDrawdownPct, 1)}</span>`).join('');
+    $('mlBest').innerHTML = M.mlOos ? `<span class="${cls(M.mlOos.returnPct)}">${pct(M.mlOos.returnPct)}</span> <span class="sub">${M.threshold}× base rate</span>` : '–';
+    $('mlThr').innerHTML = (M.thresholds || []).map((x) => `<span>AI ≥ ${x.threshold}× base rate</span><span><span class="${cls(x.returnPct)}">${pct(x.returnPct)}</span> · ${x.trades} trades · DD ${pct(-x.maxDrawdownPct, 1)}</span>`).join('');
     $('mlFeat').textContent = (M.importance || []).map((f) => `${f.name} ${f.weight >= 0 ? '+' : ''}${f.weight.toFixed(2)}`).join(' · ');
   }
 

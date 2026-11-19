@@ -173,7 +173,7 @@ export function simulate(ctx: SimContext, o: SimOptions): BacktestResult {
         } else {
           if (ctx.ethCrash[j] || !t.mlOk[j]) continue;
           const p = o.preds?.get(t.sym)?.[j];
-          if (p === undefined || !Number.isFinite(p) || p < (o.threshold ?? 0.6)) continue;
+          if (p === undefined || !Number.isFinite(p) || p < (o.threshold ?? 2)) continue; // p = lift over base rate
           s = p;
         }
         if (s > bestScore) { bestScore = s; best = t; }
@@ -202,7 +202,7 @@ export function simulate(ctx: SimContext, o: SimOptions): BacktestResult {
             breakevenPrice: (size + 2 * g) / (qty * (1 - best.tm.poolFeePct - slip)),
             hops: best.tm.hops, fee: best.tm.poolFeePct, core: best.tm.token.core,
           });
-          tradeList.push({ t: now, side: 'BUY', symbol: best.sym, price, usd: size, reason: o.mode === 'ml' ? `ML p=${bestScore.toFixed(2)}` : `score ${bestScore.toFixed(2)}` });
+          tradeList.push({ t: now, side: 'BUY', symbol: best.sym, price, usd: size, reason: o.mode === 'ml' ? `ML lift ${bestScore.toFixed(1)}x` : `score ${bestScore.toFixed(2)}` });
         }
       }
     }
@@ -247,7 +247,7 @@ export interface MlReport {
   oosRows: number;
   baseRate: number | null;
   oosFrom: number;
-  threshold: number | null;
+  threshold: number | null; // chosen lift (x base rate)
   thresholds: { threshold: number; returnPct: number; trades: number; maxDrawdownPct: number }[];
   rulesOos: BacktestResult | null;
   mlOos: BacktestResult | null;
@@ -290,8 +290,8 @@ export async function runResearch(history: History, market: MarketInfo, gasPrice
   }
   report.rulesOos = simulate(ctx, { label: 'Rules (same period)', mode: 'rules', from: wf.oosStart, startUsd });
   let best: BacktestResult | null = null;
-  for (const thr of ML.thresholds) {
-    const r = simulate(ctx, { label: `ML p≥${thr}`, mode: 'ml', from: wf.oosStart, threshold: thr, preds: wf.preds, startUsd });
+  for (const thr of ML.liftThresholds) {
+    const r = simulate(ctx, { label: `ML ${thr}x base rate`, mode: 'ml', from: wf.oosStart, threshold: thr, preds: wf.preds, startUsd });
     report.thresholds.push({ threshold: thr, returnPct: r.returnPct, trades: r.trades, maxDrawdownPct: r.maxDrawdownPct });
     if (!best || r.returnPct > best.returnPct) { best = r; report.threshold = thr; }
   }

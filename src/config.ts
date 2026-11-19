@@ -112,7 +112,8 @@ export const ML = {
   retrainEveryHours: 72, // walk-forward refit cadence in backtests
   minTrainDays: 21,
   minAuc: num('ML_MIN_AUC', 0.55),
-  thresholds: [0.5, 0.55, 0.6, 0.65],
+  /** buy when the model's probability is at least this many times the base rate (winners are rare, so absolute 50%+ never happens) */
+  liftThresholds: [1.5, 2, 2.5, 3],
   l2: 0.01,
 };
 
