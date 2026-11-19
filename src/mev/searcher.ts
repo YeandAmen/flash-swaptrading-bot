@@ -8,9 +8,8 @@ import { redactDiagnostic } from '../diagnostics.js';
 import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../executor.js';
 import { BIG_BATCH, type McResult } from '../market.js';
 import { writeJson } from '../persistence.js';
-import { FLASH_ARB_ABI, FLASH_ARB_BYTECODE } from './artifact.js';
-import { FLASH_ARB_V2_ABI } from './artifact-v2.js';
-import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, flashArbRuntime, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
+import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
+import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
 import { sendBundle } from './bundles.js';
 import { routeInputSizes } from './sizing.js';
 import { arbGas, bestCycle, buildStateReads, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
@@ -95,8 +94,11 @@ interface MevFile {
   armedAt: number | null;
   contract: Address | null;
   v2Contract?: Address | null;
+  v2DeployedAt?: number;
+  v2DeployGasUsd?: number;
   deployedAt: number | null;
   deployTx: Hex | null;
+  deployVersion?: 'v2' | null;
   deployNonce: number | null;
   deployStartedAt: number | null;
   deployGasUsd: number;
@@ -174,8 +176,8 @@ export class MevSearcher {
   status = 'starting';
   lastError: string | null = null;
   lastBlock: { number: number; at: number; candidates: number; readMs: number; decisionMs: number | null } | null = null;
-  deploying = false;
-  deployGas: number | null = null;
+  private deploying = false;
+  private deployGas: number | null = null;
   private reads: ReturnType<typeof buildStateReads> | null = null;
   private poolsAt = 0;
   private universe: MevUniverse;
@@ -192,12 +194,12 @@ export class MevSearcher {
   constructor(private host: MevHost, private persist = true) {
     this.file = this.load();
     this.universe = new MevUniverse(persist, (message, level) => this.host.log(`[mev] ${message}`, level), {
-      includePancakeV3: MEV.version === 'v2', includeUniswapV4: MEV.version === 'v2',
+      includePancakeV3: true, includeUniswapV4: true,
     });
   }
 
-  private get selectedContract() { return MEV.version === 'v2' ? this.file.v2Contract ?? null : this.file.contract; }
-  private get configuredContract() { return MEV.version === 'v2' ? MEV.v2ContractAddress : MEV.contractAddress; }
+  private get selectedContract() { return this.file.v2Contract ?? null; }
+  private get configuredContract() { return MEV.v2ContractAddress; }
 
   private get pending() { return this.file.pending; }
 
@@ -208,6 +210,7 @@ export class MevSearcher {
       const f = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as MevFile;
       if (f.version !== 1 || !f.stats || !Array.isArray(f.recent)) throw new Error('invalid MEV state');
       if ((f.deployTx != null && !/^0x[0-9a-f]{64}$/i.test(f.deployTx))
+        || (f.deployVersion != null && f.deployVersion !== 'v2')
         || (f.contract != null && !/^0x[0-9a-f]{40}$/i.test(f.contract))
         || (f.v2Contract != null && !/^0x[0-9a-f]{40}$/i.test(f.v2Contract))) throw new Error('invalid MEV contract state');
       f.best = Array.isArray(f.best) ? f.best.filter((x) => x && typeof x === 'object' && !Array.isArray(x)) : [];
@@ -251,7 +254,7 @@ export class MevSearcher {
   }
 
   walletPending(): boolean {
-    return !!(this.stateReadError || this.pending || this.file.deployTx);
+    return Boolean(this.stateReadError || this.pending || this.file.deployTx || this.deploying);
   }
 
   private liveArmed(generation: number): boolean {
@@ -262,9 +265,10 @@ export class MevSearcher {
   private modeText(): string {
     if (this.stateReadError) return this.stateReadError;
     if (!MEV.enabled) return 'Off (MEV=off in .env)';
-    if (this.deploying) return this.selectedContract || this.configuredContract ? 'Verifying the existing arbitrage contract…' : 'Deploying the arbitrage contract…';
-    if (this.file.armed && this.selectedContract) return 'LIVE: a Flashbots bundle is sent whenever an arbitrage still pays after gas';
-    if (this.file.armed) return 'Armed: waiting for the contract';
+    if (this.deploying) return 'Deploying FlashArbV2…';
+    if (this.file.deployTx) return 'Waiting for the deployment transaction to settle';
+    if (this.file.armed && !this.contractReady) return 'Verifying the FlashArbV2 contract…';
+    if (this.file.armed) return 'LIVE: a Flashbots bundle is sent whenever an arbitrage still pays after gas';
     return 'Paper mode: every block is scanned and simulated, nothing is sent';
   }
 
@@ -282,7 +286,7 @@ export class MevSearcher {
         await sleep(Math.min(120_000, 15_000 * (i + 1)));
       }
     }
-    if (MEV.version === 'legacy' && !this.selectedContract && !this.configuredContract) void this.estimateDeployGas();
+    if (!this.selectedContract && !this.configuredContract) void this.estimateDeployGas();
     void this.loop();
     if (this.universe.broad && !this.stopping) void this.discoverMorePools();
   }
@@ -467,7 +471,7 @@ export class MevSearcher {
   async simulate(t: ArbToken, A: ArbPool, B: ArbPool, amountIn: bigint, maxBlock: bigint, blockNumber?: bigint, funding: RouteFunding = 0): Promise<{ ok: true; profit: bigint } | { ok: false; reason: string; reverted: boolean }> {
     const contract = this.contractReady ? this.selectedContract : null;
     try {
-      const data = encodeArbitrage(MEV.version, funding, { token: t.token.address, buy: A, sell: B, amountIn, minProfit: 1n, tip: 0n, maxBlock });
+      const data = encodeArbitrage(funding, { token: t.token.address, buy: A, sell: B, amountIn, minProfit: 1n, tip: 0n, maxBlock });
       const res = await publicClient.call({
         account: this.host.account.address,
         blockNumber,
@@ -475,10 +479,10 @@ export class MevSearcher {
         data,
         stateOverride: contract
           ? undefined
-          : [{ address: SIM_ADDR, code: flashArbRuntime(MEV.version), stateDiff: [{ slot: pad('0x0'), value: pad(this.host.account.address) }] }],
+          : [{ address: SIM_ADDR, code: FLASH_ARB_V2_RUNTIME, stateDiff: [{ slot: pad('0x0'), value: pad(this.host.account.address) }] }],
       });
       if (!res.data) return { ok: false, reason: 'no result', reverted: false };
-      return { ok: true, profit: decodeArbitrage(MEV.version, res.data) };
+      return { ok: true, profit: decodeArbitrage(res.data) };
     } catch (e) {
       const reverted = e instanceof BaseError && e.walk((cause) => cause instanceof ExecutionRevertedError) instanceof ExecutionRevertedError;
       return { ok: false, reason: reasonOf(e), reverted };
@@ -492,7 +496,7 @@ export class MevSearcher {
     const previous = this.previousSizes.get(key);
     const sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previous && Date.now() - previous.at < 10 * 60_000 ? previous.amount : undefined);
     if (!sizes.length) return null;
-    const trials = fundingTrials(MEV.version, MEV.funding, sizes);
+    const trials = fundingTrials(MEV.funding, sizes);
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));
     st.rpcCalls += sims.length;
     st.simulated++;
@@ -580,7 +584,7 @@ export class MevSearcher {
     if (!validPrice(ethUsd)) return skip('ETH/USD price unavailable');
     const minimumNet = this.minimumNet(ethUsd);
     const target = r.blockNumber + 1n;
-    const encode = (tip: bigint, minProfit: bigint) => encodeArbitrage(MEV.version, offer.funding, {
+    const encode = (tip: bigint, minProfit: bigint) => encodeArbitrage(offer.funding, {
       buy: c.A, sell: c.B, token: c.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
     });
     let gas: bigint, tip: bigint, worstGas: bigint, data: Hex;
@@ -597,7 +601,7 @@ export class MevSearcher {
       data = encode(tip, tip + worstGas + minimumNet);
       const result = await publicClient.call({ account, to: contract, data, gas, blockNumber: r.blockNumber });
       this.file.stats.rpcCalls++;
-      if (!result.data || decodeArbitrage(MEV.version, result.data) < tip + worstGas + minimumNet) {
+      if (!result.data || decodeArbitrage(result.data) < tip + worstGas + minimumNet) {
         return skip('final simulation returned insufficient profit');
       }
     } catch (e) {
@@ -698,7 +702,7 @@ export class MevSearcher {
       this.host.exec.noteNonceUsed(p.nonce);
       const gasWei = receipt.gasUsed * receipt.effectiveGasPrice;
       const ev = parseEventLogs({
-        abi: FLASH_ARB_ABI,
+        abi: FLASH_ARB_V2_ABI,
         logs: receipt.logs.filter((log) => log.address.toLowerCase() === p.contract.toLowerCase()),
         eventName: 'Arbitrage',
       })[0];
@@ -785,47 +789,46 @@ export class MevSearcher {
     if (!CONFIG.allowLiveTrading && !CONFIG.forkMode) throw new Error('Live execution is disabled (ALLOW_LIVE_TRADING=off).');
     if (!CONFIG.forkMode && MEV.builders.length === 0) throw new Error('MEV requires at least one configured builder.');
     if (this.stateReadError) throw new Error(this.stateReadError);
-    if (!this.persist || this.stopping || this.walletPending() || this.deploying) throw new Error('MEV cannot arm while wallet recovery or contract preparation is in progress.');
+    if (!this.persist || this.stopping || this.walletPending()) throw new Error('MEV cannot arm while wallet recovery or contract preparation is in progress.');
     const existing = this.selectedContract;
     const configured = this.configuredContract;
-    const addressSetting = MEV.version === 'v2' ? 'MEV_V2_CONTRACT_ADDRESS' : 'MEV_CONTRACT_ADDRESS';
     if (existing && configured && existing.toLowerCase() !== configured.toLowerCase()) {
-      throw new Error(`${addressSetting} conflicts with the saved deployment. Review both addresses before arming.`);
+      throw new Error('MEV_V2_CONTRACT_ADDRESS conflicts with the saved deployment. Review both addresses before arming.');
     }
-    if (MEV.version === 'v2' && !existing && !configured) {
-      throw new Error('FlashArbV2 requires a manual deployment before arming. Set MEV_V2_CONTRACT_ADDRESS afterward.');
-    }
-    if (!this.file.armed) {
-      this.armGeneration++;
-      this.contractReady = false;
-      this.file.armed = true;
-      this.file.armedAt = Date.now();
-      const preparation = existing || configured ? 'verifying the existing contract' : 'preparing initial contract deployment';
-      this.host.log(`MEV live arming requested. First, ${preparation}.`, 'warn');
-    }
-    void this.ensureDeployed();
+    const address = existing ?? configured;
+    if (!address) throw new Error('Deploy FlashArbV2 from the dashboard before arming MEV.');
+    if (this.file.armed) return;
+    const generation = ++this.armGeneration;
+    this.contractReady = false;
+    this.file.armed = true;
+    this.file.armedAt = Date.now();
+    this.status = this.modeText();
+    this.host.log('MEV live arming requested. Verifying FlashArbV2.', 'warn');
+    void this.verifyForArm(address, generation);
   }
 
   disarm(reason = 'by user') {
-    if (!this.file.armed) return;
+    if (!this.file.armed && !this.deploying) return;
     this.armGeneration++;
+    const wasArmed = this.file.armed;
     this.file.armed = false;
     this.file.armedAt = null;
+    this.contractReady = false;
     this.status = this.modeText();
-    this.host.log(`MEV arbitrage disarmed ${reason}. Scanning continues in paper mode.`, 'warn');
+    if (wasArmed) this.host.log(`MEV arbitrage disarmed ${reason}. Scanning continues in paper mode.`, 'warn');
   }
 
-  private async contractOk(addr: Address, version = MEV.version): Promise<boolean> {
+  private async contractOk(addr: Address): Promise<boolean> {
     const [code, owner] = await Promise.all([
       publicClient.getCode({ address: addr }).catch(() => undefined),
-      publicClient.readContract({ address: addr, abi: FLASH_ARB_ABI, functionName: 'owner' }).catch(() => null),
+      publicClient.readContract({ address: addr, abi: FLASH_ARB_V2_ABI, functionName: 'owner' }).catch(() => null),
     ]);
-    return code?.toLowerCase() === flashArbRuntime(version).toLowerCase() && String(owner).toLowerCase() === this.host.account.address.toLowerCase();
+    return code?.toLowerCase() === FLASH_ARB_V2_RUNTIME.toLowerCase() && owner?.toLowerCase() === this.host.account.address.toLowerCase();
   }
 
   private async estimateDeployGas() {
     try {
-      this.deployGas = Number(await publicClient.estimateGas({ account: this.host.account.address, data: FLASH_ARB_BYTECODE }));
+      this.deployGas = Number(await publicClient.estimateGas({ account: this.host.account.address, data: FLASH_ARB_V2_BYTECODE }));
     } catch { /* the dashboard shows the estimate only when known */ }
   }
 
@@ -833,14 +836,24 @@ export class MevSearcher {
     const f = this.file;
     const previous = {
       contract: f.contract, deployedAt: f.deployedAt, deployGasUsd: f.deployGasUsd,
-      deployTx: f.deployTx, deployNonce: f.deployNonce, deployStartedAt: f.deployStartedAt,
+      v2Contract: f.v2Contract, v2DeployedAt: f.v2DeployedAt, v2DeployGasUsd: f.v2DeployGasUsd,
+      deployTx: f.deployTx, deployVersion: f.deployVersion, deployNonce: f.deployNonce, deployStartedAt: f.deployStartedAt,
     };
     if (deployment) {
-      f.contract = deployment.address;
-      f.deployedAt = Date.now();
-      f.deployGasUsd = eth(deployment.gasWei) * (this.host.ethUsd() ?? 0);
+      const cost = eth(deployment.gasWei) * (this.host.ethUsd() ?? 0);
+      if (f.deployVersion === 'v2') {
+        f.v2Contract = deployment.address;
+        f.v2DeployedAt = Date.now();
+        f.v2DeployGasUsd = cost;
+      } else {
+        // Deployment journals from before V2 had no version marker. Keep their receipts as history.
+        f.contract = deployment.address;
+        f.deployedAt = Date.now();
+        f.deployGasUsd = cost;
+      }
     }
     f.deployTx = null;
+    f.deployVersion = null;
     f.deployNonce = null;
     f.deployStartedAt = null;
     try {
@@ -849,6 +862,7 @@ export class MevSearcher {
       Object.assign(f, previous);
       throw e;
     }
+    this.status = this.modeText();
   }
 
   private async recoverDeployment() {
@@ -864,7 +878,8 @@ export class MevSearcher {
     const receipt = result.receipt;
     if (f.deployNonce !== null) this.host.exec.noteNonceUsed(f.deployNonce);
     if (receipt.status === 'success') {
-      if (!receipt.contractAddress || !await this.contractOk(receipt.contractAddress, 'legacy')) {
+      if (!receipt.contractAddress || receipt.from.toLowerCase() !== this.host.account.address.toLowerCase()
+        || (f.deployVersion === 'v2' && !await this.contractOk(receipt.contractAddress))) {
         throw new Error('Confirmed deployment could not be verified');
       }
       this.clearDeployment({ address: receipt.contractAddress, gasWei: receipt.gasUsed * receipt.effectiveGasPrice });
@@ -875,50 +890,70 @@ export class MevSearcher {
     }
   }
 
-  /** Deploy on explicit arm only when there is no saved contract, or verify the existing deployment. */
-  private async ensureDeployed() {
+  private async verifyForArm(address: Address, generation: number) {
+    try {
+      if (!await this.contractOk(address)) throw new Error('FlashArbV2 bytecode or bot wallet ownership could not be verified.');
+      if (!this.liveArmed(generation)) return;
+      if (!this.selectedContract) {
+        const previous = this.file.v2Contract;
+        this.file.v2Contract = address;
+        try {
+          this.writeState();
+        } catch (error) {
+          this.file.v2Contract = previous;
+          throw error;
+        }
+      }
+      this.contractReady = true;
+      this.status = this.modeText();
+      this.host.log(`[mev] Verified FlashArbV2 at ${address}`);
+    } catch (error) {
+      if (this.liveArmed(generation)) {
+        this.host.log('[mev] Arming stopped: ' + errMsg(error), 'warn');
+        this.disarm('after contract verification failed');
+      }
+    }
+  }
+
+  /** This action authorizes one deployment. Live trading stays separately controlled. */
+  async deployFromDashboard(): Promise<Address> {
+    if (!MEV.enabled) throw new Error('MEV is turned off in .env (MEV=off).');
+    if (!CONFIG.allowLiveTrading && !CONFIG.forkMode) throw new Error('Live execution is disabled (ALLOW_LIVE_TRADING=off).');
+    if (this.stateReadError) throw new Error(this.stateReadError);
+    if (!this.persist || this.stopping || this.file.armed || this.walletPending() || this.host.tradePending()) {
+      throw new Error('Disarm MEV and wait for pending wallet operations to settle before deploying.');
+    }
+    if (this.selectedContract || this.configuredContract) throw new Error('A FlashArbV2 address is already saved or configured.');
+
     const generation = this.armGeneration;
-    if (this.deploying || !this.liveArmed(generation)) return;
     this.deploying = true;
     this.status = this.modeText();
     const f = this.file;
-    const canSend = () => this.liveArmed(generation) && !this.pending && !this.host.tradePending();
+    const canSend = () => this.deploying && this.armGeneration === generation && !this.stopping
+      && !f.armed && !this.stateReadError && !this.pending && !this.host.tradePending();
     try {
-      const existing = this.selectedContract ?? this.configuredContract;
-      if (existing) {
-        if (!await this.contractOk(existing)) throw new Error('Existing MEV contract owner or runtime could not be verified.');
-        if (!this.liveArmed(generation)) return;
-        if (!this.selectedContract) {
-          const key = MEV.version === 'v2' ? 'v2Contract' : 'contract';
-          const previous = f[key];
-          f[key] = existing;
-          try { this.writeState(); } catch (error) { Object.assign(f, { [key]: previous }); throw error; }
-        }
-        this.contractReady = true;
-        this.host.log(`[mev] Verified existing arbitrage contract at ${existing}`, 'info');
-        return;
-      }
-      if (MEV.version === 'v2') throw new Error('FlashArbV2 requires a manual deployment');
-      if (this.walletPending() || !canSend()) throw new Error('Wallet operation is still settling; re-arm once it has settled.');
       const me = this.host.account.address;
       const [balance, gas, block] = await Promise.all([
         publicClient.getBalance({ address: me }),
-        publicClient.estimateGas({ account: me, data: FLASH_ARB_BYTECODE }),
+        publicClient.estimateGas({ account: me, data: FLASH_ARB_V2_BYTECODE }),
         publicClient.getBlock(),
       ]);
+      this.deployGas = Number(gas);
       const need = ((gas * 13n) / 10n) * ((block.baseFeePerGas ?? parseGwei('1')) * 2n + parseGwei('1.5'));
-      if (balance < need) throw new Error('Wallet ETH does not cover contract deployment.');
+      if (balance < need) throw new Error('The bot wallet needs more ETH to cover deployment gas.');
       const r = await this.host.exec.deployContract(
-        FLASH_ARB_BYTECODE,
+        FLASH_ARB_V2_BYTECODE,
         (message) => this.host.log('[mev] ' + message),
         (hash, nonce) => {
           f.deployTx = hash;
+          f.deployVersion = 'v2';
           f.deployNonce = nonce;
           f.deployStartedAt = Date.now();
           try {
             this.writeState();
           } catch (error) {
             f.deployTx = null;
+            f.deployVersion = null;
             f.deployNonce = null;
             f.deployStartedAt = null;
             throw error;
@@ -928,15 +963,11 @@ export class MevSearcher {
       );
       if (!await this.contractOk(r.address)) throw new Error('Confirmed deployment could not be verified');
       this.clearDeployment({ address: r.address, gasWei: r.gasWei });
-      this.contractReady = true;
-      this.host.log('[mev] Verified new contract deployment at ' + r.address, 'trade');
-    } catch (e) {
-      if (e instanceof UncertainTxError) {
-        this.host.log('[mev] A wallet transaction is awaiting confirmation. Recovery continues in paper mode.', 'warn');
-      } else {
-        this.host.log('[mev] Contract preparation stopped: ' + errMsg(e), 'warn');
-      }
-      if (this.armGeneration === generation) this.disarm('after contract preparation stopped');
+      this.host.log('[mev] Verified FlashArbV2 deployment at ' + r.address, 'trade');
+      return r.address;
+    } catch (error) {
+      if (error instanceof UncertainTxError) throw new Error('The deployment transaction is awaiting confirmation. Recovery continues in paper mode.');
+      throw error;
     } finally {
       this.deploying = false;
       this.status = this.modeText();
@@ -956,16 +987,16 @@ export class MevSearcher {
     const hour = Math.floor(Date.now() / HOUR) * HOUR;
     return {
       enabled: MEV.enabled,
-      mode: !MEV.enabled ? 'off' : this.deploying ? 'deploying' : f.armed && this.selectedContract ? 'live' : f.armed ? 'arming' : 'paper',
+      mode: !MEV.enabled ? 'off' : this.deploying ? 'deploying' : f.armed ? (this.contractReady ? 'live' : 'arming') : 'paper',
       status: this.status,
       lastError: this.lastError,
       armed: f.armed,
       contract: this.selectedContract,
       configuredContract: this.configuredContract,
-      contractVersion: MEV.version,
-      fundingMode: MEV.version === 'v2' ? MEV.funding : 'pool',
-      deployedAt: MEV.version === 'legacy' ? f.deployedAt : null,
-      deployGasUsd: MEV.version === 'legacy' ? f.deployGasUsd : 0,
+      contractVersion: 'v2',
+      fundingMode: MEV.funding,
+      deployedAt: f.v2DeployedAt ?? null,
+      deployGasUsd: f.v2DeployGasUsd ?? 0,
       deployEstimateUsd: this.deployGas && gp && ethUsd ? this.deployGas * gp * 1e-9 * ethUsd : null,
       tokens: this.tokens.length,
       pools: this.tokens.reduce((s, t) => s + t.pools.length, 0),

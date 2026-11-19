@@ -6,8 +6,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { generatePrivateKey } from 'viem/accounts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const [suite = 'cli-forktest', mode = '', ...extra] = process.argv.slice(2);
-const suites = ['cli-forktest', 'cli-mev-forktest', 'cli-mev-v2-forktest', 'cli-wallet-forktest'];
+const [requestedSuite = 'cli-forktest', mode = '', ...extra] = process.argv.slice(2);
+const suite = requestedSuite === 'cli-mev-forktest' ? 'cli-mev-v2-forktest' : requestedSuite;
+const suites = ['cli-forktest', 'cli-mev-v2-forktest', 'cli-wallet-forktest'];
 const standalone = suite === 'cli-wallet-forktest' && mode === '--standalone';
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   ['PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE'].includes(key.toUpperCase())));

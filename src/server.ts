@@ -224,11 +224,11 @@ function allowArming(req: Request, res: Response): boolean {
   return true;
 }
 
-function control(operation: (req: Request) => void | Promise<void>) {
+function control(operation: (req: Request) => void | Promise<void | { address: string }>) {
   return async (req: Request, res: Response) => {
     try {
-      await operation(req);
-      res.json({ ok: true });
+      const result = await operation(req);
+      res.json({ ok: true, ...result });
     } catch (error) {
       const message = redactDiagnostic(String((error as Error)?.message ?? error).split('\n')[0]);
       engine.log(`${req.path}: ${message}`, 'warn');
@@ -242,6 +242,13 @@ app.post('/api/arm', (req, res) => {
   if (allowArming(req, res)) void control(() => engine.arm())(req, res);
 });
 app.post('/api/disarm', control(() => engine.disarm()));
+app.post('/api/mev/deploy', (req, res) => {
+  if (req.body?.confirm !== 'DEPLOY') { res.status(400).json({ error: 'Type DEPLOY to confirm' }); return; }
+  if (!allowArming(req, res)) return;
+  const mev = engine.mev;
+  if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
+  void control(async () => ({ address: await mev.deployFromDashboard() }))(req, res);
+});
 app.post('/api/mev/arm', (req, res) => {
   if (req.body?.confirm !== 'MEV') { res.status(400).json({ error: 'Type MEV to confirm' }); return; }
   if (!allowArming(req, res)) return;

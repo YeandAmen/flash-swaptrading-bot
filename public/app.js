@@ -13,6 +13,7 @@ let S = null;
 let tab = 'live';
 let qrLoaded = false;
 let panicPending = false;
+let mevDeploySubmitting = false;
 
 async function api(path, body) {
   const send = (authorization) => fetch(path, {
@@ -85,7 +86,7 @@ function render() {
     pill.className = 'pill paper'; pill.textContent = 'PAPER';
     banner.className = 'banner'; $('bannerText').textContent = S.liveTradingAllowed
       ? 'Paper trading with on-chain prices. Live modes start disarmed.'
-      : 'Paper trading with on-chain prices. Live signing is disabled in settings.';
+      : 'Paper trading with on-chain prices. Set ALLOW_LIVE_TRADING=on in .env and restart to enable live signing.';
   }
 
   // wallet
@@ -241,16 +242,8 @@ function render() {
       <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
       <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}</td></tr>`).join('')
       : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
-    $('mevArmBtn').hidden = X.armed || X.mode === 'off';
-    $('mevArmBtn').disabled = !S.liveTradingAllowed || !S.health.ready || Boolean(X.pending);
-    $('mevDisarmBtn').hidden = !X.armed;
-    $('mevDeploy').textContent = X.contract
-      ? `contract ${X.contract.slice(0, 8)}…${X.contract.slice(-4)}`
-      : X.configuredContract ? 'Configured contract · verified on arming'
-      : X.contractVersion === 'v2' ? 'FlashArbV2 · paper simulation · manual deployment required for execution'
-        : X.deployEstimateUsd != null ? `arming deploys the contract once (~${usd(X.deployEstimateUsd)} gas)` : '';
-    if (X.contractVersion === 'v2' && !X.contract && !X.configuredContract) $('mevArmBtn').disabled = true;
   }
+  renderMevControls(X);
 
   // log
   $('log').innerHTML =(S.events || []).map((e) => `<div><span class="t">${hm(e.t)}</span><span class="${e.level}">${esc(e.msg)}</span></div>`).join('');
@@ -266,6 +259,33 @@ function render() {
     ['Daily loss stop', pct(-r.dailyLossLimitPct, 0)], ['Drawdown halt', pct(-r.maxDrawdownPct, 0)],
     ['Max entry gas', r.maxEntryGasGwei + ' gwei'], ['Approvals', r.approvalMode === 'exact' ? 'exact amount only' : 'unlimited'],
   ].map(([a, v]) => `<span>${a}</span><span>${v}</span>`).join('');
+}
+
+function renderMevControls(X) {
+  const contract = X?.contract || X?.configuredContract;
+  const off = X?.mode === 'off';
+  let reason = '';
+  if (!X) reason = 'Waiting for bot status.';
+  else if (off) reason = 'MEV scanning is disabled by MEV=off in .env.';
+  else if (X.deploymentPending) reason = 'Waiting for the FlashArbV2 deployment receipt.';
+  else if (mevDeploySubmitting || X.mode === 'deploying') reason = 'Preparing FlashArbV2 deployment…';
+  else if (X.mode === 'arming') reason = 'Checking FlashArbV2 before arming…';
+  else if (!S.liveTradingAllowed) reason = 'Set ALLOW_LIVE_TRADING=on in .env and restart to enable deployment and live MEV.';
+  else if (!S.health.ready) reason = S.health.reason || 'Waiting for the bot to be ready.';
+  else if (X.pending) reason = 'Waiting for a submitted MEV bundle to settle.';
+
+  $('mevDeployBtn').hidden = Boolean(contract || off);
+  $('mevDeployBtn').disabled = Boolean(reason || contract);
+  $('mevArmBtn').hidden = Boolean(X?.armed || off);
+  $('mevArmBtn').disabled = Boolean(reason || !contract);
+  $('mevDisarmBtn').hidden = !X?.armed;
+  $('mevContract').hidden = !contract;
+  $('mevContract').textContent = contract ? `FlashArbV2 ${contract}${X.contract ? '' : ' (configured)'}` : '';
+  const status = reason || (contract ? '' : 'Deploy FlashArbV2 to enable MEV arming.');
+  const statusNode = $('mevDeploy');
+  if (statusNode.textContent !== status) statusNode.textContent = status;
+  statusNode.hidden = !status;
+  updateMevDeployConfirm();
 }
 
 function spark(svg, pts, base) {
@@ -306,12 +326,48 @@ $('disarmBtn').onclick = async () => {
   try { await api('/api/disarm'); } catch (e) { alert(e.message); }
   refresh();
 };
+const mevDeployDlg = $('mevDeployDlg');
+function updateMevDeployConfirm() {
+  $('mevDeployConfirm').disabled = $('mevDeployBtn').disabled || $('mevDeployInput').value.trim() !== 'DEPLOY';
+}
+$('mevDeployBtn').onclick = () => {
+  if ($('mevDeployBtn').disabled) return;
+  const estimate = S.mev.deployEstimateUsd;
+  const fee = S.forkMode
+    ? 'Deployment spends test ETH from the bot wallet on this local fork.'
+    : 'Deployment sends a mainnet transaction and spends real ETH from the bot wallet.';
+  $('mevDeployGas').textContent = fee + (estimate != null ? ` Current gas estimate is about ${usd(estimate)}.` : ' A gas estimate is currently unavailable.');
+  $('mevDeployInput').value = '';
+  $('mevDeployError').hidden = true;
+  updateMevDeployConfirm();
+  mevDeployDlg.showModal();
+};
+$('mevDeployInput').oninput = updateMevDeployConfirm;
+$('mevDeployCancel').onclick = () => mevDeployDlg.close();
+mevDeployDlg.oncancel = (event) => { if (mevDeploySubmitting) event.preventDefault(); };
+$('mevDeployConfirm').onclick = async () => {
+  if ($('mevDeployConfirm').disabled) return;
+  mevDeploySubmitting = true;
+  $('mevDeployCancel').disabled = true;
+  $('mevDeployInput').disabled = true;
+  $('mevDeployError').hidden = true;
+  renderMevControls(S.mev);
+  try {
+    await api('/api/mev/deploy', { confirm: 'DEPLOY' });
+    mevDeployDlg.close();
+  } catch (error) {
+    $('mevDeployError').textContent = error.message;
+    $('mevDeployError').hidden = false;
+  } finally {
+    await refresh();
+    mevDeploySubmitting = false;
+    $('mevDeployCancel').disabled = false;
+    $('mevDeployInput').disabled = false;
+    renderMevControls(S?.mev);
+  }
+};
 const mevDlg = $('mevDlg');
 $('mevArmBtn').onclick = () => {
-  const X = S?.mev;
-  $('mevDlgDeploy').innerHTML = X?.contract || X?.configuredContract
-    ? 'Arming verifies the configured contract bytecode and wallet ownership.'
-    : `First, one transaction deploys the bot's own arbitrage contract (owner = the bot wallet): about <b>${X?.deployEstimateUsd != null ? usd(X.deployEstimateUsd) : 'a few dollars'}</b> of ETH gas, once.`;
   $('mevInput').value = '';
   $('mevConfirm').disabled = true;
   mevDlg.showModal();

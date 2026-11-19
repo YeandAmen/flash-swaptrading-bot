@@ -9,8 +9,7 @@ import { CONFIG, DATA_DIR, MEV } from './config.js';
 import { Engine } from './engine.js';
 import { LiveExecutor, LiveSendBlocked } from './executor.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
-import { FLASH_ARB_ABI, FLASH_ARB_BYTECODE, FLASH_ARB_RUNTIME } from './mev/artifact.js';
-import { FLASH_ARB_V2_BYTECODE } from './mev/artifact-v2.js';
+import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_RUNTIME } from './mev/artifact-v2.js';
 import { MevSearcher } from './mev/searcher.js';
 import { loadOrCreateWallet } from './wallet.js';
 
@@ -28,6 +27,7 @@ const log = () => {};
 const emptyContract = '0x6001600c60003960016000f300';
 
 const stateFile = path.join(DATA_DIR, 'state.json');
+const mevStateFile = path.join(DATA_DIR, 'mev.json');
 const first = new Engine();
 fs.writeFileSync(stateFile, JSON.stringify({ ...first.state, armed: true, armedAt: Date.now() }));
 const restartedEngine = new Engine();
@@ -45,6 +45,7 @@ CONFIG.forkMode = false;
 try {
   assert.throws(() => restartedEngine.arm(), /disabled/);
   assert.throws(() => mev.arm(), /disabled/);
+  await assert.rejects(mev.deployFromDashboard(), /disabled/);
   await assert.rejects(exec.deployContract(emptyContract, log), LiveSendBlocked);
 } finally {
   CONFIG.forkMode = true;
@@ -100,57 +101,23 @@ assert.equal(await nonce(), before, 'a canceled operation must not consume a non
 assert.equal(await balance(), initialBalance, 'a canceled operation must not spend gas');
 console.log('✓ Final send gate honored cancellation during signing');
 
-const [flashArb, example] = await Promise.all([
-  exec.deployContract(FLASH_ARB_BYTECODE, log),
+const [otherExample, example] = await Promise.all([
+  exec.deployContract(emptyContract, log),
   exec.deployContract(emptyContract, log),
 ]);
-const [flashTx, exampleTx] = await Promise.all([
-  publicClient.getTransaction({ hash: flashArb.hash }),
+const [otherExampleTx, exampleTx] = await Promise.all([
+  publicClient.getTransaction({ hash: otherExample.hash }),
   publicClient.getTransaction({ hash: example.hash }),
 ]);
-assert.equal(flashTx.nonce, before);
+assert.equal(otherExampleTx.nonce, before);
 assert.equal(exampleTx.nonce, before + 1);
 assert.equal(await nonce(), before + 2);
-assert.equal(await publicClient.getCode({ address: flashArb.address }), FLASH_ARB_RUNTIME);
-assert.equal(
-  await publicClient.readContract({ address: flashArb.address, abi: FLASH_ARB_ABI, functionName: 'owner' }),
-  account.address,
-);
-console.log('✓ Concurrent wallet operations used consecutive nonces; verified FlashArb runtime and owner');
+console.log('✓ Concurrent wallet operations used consecutive nonces');
 
 const waitForPreparation = async (searcher: MevSearcher) => {
-  for (let i = 0; i < 100 && searcher.deploying; i++) await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(searcher.deploying, false, 'contract verification finished');
+  for (let i = 0; i < 100 && searcher.view().mode === 'arming'; i++) await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.notEqual(searcher.view().mode, 'arming', 'contract verification finished');
 };
-const originalAddress = MEV.contractAddress;
-try {
-  MEV.contractAddress = example.address;
-  const wrongCode = new MevSearcher(mevHost);
-  wrongCode.arm();
-  await waitForPreparation(wrongCode);
-  assert.equal(wrongCode.file.armed, false, 'wrong configured runtime must leave MEV disarmed');
-  assert.equal(await nonce(), before + 2, 'invalid configured address must never fall back to deployment');
-
-  MEV.contractAddress = flashArb.address;
-  const adopted = new MevSearcher(mevHost);
-  assert.equal(adopted.view().contract, null, 'test starts with no saved deployment');
-  adopted.arm();
-  await waitForPreparation(adopted);
-  assert.equal(adopted.view().mode, 'live');
-  assert.equal(adopted.file.contract?.toLowerCase(), flashArb.address.toLowerCase());
-  assert.equal(await nonce(), before + 2, 'configured verified deployment must be reused without spending gas');
-  adopted.disarm();
-
-  MEV.contractAddress = example.address;
-  const conflict = new MevSearcher(mevHost);
-  assert.throws(() => conflict.arm(), /conflicts with the saved deployment/);
-  assert.equal(conflict.file.contract?.toLowerCase(), flashArb.address.toLowerCase());
-  assert.equal(conflict.file.armed, false);
-  assert.equal(await nonce(), before + 2);
-} finally {
-  MEV.contractAddress = originalAddress;
-}
-console.log('✓ Existing FlashArb reused after runtime and owner verification; invalid and conflicting addresses blocked');
 
 const restored = new LiveExecutor(account);
 const intent = { owner: account.address, hash: example.hash, nonce: exampleTx.nonce, signedAt: Date.now() };
@@ -167,31 +134,95 @@ console.log('✓ Restart reconciled a known receipt and preserved an unresolved 
 
 // Remove the fake, deliberately unresolved intent above before starting this independent fixture.
 fs.unlinkSync(walletJournal);
-const originalVersion = MEV.version;
 const originalV2Address = MEV.v2ContractAddress;
 try {
-  MEV.version = 'v2';
   MEV.v2ContractAddress = null;
-  const beforeV2 = await nonce();
+  const beforeDeploy = await nonce();
+  // Old installations have a saved V1 address even when no V2 has been deployed.
+  fs.writeFileSync(mevStateFile, JSON.stringify({ ...mev.file, contract: otherExample.address }));
   const paperV2 = new MevSearcher(mevHost);
   assert.equal(paperV2.view().mode, 'paper');
-  assert.throws(() => paperV2.arm(), /manual deployment/);
-  assert.equal(await nonce(), beforeV2, 'the V2 app cannot auto-deploy');
+  assert.equal(paperV2.view().contract, null);
+  assert.throws(() => paperV2.arm(), /deploy|contract/i);
+  assert.equal(await nonce(), beforeDeploy, 'arming cannot deploy a contract');
 
-  const v2 = await exec.deployContract(FLASH_ARB_V2_BYTECODE, log); // Explicit local deployment only.
-  MEV.v2ContractAddress = v2.address;
+  MEV.v2ContractAddress = example.address;
+  const wrongCode = new MevSearcher(mevHost);
+  wrongCode.arm();
+  await waitForPreparation(wrongCode);
+  assert.equal(wrongCode.view().mode, 'paper', 'wrong configured runtime leaves MEV disarmed');
+  assert.equal(await nonce(), beforeDeploy, 'invalid configured address cannot trigger deployment');
+  MEV.v2ContractAddress = null;
+
+  const [deployment, duplicate] = await Promise.allSettled([paperV2.deployFromDashboard(), paperV2.deployFromDashboard()]);
+  assert.equal(deployment.status, 'fulfilled', 'the first dashboard deployment succeeds');
+  assert.equal(duplicate.status, 'rejected', 'a duplicate deployment request is blocked while the first is pending');
+  const v2 = deployment.value;
+  assert.equal(paperV2.view().contract, v2);
+  assert.equal(paperV2.view().mode, 'paper', 'deployment keeps MEV in paper mode');
+  assert.equal(restartedEngine.state.armed, false, 'deployment leaves live spot trading off');
+  assert.equal(paperV2.file.contract, otherExample.address, 'legacy address remains a historical record');
+  assert.equal(await publicClient.getCode({ address: v2 }), FLASH_ARB_V2_RUNTIME);
+  assert.equal(await publicClient.readContract({ address: v2, abi: FLASH_ARB_V2_ABI, functionName: 'owner' }), account.address);
+  await paperV2.deployFromDashboard().catch(() => undefined);
+  assert.equal(await nonce(), beforeDeploy + 1, 'repeated deployment does not spend gas');
+
+  MEV.v2ContractAddress = example.address;
+  const conflict = new MevSearcher(mevHost);
+  assert.throws(() => conflict.arm(), /conflicts with the saved deployment/);
+  assert.equal(conflict.view().contract, v2);
+  assert.equal(conflict.view().mode, 'paper');
+  MEV.v2ContractAddress = null;
+
   const adoptedV2 = new MevSearcher(mevHost);
+  assert.equal(adoptedV2.view().mode, 'paper');
+  assert.equal(adoptedV2.view().contract, v2);
   adoptedV2.arm();
   await waitForPreparation(adoptedV2);
   assert.equal(adoptedV2.view().mode, 'live');
-  assert.equal(adoptedV2.file.v2Contract, v2.address);
-  assert.equal(adoptedV2.file.contract?.toLowerCase(), flashArb.address.toLowerCase());
-  assert.equal(await nonce(), beforeV2 + 1, 'V2 adoption only verified runtime and owner');
+  assert.equal(adoptedV2.file.v2Contract, v2);
+  assert.equal(await nonce(), beforeDeploy + 1, 'arming reused the verified V2 deployment without spending gas');
   adoptedV2.disarm();
   assert.equal(new MevSearcher(mevHost).view().mode, 'paper');
+  console.log('✓ Dashboard deployed FlashArbV2 once and left both live modes off; restart reused the verified contract on explicit arm');
+
+  const afterDeployBalance = await balance();
+  const { transactions } = await publicClient.getBlock({ blockTag: 'latest', includeTransactions: true });
+  const creation = transactions.find((tx) => tx.from.toLowerCase() === account.address.toLowerCase()
+    && tx.nonce === beforeDeploy && tx.to === null);
+  assert.ok(creation, 'find the mined dashboard deployment');
+
+  // Replay the saved intent that would remain if the process stopped before recording the V2 address.
+  fs.writeFileSync(mevStateFile, JSON.stringify({
+    ...adoptedV2.file, v2Contract: null, v2DeployedAt: null,
+    deployVersion: 'v2', deployTx: creation.hash, deployNonce: creation.nonce, deployStartedAt: Date.now(),
+  }));
+  const recoverV2 = new MevSearcher(mevHost);
+  assert.equal(recoverV2.view().deploymentPending, creation.hash);
+  await recoverV2.reconcileWallet();
+  const afterV2Recovery = new MevSearcher(mevHost);
+  assert.equal(afterV2Recovery.view().deploymentPending, null);
+  assert.equal(afterV2Recovery.view().mode, 'paper');
+  assert.equal(afterV2Recovery.view().contract, v2);
+  assert.equal(afterV2Recovery.file.contract, otherExample.address);
+
+  // A markerless legacy receipt updates only the historical address.
+  fs.writeFileSync(mevStateFile, JSON.stringify({
+    ...afterV2Recovery.file, deployVersion: undefined,
+    deployTx: example.hash, deployNonce: exampleTx.nonce, deployStartedAt: Date.now(),
+  }));
+  const recoverLegacy = new MevSearcher(mevHost);
+  assert.equal(recoverLegacy.view().deploymentPending, example.hash);
+  await recoverLegacy.reconcileWallet();
+  const afterLegacyRecovery = new MevSearcher(mevHost);
+  assert.equal(afterLegacyRecovery.view().deploymentPending, null);
+  assert.equal(afterLegacyRecovery.view().mode, 'paper');
+  assert.equal(afterLegacyRecovery.view().contract, v2);
+  assert.equal(afterLegacyRecovery.file.contract, example.address);
+  assert.equal(await nonce(), beforeDeploy + 1, 'receipt recovery requires no new sends');
+  assert.equal(await balance(), afterDeployBalance, 'receipt recovery spends no gas');
+  console.log('✓ Deployment journal recovery kept V2 and legacy receipts separate without spending gas');
 } finally {
-  MEV.version = originalVersion;
   MEV.v2ContractAddress = originalV2Address;
 }
-console.log('✓ FlashArbV2 required manual deployment and was verified separately from legacy state');
 console.log('ALL WALLET TESTS PASSED');

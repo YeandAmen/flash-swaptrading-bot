@@ -21,7 +21,7 @@
     "dashboard:password": "node dist/cli-dashboard-password.js",
     "wallet:address": "node dist/cli-wallet.js address",
     "wallet:export": "node dist/cli-wallet.js export",
-    "mev-fork-test": "node scripts/fork-test.mjs cli-mev-forktest",
+    "mev-fork-test": "node scripts/fork-test.mjs cli-mev-v2-forktest",
     "mev-v2-fork-test": "node scripts/fork-test.mjs cli-mev-v2-forktest",
     "wallet:fork-test": "node scripts/fork-test.mjs cli-wallet-forktest",
     "wallet:local-test": "node scripts/fork-test.mjs cli-wallet-forktest --standalone",

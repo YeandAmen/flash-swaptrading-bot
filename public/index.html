@@ -180,7 +180,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
   </section>
 
   <section class="card">
-    <h2>MEV arbitrage · flash swaps + Flashbots bundles <span id="mevMode"></span></h2>
+    <h2>MEV arbitrage · flash loans + private bundles <span id="mevMode"></span></h2>
     <div class="sub" id="mevStatus" style="margin:-4px 0 10px">Starting…</div>
     <div class="stats">
       <div class="stat"><div class="l">Blocks scanned</div><div class="v" id="mevBlocks">–</div></div>
@@ -195,11 +195,12 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
       <tbody id="mevBody"></tbody>
     </table></div>
     <div class="row">
-      <button id="mevArmBtn" class="primary">Arm MEV (live bundles)</button>
+      <button id="mevDeployBtn" aria-describedby="mevDeploy" disabled>Deploy FlashArbV2</button>
+      <button id="mevArmBtn" class="primary" aria-describedby="mevDeploy" disabled>Arm MEV (live bundles)</button>
       <button id="mevDisarmBtn" class="danger" hidden>Disarm MEV</button>
-      <span class="sub" id="mevDeploy" style="align-self:center"></span>
     </div>
-    <div class="note">Every block (12 s) the bot reads all watched pools in one call and looks for one token priced differently in two pools (Uniswap v3 fee tiers, Uniswap v2, SushiSwap). It checks the exact profit with an on-chain simulation and, when armed, sends a private Flashbots bundle: buy in the cheap pool and sell in the dear one in a single flash-swap transaction (no capital needed, profit arrives as ETH). A bundle lands only if it still pays after gas, otherwise it costs nothing. Pure arbitrage: it never front-runs or sandwiches other traders. Realistically, professional searchers take most gaps within milliseconds, so wins from a home Mac are rare.</div>
+    <p class="note" id="mevContract" style="overflow-wrap:anywhere" hidden></p>
+    <p class="note" id="mevDeploy" role="status">Waiting for bot status.</p>
   </section>
 
   <section class="grid2">
@@ -251,7 +252,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
   </section>
 </main>
 
-<footer>Runs only on this Mac at http://localhost. No strategy can guarantee profit. Only trade money you can afford to lose.</footer>
+<footer>Runs locally on this computer. No strategy can guarantee profit. Only trade money you can afford to lose.</footer>
 
 <dialog id="armDlg">
   <h3>Arm live trading?</h3>
@@ -260,7 +261,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     <li>It needs <b>USDC + a tiny bit of ETH once</b> (Ethereum mainnet). After that it <b>buys its own gas with USDC</b> (small amounts, capped per day).</li>
     <li>It may buy tokens that pass the pool, history and strategy checks. Long-tail candidates also pass a simulated round trip. New buys are capped by aggregate long-tail exposure.</li>
     <li>Losses are possible. It can hold up to 3 tokens at once (max 45% of equity each). Risk limits: ~2.5% of equity per trade, daily loss stop 6%, max drawdown halt 25%.</li>
-    <li>Back up the private key first. It is stored in your macOS Keychain (see README).</li>
+    <li>Back up the private key first. See the README for storage and export instructions.</li>
   </ul>
   <label class="sub">Type <b>LIVE</b> to confirm</label>
   <input id="armInput" autocomplete="off" spellcheck="false">
@@ -270,11 +271,24 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
   </div>
 </dialog>
 
+<dialog id="mevDeployDlg" aria-labelledby="mevDeployTitle">
+  <h3 id="mevDeployTitle">Deploy FlashArbV2?</h3>
+  <p id="mevDeployGas"></p>
+  <p>The bot wallet will own the contract. Arming live MEV is a separate action.</p>
+  <label class="sub" for="mevDeployInput">Type <b>DEPLOY</b> to confirm</label>
+  <input id="mevDeployInput" autocomplete="off" spellcheck="false">
+  <p id="mevDeployError" class="neg" role="alert" hidden></p>
+  <div class="row" style="justify-content:flex-end">
+    <button id="mevDeployCancel" class="ghost">Cancel</button>
+    <button id="mevDeployConfirm" class="primary" disabled>Deploy FlashArbV2</button>
+  </div>
+</dialog>
+
 <dialog id="mevDlg">
   <h3>Arm MEV arbitrage?</h3>
   <ul>
-    <li id="mevDlgDeploy">First, one transaction deploys the bot's own arbitrage contract (owner = the bot wallet).</li>
-    <li>When a qualifying gap appears, the bot submits a bundle to configured builders. The flash swap supplies the principal, and profit is paid in <b>ETH</b>.</li>
+    <li>Arming checks the FlashArbV2 bytecode and confirms that the bot wallet owns the contract.</li>
+    <li>When a qualifying gap appears, the bot submits a bundle to configured builders. Flash funding supplies the principal, and the bot wallet receives any realized contract profit in <b>ETH</b>.</li>
     <li>The contract enforces a profit floor. Gas is still at risk if a builder includes a transaction that reverts.</li>
     <li>The builder tip is set by MEV_BUILDER_TIP_PCT in .env.</li>
     <li>Expect few or no wins: professional searchers with faster infrastructure take most gaps first.</li>

@@ -90,10 +90,7 @@ On Windows PowerShell, use `curl.exe` for these commands.
 
 ## 4. Arbitrage venues and funding
 
-| Runtime | Pool support | Funding |
-| --- | --- | --- |
-| Legacy FlashArb (default) | Uniswap v2/v3 and SushiSwap v2/v3 WETH pairs | Pool flash swap |
-| FlashArb V2 | Legacy venues plus PancakeSwap v3 and supported hook-free, static-fee Uniswap v4 ETH or WETH pools | Pool funding, Aave V3 WETH flash loans, or Morpho Blue WETH flash loans, subject to route eligibility |
+FlashArbV2 supports Uniswap v2/v3, SushiSwap v2/v3, and PancakeSwap v3 WETH pairs, plus supported hook-free, static-fee Uniswap v4 ETH or WETH pools. Eligible routes can use pool funding, Aave V3 WETH flash loans, or Morpho Blue WETH flash loans. `MEV_FUNDING=auto` compares available sources. Use `pool`, `aave`, or `morpho` to select one source. Aave charges a repayment premium. Morpho Blue has no lender premium and can lend up to its available balance.
 
 The searcher checks canonical factory or PoolManager state. It compares live pool depth, quotes candidate sizes at a consistent block, and rejects candidates that fail the profit floor after gas and any applicable flash-loan premium and builder tip. The V4 scanner restricts compatibility to pool types the contract can settle. Tokens from the public Ethereum token lists are indexed in paced batches. `MEV_UNIVERSE=spot` restricts the sweep to the spot and core universe, and `MEV_MAX_TRACKED_POOLS` limits active per-block reads.
 
@@ -114,7 +111,6 @@ npm run wallet:local-test
 export FORK_RPC_URL='https://your-ethereum-archive-rpc.example'
 npm run fork-test
 npm run wallet:fork-test
-npm run mev-fork-test
 FORK_BLOCK_NUMBER=26451239 npm run mev-v2-fork-test
 ```
 
@@ -124,7 +120,6 @@ FORK_BLOCK_NUMBER=26451239 npm run mev-v2-fork-test
 $env:FORK_RPC_URL = 'https://your-ethereum-archive-rpc.example'
 npm run fork-test
 npm run wallet:fork-test
-npm run mev-fork-test
 $env:FORK_BLOCK_NUMBER = '26451239'
 npm run mev-v2-fork-test
 Remove-Item Env:FORK_BLOCK_NUMBER
@@ -132,36 +127,18 @@ Remove-Item Env:FORK_BLOCK_NUMBER
 
 Ethereum block `26451239` contains the canonical PancakeSwap v3 and Uniswap v4 pools used by the V2 fixture. Choose another archive snapshot by setting `FORK_BLOCK_NUMBER`. Use the `ANVIL` environment variable for a locally installed executable outside your `PATH`.
 
-## 6. Select FlashArb V2 and deploy manually when you are ready
+## 6. Deploy FlashArbV2 from the dashboard
 
-The legacy contract remains the default for existing deployments. To select V2 for paper simulation, set `MEV_CONTRACT_VERSION=v2` and `MEV_FUNDING=auto`. The alternatives `pool`, `aave`, and `morpho` restrict routes to the corresponding funding source. Keep `ALLOW_LIVE_TRADING=off` throughout setup. Aave charges a repayment premium. Morpho Blue has no lender premium but still consumes gas and can only lend its available balance. Compare net profit after repayment, gas, and the builder tip.
+Paper scanning is available after startup. If the live controls are disabled, check `ALLOW_LIVE_TRADING` in `.env`. The default `off` blocks every broadcast, including contract deployment. Both live modes start disarmed on every restart.
 
-FlashArb V2 requires an explicit deployment for live use. The bot verifies the supplied contract runtime and confirms that its `owner()` matches the bot wallet. Successful routes settle the loan and forward net proceeds and relevant route leftovers to the owner. An owner-only recovery path handles assets transferred to the contract outside a route.
+1. To allow a real mainnet deployment, set `ALLOW_LIVE_TRADING=on` in `.env` and restart the bot. Use `npm run service:restart` for the installed macOS service, or stop and restart `npm start` for a foreground run.
+2. Open [the local dashboard](http://127.0.0.1:7777), wait for the bot to be ready, and select **Deploy FlashArbV2**. Review the gas estimate. The bot wallet must have enough ETH to pay the real mainnet fee.
+3. Type `DEPLOY` and authorize the action with the password from `npm run --silent dashboard:password`. The bot waits for the receipt and verifies the deployed bytecode and wallet ownership.
+4. **Arm MEV** separately when you want live arbitrage. Spot trading has its own arming control. To return to paper-only operation, set `ALLOW_LIVE_TRADING=off` and restart.
 
-To build the raw creation data locally, install `solc` 0.8.26 and run the contract and TypeScript builds. The command displays public deployment data.
+The dashboard reuses a verified V2 deployment. To adopt a manually deployed copy, set `MEV_V2_CONTRACT_ADDRESS` to the FlashArbV2 address owned by the bot wallet and restart. The bot verifies its runtime and owner before use. Ethereum keeps prior V1 deployments and their transaction history on-chain. The current bot uses FlashArbV2.
 
-```sh
-npm run build:contract -- v2
-npm run build
-npm run --silent mev:v2:bytecode
-```
-
-For a manual deployment using Cast, import the bot owner key interactively into an encrypted keystore. Use the local protected key backup and keep the raw key out of shell arguments.
-
-```sh
-cast wallet import bot-owner --interactive
-cast wallet address --account bot-owner
-```
-
-Before sending any deployment transaction, confirm that the wallet address equals `npm run --silent wallet:address` and that the chosen deployment RPC reports chain ID `1`. A mainnet contract deployment costs real ETH. Once you intentionally choose to deploy, you can send the compiled creation data from that owner account. These are Bash commands. On Windows use a compatible shell or WSL for the deployment command.
-
-```sh
-cast chain-id --rpc-url "$DEPLOY_RPC_URL"
-creation_data=$(npm run --silent mev:v2:bytecode)
-cast send --create "$creation_data" --account bot-owner --rpc-url "$DEPLOY_RPC_URL"
-```
-
-`DEPLOY_RPC_URL` is your chosen Ethereum transaction endpoint for this manual step. After confirmation, record the receipt's `contractAddress`. Add `MEV_V2_CONTRACT_ADDRESS` to `.env`, keep `MEV_CONTRACT_VERSION=v2` and `ALLOW_LIVE_TRADING=off`, then restart and verify paper mode. Keep the previous deployment record and `MEV_CONTRACT_ADDRESS` if you plan to return to the legacy version. Resolve pending wallet operations before switching versions.
+Successful routes settle the loan and forward net proceeds and relevant route leftovers to the owner. An owner-only recovery path handles assets transferred to the contract outside a route. For manual deployment, use `npm run --silent mev:v2:bytecode` to obtain the public creation data and deploy from the bot wallet on Ethereum mainnet. If you change the Solidity source, rebuild it with `npm run build:contract` using `solc` 0.8.26, then run `npm run build`.
 
 ## Commands and key settings
 
@@ -184,7 +161,7 @@ cast send --create "$creation_data" --account bot-owner --rpc-url "$DEPLOY_RPC_U
 | `ALLOW_LIVE_TRADING` | Master signing switch. Off by default. |
 | `PORT`, `DATA_DIR`, `WALLET_KEY_FILE` | Local dashboard port, state directory and optional protected key import. |
 | `TOKEN_MODE`, `TOKEN_LIST_URLS`, `MEV_UNIVERSE` | Spot token strategy and separate MEV list scope. |
-| `MEV_CONTRACT_VERSION`, `MEV_CONTRACT_ADDRESS`, `MEV_V2_CONTRACT_ADDRESS` | Version selection and verified deployment addresses. |
+| `MEV_V2_CONTRACT_ADDRESS` | Optional existing FlashArbV2 deployment owned by the bot wallet. |
 | `MEV_FUNDING`, `MEV_MIN_POOL_WETH`, `MEV_MIN_NET_USD` | V2 funding selection, depth and profit floors. |
 | `MEV_BUILDERS`, `MEV_BUILDER_TIP_PCT`, `MEV_MAX_TRACKED_POOLS`, `MEV_MAX_SIMS_PER_BLOCK` | Bundle destinations, builder bid, active read budget and candidate simulation budget. |
 
