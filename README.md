@@ -203,7 +203,7 @@ The dashboard can run a separate Arbitrum One scanner and a Solana scanner along
 
 ### Arbitrum One
 
-Set `ARBITRUM=on` to start scanning Aave V3 WETH flash-loan routes across Uniswap v3 and hook-free v4 pools. Set `ARBITRUM_RPC_URL` if you have a dedicated provider. The public fallback is the official Arbitrum One RPC. The scanner queries chain ID 42161 and uses the Arbitrum L2 block number for deadlines.
+Set `ARBITRUM=on` to start scanning Aave V3 WETH flash-loan routes across Uniswap v3 and hook-free v4 pools. The scanner discovers liquid pools for USDC, USDC.e, USDT, WBTC, ARB, LINK, GMX, wstETH, and rETH against WETH or native ETH. Set `ARBITRUM_RPC_URL` if you have a dedicated provider. The public fallback is the official Arbitrum One RPC. The scanner queries chain ID 42161 and uses the Arbitrum L2 block number for deadlines.
 
 ```sh
 npm run build
@@ -230,10 +230,10 @@ The upgrade deploys the new implementation and activates it in one transaction a
 
 With `ARBITRUM_LIVE=on` and global signing enabled, the worker submits qualifying routes after a pending-state simulation. Default limits are $0.50 per transaction, $2 over 24 hours and at least $0.05 modeled net after padded fees. An included revert still costs gas.
 
-To test with fake funds on a pinned Arbitrum archive fork:
+To test with fake funds, use an Arbitrum archive endpoint with state access at the selected L2 block.
 
 ```sh
-FORK_RPC_URL=https://arb1.arbitrum.io/rpc FORK_BLOCK_NUMBER=525952800 node scripts/fork-test.mjs cli-arbitrum-contract-forktest
+FORK_RPC_URL='<Arbitrum archive RPC URL>' FORK_BLOCK_NUMBER='<L2 block number>' node scripts/fork-test.mjs cli-arbitrum-contract-forktest
 ```
 
 ### Solana

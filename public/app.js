@@ -173,7 +173,8 @@ function renderNetworkSettlement(network, pending, outcome) {
     const fee = network === 'arbitrum'
       ? (Number.isFinite(outcome.gasUsd) ? networkUsd(outcome.gasUsd) : '')
       : (Number.isFinite(outcome.feeLamports) ? networkGas(outcome.feeLamports / 1e9, 'SOL') : '');
-    links.push(`<span>${receipt}${Number.isFinite(profit) ? ` · ${networkUsd(profit)} net` : ''}${fee ? ` · ${fee} fee` : ''}</span>`);
+    const loan = Number.isFinite(outcome.loanUsd) ? ` · ${networkUsd(outcome.loanUsd)} loan` : '';
+    links.push(`<span>${receipt}${loan}${Number.isFinite(profit) ? ` · ${networkUsd(profit)} net` : ''}${fee ? ` · ${fee} fee` : ''}</span>`);
   }
   setNetworkMarkup(network + 'Settlement', links.join('') || '<span class="sub">No settled transaction recorded.</span>');
 }

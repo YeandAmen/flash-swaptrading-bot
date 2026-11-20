@@ -21,6 +21,10 @@ const tokens = [
   ['USDT', '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9'],
   ['WBTC', '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f'],
   ['ARB', '0x912ce59144191c1204e64559fe8253a0e49e6548'],
+  ['LINK', '0xf97f4df75117a78c1a5a0dbb814af92458539fb4'],
+  ['GMX', '0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a'],
+  ['wstETH', '0x5979d7b546e38e414f7e9822514be443a4800529'],
+  ['rETH', '0xec70dcb4a1efa46b8f2d97c310c9c4790ba5ffa8'],
 ] as const;
 const tiers = [[100, 1], [500, 10], [3000, 60], [10000, 200]] as const;
 const amounts = ['0.05', '0.25', '1', '4', '16'].map((size) => parseEther(size));

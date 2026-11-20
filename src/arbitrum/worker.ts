@@ -19,7 +19,7 @@ const txLimitUsd = 0.50;
 const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
 type Pending = { hash: Hash; nonce: number; ethUsd: number; budgetUsd: number };
-type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'replaced'; gasUsd: number; netUsd: number; at: number };
+type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'replaced'; gasUsd: number; netUsd: number; at: number; loanUsd?: number };
 type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest };
 
 export class ArbitrumWorker {
@@ -238,8 +238,12 @@ export class ArbitrumWorker {
   private save(next: Journal) {
     const outcome = next.recent[0];
     if (outcome && next.test?.status === 'submitted' && next.test.hash === outcome.hash) {
-      next = { ...next, test: { ...next.test, status: outcome.status === 'landed' ? 'landed' : 'failed',
-        note: `Confirmed ${outcome.status}. Gas $${outcome.gasUsd.toFixed(4)}, net $${outcome.netUsd.toFixed(4)}.` } };
+      const meetsProfit = next.test.minimumNetUsd === undefined || outcome.netUsd >= next.test.minimumNetUsd;
+      const meetsLoan = next.test.minimumLoanUsd === undefined || (outcome.loanUsd ?? 0) >= next.test.minimumLoanUsd;
+      const passed = outcome.status === 'landed' && meetsProfit && meetsLoan;
+      const belowFloor = outcome.status === 'landed' && !passed ? ' The receipt did not meet the requested loan or profit floor.' : '';
+      next = { ...next, test: { ...next.test, status: passed ? 'landed' : 'failed',
+        note: `Confirmed ${outcome.status}. Gas $${outcome.gasUsd.toFixed(4)}, net $${outcome.netUsd.toFixed(4)}.${belowFloor}` } };
     }
     writeJson(journalFile, next);
     if (outcome && this.journal?.recent[0]?.hash !== outcome.hash) this.logSettlement(outcome);
@@ -260,16 +264,16 @@ export class ArbitrumWorker {
       }, ...journal.recent.filter((row) => row.at > Date.now() - dayMs)] });
       return;
     }
-    const [event] = parseEventLogs({
-      abi: ARBITRUM_FLASH_ARB_ABI, eventName: 'Arbitrage',
-      logs: receipt.logs.filter((log) => isAddressEqual(log.address, this.contract)),
-    });
+    const logs = receipt.logs.filter((log) => isAddressEqual(log.address, this.contract));
+    const [event] = parseEventLogs({ abi: ARBITRUM_FLASH_ARB_ABI, eventName: 'Arbitrage', logs });
+    const [funding] = parseEventLogs({ abi: ARBITRUM_FLASH_ARB_ABI, eventName: 'FundedBy', logs });
     const fee = receipt.gasUsed * receipt.effectiveGasPrice;
     const landed = receipt.status === 'success' && event;
     const proceeds = landed ? event.args.profit - event.args.tip : 0n;
     this.save({ ...journal, pending: null, recent: [{
       hash: pending.hash, status: landed ? 'landed' : 'reverted', gasUsd: Number(formatEther(fee)) * pending.ethUsd,
       netUsd: Number(formatEther(proceeds - fee)) * pending.ethUsd, at: Date.now(),
+      loanUsd: landed && funding ? Number(formatEther(funding.args.amount)) * pending.ethUsd : undefined,
     }, ...journal.recent.filter((row) => row.at > Date.now() - dayMs)] });
   }
 }
