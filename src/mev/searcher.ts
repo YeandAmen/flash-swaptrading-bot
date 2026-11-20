@@ -35,6 +35,7 @@ const FALLBACK_LEAD_MS = 5_000;
 const CADENCE_RECHECK_MS = 60_000;
 const GAS_ONLY_TEST_MS = 6 * 60_000;
 const GAS_ONLY_TEST_ROUTES = 4;
+const MAX_PRIVATE_GAS_ONLY_TEST_USD = 0.25;
 const TEST_ID = /^[A-Za-z0-9_-]{8,80}$/;
 const HEAD_RETRY_MS = 400;
 const POOL_READS_PER_CHUNK = 160;
@@ -776,8 +777,11 @@ export class MevSearcher {
       const offers = routes.flatMap((route) => route?.primary
         ? route.fallback ? [route.primary, route.fallback] : [route.primary] : []);
       const prepared = await Promise.all(offers.map((offer) => this.prepareLive(offer, r, policy, test)));
-      const ranked = prepared.filter((offer) => offer !== null)
-        .sort((a, b) => a.net > b.net ? -1 : a.net < b.net ? 1 : 0);
+      const ranked = prepared.filter((offer) => offer !== null).sort((a, b) => {
+        const left = test.requireGasCoverage ? a.net : a.offer.profit;
+        const right = test.requireGasCoverage ? b.net : b.offer.profit;
+        return left > right ? -1 : left < right ? 1 : 0;
+      });
       for (const offer of ranked) {
         if (!canTry()) break;
         await this.sendLive(offer, r, generation);
@@ -853,8 +857,9 @@ export class MevSearcher {
     const previousAmount = previous && Date.now() - previous.at < 10 * 60_000 ? previous.amount : undefined;
     const sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previousAmount, limit, broadenSizes);
     if (!sizes.length) return null;
+    const lenderOnlyTest = test?.requireGasCoverage === false && !test.privateSubmission;
     const trials = fundingTrials(MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark)
-      .filter(({ funding }) => funding !== 0 || (test?.requireGasCoverage !== false && c.A.kind !== NextVenueKind.CurveTricrypto));
+      .filter(({ funding }) => funding !== 0 || (!lenderOnlyTest && c.A.kind !== NextVenueKind.CurveTricrypto));
     if (!trials.length) return null;
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));
     st.rpcCalls += sims.length;
@@ -1022,7 +1027,7 @@ export class MevSearcher {
     const { candidate: c, opp } = offer;
     const gasOnly = test?.requireGasCoverage === false;
     if (test && (this.activeGasOnlyTest() !== test || MEV.submission !== 'direct'
-      || (gasOnly && offer.funding === 0) || offer.profit < 1n)) return null;
+      || (gasOnly && !test.privateSubmission && offer.funding === 0) || offer.profit < 1n)) return null;
     if (!contract) return this.skipOpportunity(opp, `verified ${this.contractLabel} unavailable`);
     if (!this.canMeetSendDeadline(r)) return this.skipOpportunity(opp, 'too late to prepare a fresh send');
     const ethUsd = this.host.ethUsd();
@@ -1055,7 +1060,7 @@ export class MevSearcher {
       if (direct) {
         const now = Date.now();
         // A deadline-protected test bids as high as its padded gas and profit limits allow.
-        const ordinaryTip = test?.privateSubmission ? priorityCap : preferredTip < priorityCap ? preferredTip : priorityCap;
+        const ordinaryTip = test?.privateSubmission && !gasOnly ? priorityCap : preferredTip < priorityCap ? preferredTip : priorityCap;
         const minimumTip = priorityCap < MIN_PRIORITY_FEE_WEI ? priorityCap : MIN_PRIORITY_FEE_WEI;
         const maxGasUsd = Math.min(this.availableDirectGasUsd(now), test?.maximumGasUsd ?? Infinity);
         const maxGasWei = loanLimitWei(maxGasUsd, ethUsd);
@@ -1176,7 +1181,7 @@ export class MevSearcher {
       };
       const queued = direct ? this.activeGasOnlyTest() : null;
       const matched = queued && signingGasUsd <= queued.maximumGasUsd
-        && (offer.funding !== 0 || queued.requireGasCoverage) && (!queued.privateSubmission || privateSubmission) ? queued : null;
+        && (offer.funding !== 0 || queued.requireGasCoverage || queued.privateSubmission) && (!queued.privateSubmission || privateSubmission) ? queued : null;
       Object.assign(opp, {
         gasOnlyTestId: matched?.id,
         hash, status: 'sent', gasEth: submission.gasEth, tipEth: submission.tipEth,
@@ -1476,7 +1481,9 @@ export class MevSearcher {
       throw new Error('A verified, armed direct proxy with an available wallet is required for a test.');
     }
     if (this.activeGasOnlyTest()) throw new Error('A gas-only test is already queued.');
-    if (privateSubmission && !requireGasCoverage) throw new Error('Private tests require full gas coverage.');
+    if (privateSubmission && !requireGasCoverage && maximumGasUsd > MAX_PRIVATE_GAS_ONLY_TEST_USD) {
+      throw new Error('A private gas-only test must have a gas cap of at most $0.25.');
+    }
     this.queuedTest = { id, maximumGasUsd, requireGasCoverage, privateSubmission, expiresAt: Date.now() + GAS_ONLY_TEST_MS, blocksChecked: 0, routesChecked: 0 };
     const coverage = requireGasCoverage ? ' requiring full gas coverage' : '';
     this.host.log('[mev] One flash-loan test queued' + coverage + ' with a gas cap of $' + maximumGasUsd.toFixed(2) + '.');

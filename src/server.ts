@@ -272,8 +272,7 @@ app.post('/api/mev/test-once', (req, res) => {
   const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false } = req.body ?? {};
   if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)
     || typeof maximumGasUsd !== 'number' || !Number.isFinite(maximumGasUsd) || maximumGasUsd <= 0
-    || typeof requireGasCoverage !== 'boolean' || typeof privateSubmission !== 'boolean'
-    || (privateSubmission && !requireGasCoverage)) {
+    || typeof requireGasCoverage !== 'boolean' || typeof privateSubmission !== 'boolean') {
     res.status(400).json({ error: 'Confirm TEST with a request ID, maximum gas cost, and optional gas coverage requirement.' });
     return;
   }
