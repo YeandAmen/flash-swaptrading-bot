@@ -21,8 +21,7 @@ const rent = 4_079_040;
 const walletBalance = 20_000_000;
 const expires = 150n;
 
-function testCandidate(wallet: Address): PreparedSolanaCycle {
-  const blockhash = '11111111111111111111111111111111';
+function testCandidate(wallet: Address, blockhash = '11111111111111111111111111111111'): PreparedSolanaCycle {
   assertIsBlockhash(blockhash);
   const sequence = [LIGHTHOUSE, LIGHTHOUSE, KAMINO, JUPITER, JUPITER, KAMINO, LIGHTHOUSE, LIGHTHOUSE];
   const message = appendTransactionMessageInstructions(sequence.map((programAddress) => ({ programAddress })),
@@ -44,7 +43,7 @@ test('Solana journals before raw send and restores one pending signature across 
   const { address: wallet, keyPair } = await createKeyPairSignerFromPrivateKeyBytes(seed);
   const publicBytes = new Uint8Array(await crypto.subtle.exportKey('raw', keyPair.publicKey));
   writePrivateFile(keyFile, JSON.stringify([...seed, ...publicBytes]));
-  const candidate = testCandidate(wallet);
+  let candidate = testCandidate(wallet);
   let slot = 91;
   let height = 80;
   let blockhashValid = true;
@@ -165,6 +164,23 @@ test('Solana journals before raw send and restores one pending signature across 
   assert.equal(restarted.summary.lastOutcome?.status, 'failed');
   assert.equal(restarted.summary.spentFeeLamports, fee);
   assert.equal(restarted.summary.lastOutcome?.walletDebitLamports, fee);
+
+  // A missed signature only expires after the finalized height and history checks agree.
+  finalizedReceipt = 'none';
+  candidate = testCandidate(wallet, USDC);
+  await restarted.submit(candidate);
+  assert.equal(rawSendCount, 2);
+  assert.equal(restarted.summary.pending, pendingSignature);
+  height = 153;
+  slot = 201;
+  await restarted.reconcile();
+  assert.equal(restarted.summary.pending, pendingSignature);
+  blockhashValid = false;
+  await restarted.reconcile();
+  assert.equal(restarted.summary.pending, null);
+  assert.equal(restarted.summary.lastOutcome?.status, 'expired');
+  assert.equal(restarted.summary.spentFeeLamports, fee);
+
   restarted.disarm();
   restarted.stop();
 

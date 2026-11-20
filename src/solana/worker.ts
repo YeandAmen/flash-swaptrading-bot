@@ -21,6 +21,11 @@ const MIN_BLOCKS_TO_EXPIRY = 5n;
 const MAX_BLOCKS_TO_EXPIRY = 160n;
 const DAY_MS = 86_400_000;
 const LIVE_COMMITMENT = 'confirmed';
+const LIVE_PROGRAMS = new Set<Address>([
+  KAMINO, JUPITER, LIGHTHOUSE,
+  address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'),
+  address('ComputeBudget111111111111111111111111111111'),
+]);
 
 type Rpc = ReturnType<typeof createSolanaRpc>;
 type AssetBalances = readonly { mint: Address; owner?: Address; uiTokenAmount: { amount: string } }[] | null | undefined;
@@ -206,6 +211,7 @@ export class SolanaLiveWorker {
     return {
       ready, armed: ready && this.journal?.armed === true, wallet: this.wallet,
       status: this.status, pending: pending?.signature ?? null,
+      pendingFeeLamports: pending ? Number(pending.feeLamports) : 0,
       lastOutcome: this.journal?.lastOutcome ?? null,
       spentFeeLamports: Number(this.spentFees()), dailyFeeCapLamports: Number(DAILY_FEE_CAP),
       nativeReserveLamports: Number(NATIVE_RESERVE), minimumNetUsdc: Number(this.minimumNet) / 1_000_000,
@@ -312,8 +318,9 @@ export class SolanaLiveWorker {
         return;
       }
       const programs = compiled.instructions.map((ix) => compiled.staticAccounts[ix.programAddressIndex]);
-      if (programs.filter((program) => program === KAMINO).length !== 2
-        || programs.filter((program) => program === JUPITER).length !== 2
+      const cycle = programs.filter((program) => program === KAMINO || program === JUPITER);
+      if (programs.some((program) => !LIVE_PROGRAMS.has(program)) || cycle.length !== 4
+        || cycle[0] !== KAMINO || cycle[1] !== JUPITER || cycle[2] !== JUPITER || cycle[3] !== KAMINO
         || programs.filter((program) => program === LIGHTHOUSE).length < 4 || programs.at(-1) !== LIGHTHOUSE) {
         this.status = 'Solana candidate is missing complete swap or profit assertions';
         return;
@@ -341,6 +348,7 @@ export class SolanaLiveWorker {
       const measured = simulation.err ? null : accountOutcome(simulation, this.wallet, candidate.loan, candidate.firstMinimum);
       if (context.slot < head.absoluteSlot || context.slot - candidate.simulationSlot > MAX_CANDIDATE_AGE_SLOTS
         || !measured || measured.fee !== candidate.feeLamports || measured.cost > candidate.maximumLamportDebit
+        || (simulation.postBalances?.[0] ?? 0n) < NATIVE_RESERVE
         || !measured.wsolPreserved || measured.net === null || measured.net < this.minimumNet) {
         this.status = 'Solana final simulation did not satisfy the profit and cost guards';
         return;
@@ -351,6 +359,7 @@ export class SolanaLiveWorker {
       if (!canSend()) return;
       const wire = getBase64EncodedWireTransaction(signed);
       const sig = getSignatureFromTransaction(signed);
+      if (this.journal.lastOutcome?.signature === sig) return;
       const pending: Pending = {
         signature: sig, blockhash, lastValidBlockHeight: candidate.lastValidBlockHeight.toString(),
         minContextSlot: context.slot.toString(), feeLamports: candidate.feeLamports.toString(),
