@@ -217,7 +217,18 @@ npm run arbitrum:quote
 ALLOW_LIVE_TRADING=on npm run arbitrum:deploy -- 2
 ```
 
-Set `ARBITRUM_EXECUTOR_ADDRESS` to the verified address returned by the command and restart the service. The deployment command records its hash before broadcast and reconciles that hash on retry. The worker verifies the deployed bytecode and owner. With `ARBITRUM_LIVE=on` and global signing enabled, it submits qualifying routes after a pending-state simulation. The initial limits are $0.50 per transaction, $2 over 24 hours and at least $0.05 modeled net after padded fees. An included revert still costs gas.
+New deployments create an ERC-1967 proxy and its first implementation in one transaction. Set `ARBITRUM_EXECUTOR_ADDRESS` to the verified proxy address, `ARBITRUM_DEPLOYMENT_TX` to its deployment transaction hash, and `ARBITRUM_RELEASE_HASH` to the reported implementation runtime hash. Restart the service. The worker verifies the proxy bytecode, admin, trading owner and implementation bytecode before signing, then pins the expected implementation in each trade.
+
+For a later release with a new implementation, disarm Arbitrum and wait for any pending transaction to settle. Build the new release, keep `ARBITRUM_EXECUTOR_ADDRESS` set to the proxy, and keep `ARBITRUM_RELEASE_HASH` set to the currently installed implementation for the upgrade.
+
+```sh
+npm run arbitrum:upgrade:quote
+ALLOW_LIVE_TRADING=on npm run arbitrum:upgrade -- 2
+```
+
+The upgrade deploys the new implementation and activates it in one transaction at the existing proxy address. Once verified, record the new `ARBITRUM_RELEASE_HASH`, restart, and re-arm Arbitrum. The deployment and upgrade commands journal each signed transaction before broadcasting and reconcile its hash on retry. A standalone executor stays supported while migrating to the new proxy.
+
+With `ARBITRUM_LIVE=on` and global signing enabled, the worker submits qualifying routes after a pending-state simulation. Default limits are $0.50 per transaction, $2 over 24 hours and at least $0.05 modeled net after padded fees. An included revert still costs gas.
 
 To test with fake funds on a pinned Arbitrum archive fork:
 

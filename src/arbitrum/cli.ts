@@ -5,9 +5,12 @@ import { arbitrumChainId, arbitrumClient, discoverArbitrumPools, scanArbitrum } 
 
 try {
   const command = process.argv[2] ?? 'scan';
-  if (command === 'deploy' || command === 'quote') {
+  if (['deploy', 'quote', 'upgrade', 'upgrade-quote'].includes(command)) {
     const owner = (process.env.ARBITRUM_OWNER_ADDRESS ?? '') as Address;
-    console.log(JSON.stringify(await deployArbitrum(command === 'deploy', Number(process.argv[3] ?? 2), owner), null, 2));
+    const upgrade = command === 'upgrade' || command === 'upgrade-quote';
+    const proxy = upgrade ? (process.env.ARBITRUM_EXECUTOR_ADDRESS ?? '') as Address : undefined;
+    console.log(JSON.stringify(await deployArbitrum(command === 'deploy' || command === 'upgrade',
+      Number(process.argv[3] ?? 2), owner, proxy), null, 2));
   } else if (command === 'scan') {
     const client = arbitrumClient(process.env.ARBITRUM_RPC_URL);
     if (await client.getChainId() !== arbitrumChainId) throw new Error('RPC is not Arbitrum One');
@@ -17,7 +20,7 @@ try {
     console.log(JSON.stringify({ mode: 'paper', block: Number(block), markets: markets.length,
       pools: markets.reduce((total, market) => total + market.pools.length, 0), quotedRoutes, best }, null, 2));
   } else {
-    throw new Error('Use scan, quote, or deploy');
+    throw new Error('Use scan, quote, deploy, upgrade-quote, or upgrade');
   }
 } catch (error) {
   console.error(redactDiagnostic(error instanceof Error ? error.message.split('\n')[0] : String(error)));

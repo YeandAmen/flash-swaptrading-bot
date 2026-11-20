@@ -6,6 +6,7 @@ import {
   type Address, type AddressesByLookupTableAddress, type TransactionMessageBytesBase64, type Instruction, type Transaction,
 } from '@solana/kit';
 import { redactDiagnostic } from '../diagnostics.js';
+import type { FlashTest } from '../network-test.js';
 import { lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
 import {
   createKaminoFlashInstructions, createWalletAta, decodeKaminoUsdcReserve, decodeLookupTable, kaminoRepayment,
@@ -25,6 +26,7 @@ const routeV2 = Buffer.from('bb64facc31c4af14', 'hex');
 const addressDecoder = getAddressDecoder();
 const VENUES = ['Whirlpool', 'Raydium CLMM'] as const;
 const JUPITER_BUILD = 'https://api.jup.ag/swap/v2/build';
+export const SOLANA_TEST_MAX_FEE_LAMPORTS = 50_000n;
 
 type Rpc = ReturnType<typeof createSolanaRpc>;
 type Venue = typeof VENUES[number];
@@ -54,6 +56,8 @@ export interface SolanaScanConfig {
   minNetUsdc?: number;
   maxFeeLamports?: number;
 }
+
+export type SolanaFlashTest = Pick<FlashTest, 'id' | 'minimumNetUsd' | 'minimumLoanUsd'>;
 
 export interface PreparedSolanaCycle {
   testId?: string;
@@ -110,11 +114,21 @@ export function solanaScanConfig(env: NodeJS.ProcessEnv = process.env): SolanaSc
   };
 }
 
-function usdcAmount(value: number, minimum: number, maximum: number, label: string): bigint {
+function usdcAmount(value: number, minimum: number, maximum: number, label: string, round = Math.round): bigint {
   if (!Number.isFinite(value) || value < minimum || value > maximum) {
     throw new Error(`${label} must be between ${minimum} and ${maximum} USDC`);
   }
-  return BigInt(Math.round(value * Number(USDC_UNITS)));
+  return BigInt(round(value * Number(USDC_UNITS)));
+}
+
+// A requested minimum is an inclusive floor in atomic USDC units, so sub-unit rounding is upward.
+export function solanaTestMinimums(test?: Pick<SolanaFlashTest, 'minimumNetUsd' | 'minimumLoanUsd'> | null) {
+  return {
+    minimumNet: test?.minimumNetUsd === undefined ? undefined
+      : usdcAmount(test.minimumNetUsd, Number.MIN_VALUE, 1_000, 'Test minimum net profit', Math.ceil),
+    minimumLoan: test?.minimumLoanUsd === undefined ? undefined
+      : usdcAmount(test.minimumLoanUsd, 1, 100_000, 'Test minimum loan size', Math.ceil),
+  };
 }
 
 function rawAmount(value: string): bigint {
@@ -253,16 +267,21 @@ function summarizeFailure(error: unknown, apiKey?: string): string {
 
 /** Build and simulate an unsigned mainnet transaction. Only the live worker can authorize a qualified candidate. */
 export async function scanSolanaCycle(config: SolanaScanConfig,
-  execute?: (candidate: PreparedSolanaCycle) => Promise<void>, testId?: string): Promise<SolanaScanResult> {
+  execute?: (candidate: PreparedSolanaCycle) => Promise<void>, requestedTest?: SolanaFlashTest | string): Promise<SolanaScanResult> {
   if (!config.wallet) throw new Error('Set SOLANA_WALLET_ADDRESS to the public address of your Solana wallet');
   const wallet = address(config.wallet);
-  const loan = usdcAmount(config.loanUsdc ?? 250, 1, 100_000, 'Loan size');
-  const test = Boolean(execute && testId);
-  const minimumNet = test ? 1n : usdcAmount(config.minNetUsdc ?? 0.05, 0.000001, 1_000, 'Minimum net profit');
-  const maxFeeLamports = config.maxFeeLamports ?? 50_000;
-  if (!Number.isSafeInteger(maxFeeLamports) || maxFeeLamports < 5_000 || maxFeeLamports > 5_000_000) {
+  const test = execute && requestedTest ? (typeof requestedTest === 'string' ? { id: requestedTest } : requestedTest) : null;
+  const limits = solanaTestMinimums(test);
+  const configuredLoan = usdcAmount(config.loanUsdc ?? 250, 1, 100_000, 'Loan size');
+  const loan = limits.minimumLoan !== undefined && limits.minimumLoan > configuredLoan ? limits.minimumLoan : configuredLoan;
+  const gasOnlyTest = !!test && limits.minimumNet === undefined;
+  const minimumNet = gasOnlyTest ? 1n : limits.minimumNet ?? usdcAmount(config.minNetUsdc ?? 0.05, 0.000001, 1_000, 'Minimum net profit');
+  const configuredFee = config.maxFeeLamports ?? 50_000;
+  if (!Number.isSafeInteger(configuredFee) || configuredFee < 5_000 || configuredFee > 5_000_000) {
     throw new Error('Maximum network fee must be between 5,000 and 5,000,000 lamports');
   }
+  const maxFeeLamports = test && BigInt(configuredFee) > SOLANA_TEST_MAX_FEE_LAMPORTS
+    ? SOLANA_TEST_MAX_FEE_LAMPORTS : BigInt(configuredFee);
   const rpcUrl = config.rpcUrl ?? SOLANA_PUBLIC_RPC;
   const protocol = new URL(rpcUrl).protocol;
   if (protocol !== 'https:' && protocol !== 'http:') throw new Error('Solana RPC requires an HTTP(S) endpoint');
@@ -340,10 +359,10 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         const encoded = getBase64Decoder().decode(transaction.messageBytes) as TransactionMessageBytesBase64;
         const feeQuote = await rpc.getFeeForMessage(encoded, { commitment: COMMITMENT, minContextSlot: requiredSlot }).send(deadline());
         exactFee = feeQuote.value;
-        if (exactFee === null || exactFee > BigInt(maxFeeLamports)) throw new Error('Solana fee quote exceeds its cap or is unavailable');
+        if (exactFee === null || exactFee > maxFeeLamports) throw new Error('Solana fee quote exceeds its cap or is unavailable');
         maxDebit = exactFee + baseline.rent;
         if (baseline.lamports <= maxDebit) throw new Error('Solana fee payer cannot cover the fee and required ATA rent');
-        const requiredUsdc = minimumNet + nativeCostInUsdc(test ? baseline.rent : maxDebit, loan, firstMinimum);
+        const requiredUsdc = minimumNet + nativeCostInUsdc(gasOnlyTest ? baseline.rent : maxDebit, loan, firstMinimum);
         if (beforeNetwork < requiredUsdc) return { buy, sell, status: 'below-profit-floor', quotedNetBeforeNetworkUsdc: quote };
         transaction = await assemble([
           lighthouseLamports(wallet, 'equal', baseline.lamports - exactFee),
@@ -381,12 +400,12 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       const costUsdc = nativeCostInUsdc(costLamports, loan, firstMinimum);
       const net = postUsdc - preUsdc - costUsdc;
       // A functional test can lose only the network fee. Any account rent is still covered by the swap.
-      const protectedLamports = test ? costLamports - fee : costLamports;
+      const protectedLamports = gasOnlyTest ? costLamports - fee : costLamports;
       const protectedCost = nativeCostInUsdc(protectedLamports, loan, firstMinimum);
-      const qualified = fee <= BigInt(maxFeeLamports) && postUsdc - preUsdc >= protectedCost + minimumNet
+      const qualified = fee <= maxFeeLamports && postUsdc - preUsdc >= protectedCost + minimumNet
         && beforeNetwork >= protectedCost + minimumNet && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
       if (qualified && baseline && exactFee !== null) {
-        candidates.push({ ...(test ? { testId } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight, simulationSlot: execution.slot,
+        candidates.push({ ...(test ? { testId: test.id } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight, simulationSlot: execution.slot,
           maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports: baseline.rent, firstMinimum, loan, net });
       }
       return {

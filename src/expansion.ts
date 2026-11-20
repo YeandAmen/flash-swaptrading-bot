@@ -1,5 +1,6 @@
 import { CONFIG, DATA_DIR } from './config.js';
 import { redactDiagnostic } from './diagnostics.js';
+import type { FlashTestOptions } from './network-test.js';
 import { NetworkActivity } from './network-activity.js';
 import { LIGHTHOUSE } from './solana/guard.js';
 import { JUPITER, KAMINO } from './solana/protocol.js';
@@ -20,6 +21,7 @@ let verifiedGuardLogged = false;
 let loggedSignature: string | null = null;
 let loggedOutcome: string | null = null;
 const solanaTestSizes = [50, 250, 1000, 10] as const;
+const solanaProfitTestMultipliers = [1, 2, 5, 10] as const;
 let solanaTestScans = 0;
 let stopping = false;
 const schedule = new Set<ReturnType<typeof setTimeout>>();
@@ -62,10 +64,12 @@ export function startExpansion() {
     const execution = !liveError && worker?.summary.armed && worker.summary.ready && !worker.summary.pending ? worker : null;
     const test = execution?.activeTest();
     if (test) {
-      config.loanUsdc = solanaTestSizes[solanaTestScans % solanaTestSizes.length];
+      config.loanUsdc = test.minimumNetUsd === undefined
+        ? solanaTestSizes[solanaTestScans % solanaTestSizes.length]
+        : Math.min(100_000, (test.minimumLoanUsd ?? 500) * solanaProfitTestMultipliers[solanaTestScans % solanaProfitTestMultipliers.length]);
       solanaTestScans += 1;
     }
-    solanaResult = await scanSolanaCycle(config, execution ? (candidate) => execution.submit(candidate) : undefined, test?.id);
+    solanaResult = await scanSolanaCycle(config, execution ? (candidate) => execution.submit(candidate) : undefined, test ?? undefined);
     if (test) execution?.recordTestScan(test.id, solanaResult.routes.length);
     const quoteFailure = solanaResult.routes.length > 0 && solanaResult.routes.every((route) => route.status === 'quote-error')
       ? solanaResult.routes[0].detail ?? 'The venue quotes are unavailable' : null;
@@ -113,11 +117,11 @@ export function expansionView() {
   } };
 }
 
-export function queueArbitrumTest(id: string) { arbitrum.queueTest(id); }
+export function queueArbitrumTest(id: string, options?: FlashTestOptions) { arbitrum.queueTest(id, options); }
 
-export function queueSolanaTest(id: string) {
+export function queueSolanaTest(id: string, options?: FlashTestOptions) {
   if (!solanaLive) throw new Error('Solana live wallet is not ready');
-  solanaLive.queueTest(id);
+  solanaLive.queueTest(id, options);
   solanaActivity.record('info', 'Queued one Solana mainnet flash-loan test');
 }
 

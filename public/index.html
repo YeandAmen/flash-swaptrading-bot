@@ -30,9 +30,8 @@ main{max-width:1320px;margin:0 auto;padding:18px 20px 60px;display:grid;gap:16px
 .banner.ok{border-color:#1f5a40;background:#0f2219}
 .banner.warn{border-color:#5a4718;background:#211b0d}
 .banner.bad{border-color:#5c2228;background:#220f12}
-.grid3{display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:16px}
 .grid2{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}
-@media (max-width:1000px){.grid3,.grid2{grid-template-columns:1fr}}
+@media (max-width:1000px){.grid2{grid-template-columns:1fr}}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0}
 .card h2{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);display:flex;justify-content:space-between;align-items:center;gap:8px}
 .big{font-size:28px;font-weight:700;letter-spacing:-.01em}
@@ -75,7 +74,20 @@ svg.spark{width:100%;height:110px;display:block}
 .stat .l{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
 .stat .v{font-weight:700;font-size:16px;margin-top:2px}
 .note{color:var(--muted);font-size:12px;margin-top:8px}
-.network-section{scroll-margin-top:105px}
+.network-nav{max-width:1320px;margin:0 auto;padding:0 20px 10px;display:flex;gap:6px}
+.network-nav a{padding:4px 9px;border:1px solid transparent;border-radius:7px;color:var(--muted);text-decoration:none;font-size:13px;font-weight:600}
+.network-nav a[aria-current]{color:var(--accent);background:#1d2a47;border-color:#2c4170}
+.network-nav a:hover,.ethereum-section-header a:hover{color:var(--text)}
+.network-nav a:focus-visible,.ethereum-section-header a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.network-anchor{scroll-margin-top:115px}
+@media (max-width:650px){.network-anchor{scroll-margin-top:166px}}
+#ethereum{display:grid;gap:12px}
+.ethereum-section-header{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.ethereum-section-header h2{margin:0;font-size:18px}
+.ethereum-section-header a{font-size:13px;color:var(--accent)}
+.ethereum-overview{display:grid;grid-template-columns:1.15fr 1fr;gap:16px}
+@media (max-width:750px){.ethereum-overview{grid-template-columns:1fr}}
+#ethereum .card h3{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);display:flex;justify-content:space-between;align-items:center;gap:8px}
 .network-section>h2{margin:0 0 10px;font-size:16px}
 .network-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 .network-card .row[hidden]{display:none}
@@ -120,15 +132,102 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
       <span class="chip">Updated <b id="cAgo">–</b></span>
     </div>
   </div>
+  <nav class="network-nav" id="networkNav" aria-label="Networks">
+    <a href="#ethereum" aria-current="location">Ethereum</a>
+    <a href="#arbitrum">Arbitrum</a>
+    <a href="#solana">Solana</a>
+  </nav>
 </header>
 
 <main>
   <div id="banner" class="banner"><span id="bannerText">Connecting to bot…</span></div>
 
+  <section class="network-section network-anchor" id="ethereum" aria-labelledby="ethereumHeading">
+    <div class="ethereum-section-header">
+      <h2 id="ethereumHeading">Ethereum</h2>
+      <a href="#ethereum-mev">MEV &amp; flash loans</a>
+    </div>
+    <div class="ethereum-overview">
+      <div class="card">
+        <h3>Ethereum wallet <span class="sub" id="wStorage"></span></h3>
+        <div class="wallet">
+          <img id="qr" alt="Wallet address QR code">
+          <div>
+            <div class="addr" id="wAddr">–</div>
+            <div class="row" style="margin-top:8px"><button id="copyBtn" class="ghost">Copy address</button><a id="ethLink" class="sub" target="_blank" rel="noopener noreferrer" style="align-self:center">Etherscan ↗</a></div>
+            <div class="kv">
+              <span>USDC</span><span id="wUsdc">–</span>
+              <span>ETH (gas)</span><span id="wEth">–</span>
+              <span>Tokens</span><span id="wTokens">–</span>
+              <span>Auto gas</span><span id="wGas">–</span>
+            </div>
+          </div>
+        </div>
+        <div class="note" id="wNote" hidden>Live spot consumes Ethereum mainnet USDC and ETH for gas.</div>
+        <div class="row">
+          <button id="armBtn" class="primary" disabled>Arm live trading</button>
+          <button id="disarmBtn" class="danger" hidden>Disarm</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Ethereum Spot <span id="liveTag"></span></h3>
+        <div class="big" id="lEq">–</div>
+        <div class="sub" id="lPnl">–</div>
+        <div id="lPos"></div>
+        <div class="kv">
+          <span>Deposited</span><span id="lDep">–</span>
+          <span>Realized P&amp;L</span><span id="lReal">–</span>
+          <span>Gas spent</span><span id="lGas">–</span>
+        </div>
+        <div class="note" id="lDecision">–</div>
+      </div>
+    </div>
+    <section class="card network-anchor" id="ethereum-mev" aria-labelledby="ethereumMevHeading">
+      <h3 id="ethereumMevHeading">Ethereum MEV &amp; flash loans <span id="mevMode"></span></h3>
+      <div class="sub" id="mevStatus" style="margin:-4px 0 10px">Starting…</div>
+      <div class="stats">
+        <div class="stat"><div class="l">Blocks scanned</div><div class="v" id="mevBlocks">–</div></div>
+        <div class="stat"><div class="l" title="Best successful on-chain simulation this hour, before transaction costs">Best simulation this hour</div><div class="v" id="mevGap">–</div></div>
+        <div class="stat"><div class="l">Simulated / profitable</div><div class="v" id="mevSims">–</div></div>
+        <div class="stat"><div class="l" id="mevSubmissionLabel">Submissions / landed</div><div class="v" id="mevBundles">–</div></div>
+        <div class="stat"><div class="l">MEV profit (after gas)</div><div class="v" id="mevProfit">–</div></div>
+        <div class="stat"><div class="l">RPC calls used</div><div class="v" id="mevRpc">–</div></div>
+      </div>
+      <p class="note" id="mevDirectCadence" hidden></p>
+      <p class="note" id="mevScanWindow" hidden></p>
+      <p class="note" id="mevDirectGas" hidden></p>
+      <div class="scroll" style="margin-top:12px"><table>
+        <thead><tr><th>Time</th><th>Token</th><th>Buy on → sell on</th><th class="r">Size</th><th class="r">Gross</th><th class="r">Gas</th><th class="r">Net (ETH)</th><th>Result</th></tr></thead>
+        <tbody id="mevBody"></tbody>
+      </table></div>
+      <div class="row">
+        <button id="mevDeployBtn" aria-describedby="mevDeploy" hidden disabled>Deploy upgradeable FlashArb</button>
+        <button id="mevArmBtn" class="primary" aria-describedby="mevDeploy" disabled>Arm MEV</button>
+        <button id="mevDisarmBtn" class="danger" hidden>Disarm MEV</button>
+      </div>
+      <p class="note" id="mevContract" style="overflow-wrap:anywhere" hidden></p>
+      <p class="note" id="mevImplementation" style="overflow-wrap:anywhere" hidden></p>
+      <p class="note" id="mevDeploy" role="status">Waiting for bot status.</p>
+    </section>
+    <div class="card">
+      <h3>Ethereum paper portfolio <span class="sub">virtual $, real prices</span></h3>
+      <div class="big" id="pEq">–</div>
+      <div class="sub" id="pPnl">–</div>
+      <div id="pPos"></div>
+      <div class="kv">
+        <span>Realized P&amp;L</span><span id="pReal">–</span>
+        <span>Simulated gas</span><span id="pGas">–</span>
+        <span>Trades recorded</span><span id="pTrades">–</span>
+      </div>
+      <div class="note" id="pDecision">–</div>
+    </div>
+  </section>
+
   <section class="network-section" id="extraNetworks" aria-labelledby="networkHeading">
     <h2 id="networkHeading">Arbitrum &amp; Solana</h2>
     <div class="network-grid">
-      <article class="card network-card" aria-labelledby="arbitrumHeading">
+      <article class="card network-card network-anchor" id="arbitrum" aria-labelledby="arbitrumHeading">
         <div class="network-card-header">
           <h3 id="arbitrumHeading">Arbitrum One</h3>
           <span id="arbitrumMode" class="pill wait">CONNECTING</span>
@@ -154,7 +253,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
         </div>
         <div class="row" id="arbitrumControls" hidden><button id="arbitrumModeBtn" class="ghost"></button></div>
       </article>
-      <article class="card network-card" aria-labelledby="solanaHeading">
+      <article class="card network-card network-anchor" id="solana" aria-labelledby="solanaHeading">
         <div class="network-card-header">
           <h3 id="solanaHeading">Solana</h3>
           <span id="solanaMode" class="pill wait">CONNECTING</span>
@@ -183,56 +282,6 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     </div>
   </section>
 
-  <section class="grid3">
-    <div class="card">
-      <h2>Bot wallet <span class="sub" id="wStorage"></span></h2>
-      <div class="wallet">
-        <img id="qr" alt="Wallet address QR code">
-        <div>
-          <div class="addr" id="wAddr">–</div>
-          <div class="row" style="margin-top:8px"><button id="copyBtn" class="ghost">Copy address</button><a id="ethLink" class="sub" target="_blank" rel="noopener noreferrer" style="align-self:center">Etherscan ↗</a></div>
-          <div class="kv">
-            <span>USDC</span><span id="wUsdc">–</span>
-            <span>ETH (gas)</span><span id="wEth">–</span>
-            <span>Tokens</span><span id="wTokens">–</span>
-            <span>Auto gas</span><span id="wGas">–</span>
-          </div>
-        </div>
-      </div>
-      <div class="note" id="wNote" hidden>Live spot consumes Ethereum mainnet USDC and ETH for gas.</div>
-      <div class="row">
-        <button id="armBtn" class="primary" disabled>Arm live trading</button>
-        <button id="disarmBtn" class="danger" hidden>Disarm</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Live portfolio <span id="liveTag"></span></h2>
-      <div class="big" id="lEq">–</div>
-      <div class="sub" id="lPnl">–</div>
-      <div id="lPos"></div>
-      <div class="kv">
-        <span>Deposited</span><span id="lDep">–</span>
-        <span>Realized P&amp;L</span><span id="lReal">–</span>
-        <span>Gas spent</span><span id="lGas">–</span>
-      </div>
-      <div class="note" id="lDecision">–</div>
-    </div>
-
-    <div class="card">
-      <h2>Paper portfolio <span class="sub">virtual $, real prices</span></h2>
-      <div class="big" id="pEq">–</div>
-      <div class="sub" id="pPnl">–</div>
-      <div id="pPos"></div>
-      <div class="kv">
-        <span>Realized P&amp;L</span><span id="pReal">–</span>
-        <span>Simulated gas</span><span id="pGas">–</span>
-        <span>Trades recorded</span><span id="pTrades">–</span>
-      </div>
-      <div class="note" id="pDecision">–</div>
-    </div>
-  </section>
-
   <section class="card">
     <h2>Strategy brain <span class="sub" id="regime"></span></h2>
     <div class="sub" id="uniStats" style="margin:-4px 0 10px"></div>
@@ -257,34 +306,6 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     <div class="kv" id="mlThr"></div>
     <div class="note">Strongest features: <span id="mlFeat">–</span></div>
     <div class="note">Like intelligent-trading-bot: 21 engineered features per token-hour → logistic-regression model predicting “+1R before −1R within 48h”, re-trained every 3 days on past data only and tested on data it never saw. AUC 0.50 = coin flip. In <b>auto</b> mode the AI only drives buys if it beats the rules out of sample; otherwise the rules stay in charge. Re-trains every 6 hours.</div>
-  </section>
-
-  <section class="card">
-    <h2>MEV arbitrage · flash loans <span id="mevMode"></span></h2>
-    <div class="sub" id="mevStatus" style="margin:-4px 0 10px">Starting…</div>
-    <div class="stats">
-      <div class="stat"><div class="l">Blocks scanned</div><div class="v" id="mevBlocks">–</div></div>
-      <div class="stat"><div class="l" title="Best successful on-chain simulation this hour, before transaction costs">Best simulation this hour</div><div class="v" id="mevGap">–</div></div>
-      <div class="stat"><div class="l">Simulated / profitable</div><div class="v" id="mevSims">–</div></div>
-      <div class="stat"><div class="l" id="mevSubmissionLabel">Submissions / landed</div><div class="v" id="mevBundles">–</div></div>
-      <div class="stat"><div class="l">MEV profit (after gas)</div><div class="v" id="mevProfit">–</div></div>
-      <div class="stat"><div class="l">RPC calls used</div><div class="v" id="mevRpc">–</div></div>
-    </div>
-    <p class="note" id="mevDirectCadence" hidden></p>
-    <p class="note" id="mevScanWindow" hidden></p>
-    <p class="note" id="mevDirectGas" hidden></p>
-    <div class="scroll" style="margin-top:12px"><table>
-      <thead><tr><th>Time</th><th>Token</th><th>Buy on → sell on</th><th class="r">Size</th><th class="r">Gross</th><th class="r">Gas</th><th class="r">Net (ETH)</th><th>Result</th></tr></thead>
-      <tbody id="mevBody"></tbody>
-    </table></div>
-    <div class="row">
-      <button id="mevDeployBtn" aria-describedby="mevDeploy" hidden disabled>Deploy upgradeable FlashArb</button>
-      <button id="mevArmBtn" class="primary" aria-describedby="mevDeploy" disabled>Arm MEV</button>
-      <button id="mevDisarmBtn" class="danger" hidden>Disarm MEV</button>
-    </div>
-    <p class="note" id="mevContract" style="overflow-wrap:anywhere" hidden></p>
-    <p class="note" id="mevImplementation" style="overflow-wrap:anywhere" hidden></p>
-    <p class="note" id="mevDeploy" role="status">Waiting for bot status.</p>
   </section>
 
   <section class="grid2">

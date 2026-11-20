@@ -1,4 +1,6 @@
-export type FlashTest = {
+export type FlashTestOptions = { minimumNetUsd?: number; minimumLoanUsd?: number };
+
+export type FlashTest = FlashTestOptions & {
   id: string;
   queuedAt: number;
   expiresAt: number;
@@ -20,9 +22,18 @@ export function flashTestView(test: FlashTest | undefined | null, now = Date.now
   return test;
 }
 
-export function queueFlashTest(test: FlashTest | undefined | null, id: string, now = Date.now()): FlashTest {
+export function queueFlashTest(test: FlashTest | undefined | null, id: string, now = Date.now(), options: FlashTestOptions = {}): FlashTest {
   if (test?.id === id) return test;
+  const { minimumNetUsd, minimumLoanUsd } = options;
+  if (minimumNetUsd !== undefined && (!Number.isFinite(minimumNetUsd) || minimumNetUsd <= 0 || minimumNetUsd > 1000)
+    || minimumLoanUsd !== undefined && (minimumNetUsd === undefined || !Number.isFinite(minimumLoanUsd)
+      || minimumLoanUsd < 1 || minimumLoanUsd > 100000)) {
+    throw new Error('A loan floor requires a positive after-fee profit and a supported loan size');
+  }
   if (activeFlashTest(test, now) || test?.status === 'submitted') throw new Error('A mainnet test is already active');
   return { id, queuedAt: now, expiresAt: now + 12 * 60_000, checked: 0, status: 'queued', hash: null,
-    note: 'Waiting for a route that repays the flash loan and protects the wallet. Only network fees may be spent.' };
+    ...options,
+    note: minimumNetUsd === undefined
+      ? 'Waiting for a route that repays the flash loan and protects the wallet. Only network fees may be spent.'
+      : 'Waiting for a route that meets the loan size and positive after-fee profit floors.' };
 }

@@ -152,6 +152,7 @@ interface GasOnlyTest {
   privateSubmission: boolean;
   publicFunctional: boolean;
   minimumNetUsd?: number;
+  minimumLoanUsd?: number;
   expiresAt: number;
   blocksChecked: number;
   routesChecked: number;
@@ -770,7 +771,10 @@ export class MevSearcher {
   private async scanGasOnlyTest(test: GasOnlyTest, candidates: Candidate[], r: BlockRead, nextMaxBase: bigint,
     policy: ProfitPolicy, generation: number) {
     test.blocksChecked++;
-    candidates.sort((a, b) => b.estimatedNet - a.estimatedNet);
+    const ethUsd = this.host.ethUsd();
+    const meetsSize = (candidate: Candidate) => test.minimumLoanUsd === undefined
+      || (validPrice(ethUsd) && candidate.dx * ethUsd >= test.minimumLoanUsd);
+    candidates.sort((a, b) => Number(meetsSize(b)) - Number(meetsSize(a)) || b.estimatedNet - a.estimatedNet);
     const diversified = test.privateSubmission || test.publicFunctional;
     const top = diversified
       ? extraRoutes(candidates, [], GAS_ONLY_TEST_ROUTES + 2, (candidate) => candidate.t.token.address.toLowerCase())
@@ -858,11 +862,17 @@ export class MevSearcher {
     const st = this.file.stats;
     st.candidates++;
     const key = `${poolIdentity(c.A)}|${poolIdentity(c.B)}`;
-    const limit = loanLimitWei(MEV.maxLoanUsd, this.host.ethUsd());
-    if (limit === null) return null;
+    const price = this.host.ethUsd();
+    const limit = loanLimitWei(MEV.maxLoanUsd, price);
+    if (limit === null || (test?.minimumLoanUsd !== undefined && !validPrice(price))) return null;
     const previous = this.previousSizes.get(key);
     const previousAmount = previous && Date.now() - previous.at < 10 * 60_000 ? previous.amount : undefined;
-    const sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previousAmount, limit, broadenSizes);
+    let sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previousAmount, limit, broadenSizes);
+    if (test?.minimumLoanUsd !== undefined && validPrice(price)) {
+      const floor = BigInt(Math.ceil(test.minimumLoanUsd / price * 1e18));
+      sizes = sizes.filter((amount) => amount >= floor);
+      if (!sizes.length && floor <= limit) sizes = [floor];
+    }
     if (!sizes.length) return null;
     const lenderOnlyTest = test?.requireGasCoverage === false && !test.privateSubmission && !test.publicFunctional;
     const trials = fundingTrials(MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark)
@@ -1042,6 +1052,9 @@ export class MevSearcher {
     if (!validPrice(ethUsd)) return this.skipOpportunity(opp, 'ETH/USD price unavailable');
     const loanCap = loanLimitWei(MEV.maxLoanUsd, ethUsd);
     if (loanCap === null || offer.amount > loanCap) return this.skipOpportunity(opp, 'flash loan exceeds the USD cap');
+    if (test?.minimumLoanUsd !== undefined && eth(offer.amount) * ethUsd < test.minimumLoanUsd) {
+      return this.skipOpportunity(opp, 'flash loan is below the requested test size');
+    }
     const requestedNet = test?.minimumNetUsd;
     const profitTest = requestedNet !== undefined;
     const minimumPolicy = profitTest ? { ...policy, minNetUsd: requestedNet } : policy;
@@ -1205,6 +1218,9 @@ export class MevSearcher {
       }
       const currentLoanCap = loanLimitWei(MEV.maxLoanUsd, currentEthUsd);
       if (currentLoanCap === null || offer.amount > currentLoanCap) return skip('flash loan exceeds the USD cap at signing');
+      if (test?.minimumLoanUsd !== undefined && (!validPrice(currentEthUsd) || eth(offer.amount) * currentEthUsd < test.minimumLoanUsd)) {
+        return skip('flash loan is below the requested test size at signing');
+      }
       const signingGasUsd = eth(gasBudget) * (currentEthUsd ?? ethUsd);
       if (direct && !this.withinDirectGasBudget(signingGasUsd, Date.now(), premium, test)) return skip('direct gas limit reached at signing');
       if (test && signingGasUsd > test.maximumGasUsd) return skip('gas-only test would exceed its gas cap at signing');
@@ -1228,6 +1244,7 @@ export class MevSearcher {
         && (offer.funding !== 0 || queued.requireGasCoverage || queued.privateSubmission || queued.publicFunctional)
         && (!queued.privateSubmission || privateSubmission)
         && (!queued.publicFunctional || queued === test || queued.minimumNetUsd !== undefined)
+        && (queued.minimumLoanUsd === undefined || (validPrice(currentEthUsd) && eth(offer.amount) * currentEthUsd >= queued.minimumLoanUsd))
         && (queued.minimumNetUsd === undefined || queued === test || (minimumProfit - gasBudget) >=
           BigInt(Math.ceil(queued.minimumNetUsd / (currentEthUsd ?? ethUsd) * 1e18))) ? queued : null;
       Object.assign(opp, {
@@ -1519,7 +1536,7 @@ export class MevSearcher {
   }
 
   queueGasOnlyTest(id: string, maximumGasUsd: number, requireGasCoverage = false,
-    privateSubmission = false, publicFunctional = false, minimumNetUsd?: number) {
+    privateSubmission = false, publicFunctional = false, minimumNetUsd?: number, minimumLoanUsd?: number) {
     if (this.queuedTest?.id === id || this.file.lastGasOnlyTest?.id === id
       || this.file.recent.some((row) => row?.gasOnlyTestId === id)) return;
     const profitTest = minimumNetUsd !== undefined;
@@ -1527,6 +1544,8 @@ export class MevSearcher {
       || !Number.isFinite(minimumNetUsd * 1e18) || minimumNetUsd <= 0)) {
       throw new Error('A minimum net profit requires full gas coverage and a submission mode.');
     }
+    if (minimumLoanUsd !== undefined && (!profitTest || !Number.isFinite(minimumLoanUsd)
+      || minimumLoanUsd < 1 || minimumLoanUsd > MEV.maxLoanUsd)) throw new Error('Invalid minimum USD loan size.');
     const gasCap = profitTest ? MAX_PROFIT_TEST_GAS_USD : publicFunctional ? MAX_PUBLIC_FUNCTIONAL_TEST_USD : MEV.directMaxGasUsd;
     if (publicFunctional && (privateSubmission || (requireGasCoverage && !profitTest))) throw new Error('Invalid public test settings.');
     if (!TEST_ID.test(id) || !Number.isFinite(maximumGasUsd) || maximumGasUsd <= 0 || maximumGasUsd > gasCap) {
@@ -1539,7 +1558,7 @@ export class MevSearcher {
     if (this.activeGasOnlyTest()) throw new Error('A gas-only test is already queued.');
     this.queuedTest = { id, maximumGasUsd, requireGasCoverage, privateSubmission, publicFunctional,
       minimumNetUsd: minimumNetUsd === undefined ? undefined : Math.max(MEV.directMinNetUsd, minimumNetUsd),
-      expiresAt: Date.now() + GAS_ONLY_TEST_MS, blocksChecked: 0, routesChecked: 0 };
+      minimumLoanUsd, expiresAt: Date.now() + GAS_ONLY_TEST_MS, blocksChecked: 0, routesChecked: 0 };
     const coverage = requireGasCoverage ? ' requiring full gas coverage' : '';
     this.host.log('[mev] One flash-loan test queued' + coverage + ' with a gas cap of $' + maximumGasUsd.toFixed(2) + '.');
   }

@@ -32,6 +32,8 @@
     "arbitrum:scan": "node dist/arbitrum/cli.js scan",
     "arbitrum:quote": "node dist/arbitrum/cli.js quote",
     "arbitrum:deploy": "node dist/arbitrum/cli.js deploy",
+    "arbitrum:upgrade:quote": "node dist/arbitrum/cli.js upgrade-quote",
+    "arbitrum:upgrade": "node dist/arbitrum/cli.js upgrade",
     "solana:scan": "node dist/solana/cli.js",
     "solana:test": "node --test dist/solana/scan.test.js"
   },

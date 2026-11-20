@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { createPublicClient, createTestClient, createWalletClient, http, parseAbi, parseEther, parseEventLogs, type Address, type ContractFunctionArgs, type Hex } from 'viem';
+import { createPublicClient, createTestClient, createWalletClient, encodeDeployData, encodeFunctionData, http, keccak256, parseAbi, parseEther, parseEventLogs, type Address, type ContractFunctionArgs, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { arbitrum } from 'viem/chains';
 import { ARBITRUM_FLASH_ARB_ABI, ARBITRUM_FLASH_ARB_BYTECODE, ARBITRUM_FLASH_ARB_RUNTIME } from './arbitrum/artifact.js';
+import { ARBITRUM_FLASH_ARB_LOGIC_BYTECODE, ARBITRUM_FLASH_ARB_LOGIC_RUNTIME } from './arbitrum/artifact-logic.js';
+import { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_BYTECODE, FLASH_ARB_PROXY_RUNTIME } from './mev/artifact-proxy.js';
 
 const rpc = new URL(process.env.RPC_URL ?? '');
 assert.equal(rpc.protocol, 'http:');
@@ -35,6 +37,7 @@ const lenderCustody = '0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8';
 const router = '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45';
 const arbSys = '0x0000000000000000000000000000000000000064';
 const abi = ARBITRUM_FLASH_ARB_ABI;
+const proxyOrderAbi = [...abi, ...FLASH_ARB_PROXY_ABI.filter((entry) => entry.type === 'error')] as const;
 const erc20Abi = parseAbi([
   'function balanceOf(address owner) view returns (uint256)',
   'function allowance(address owner, address spender) view returns (uint256)',
@@ -106,12 +109,29 @@ async function skewPool(tokenIn: Address, tokenOut: Address, fee: number, amount
     }));
   }
   await confirmed(await sender.writeContract({
-    address: router, abi: routerAbi, functionName: 'exactInputSingle', account: fixture, value,
+    // Use a fixed local gas limit to avoid repeatedly reading fork state in estimateGas.
+    address: router, abi: routerAbi, functionName: 'exactInputSingle', account: fixture, value, gas: 2_000_000n,
     args: [{ tokenIn, tokenOut, fee, recipient: fixture.address, amountIn, amountOutMinimum: 1n, sqrtPriceLimitX96: 0n }],
   }));
 }
 
-async function route(label: string, buy: Pool, sell: Pool) {
+const standalone = {
+  address,
+  simulate: async (order: Order) => (await client.simulateContract({ ...call, args: [order] })).result,
+  send: (order: Order) => sender.writeContract({ ...call, args: [order], gas: 2_000_000n }),
+};
+
+function pinned(proxy: Address, release: Hex): typeof standalone {
+  const spec = { address: proxy, abi: FLASH_ARB_PROXY_ABI, functionName: 'executePinned', account: owner } as const;
+  const args = (order: Order) => [release, encodeFunctionData({ abi, functionName: 'execute', args: [order] })] as const;
+  return {
+    address: proxy,
+    simulate: async (order) => (await client.simulateContract({ ...spec, args: args(order) })).result,
+    send: (order) => sender.writeContract({ ...spec, args: args(order), gas: 2_000_000n }),
+  };
+}
+
+async function route(label: string, buy: Pool, sell: Pool, executor = standalone) {
   const saved = await admin.snapshot();
   try {
     const maxBlock = (await l2Block()) + 3n;
@@ -120,29 +140,26 @@ async function route(label: string, buy: Pool, sell: Pool) {
     for (const amount of ['1', '0.3', '0.1', '0.03', '0.01']) {
       const order = { ...basic, buy, sell, amountIn: parseEther(amount), maxBlock };
       try {
-        const { result } = await client.simulateContract({ ...call, args: [order] });
-        candidate = { order, payout: result };
+        candidate = { order, payout: await executor.simulate(order) };
         break;
       } catch (error) {
         errors.push((error as Error).message.split('\n')[0]);
       }
     }
     assert.ok(candidate, `${label} profitable simulation failed: ${errors.join(' | ')}`);
-    await assert.rejects(client.simulateContract({
-      ...call, args: [{ ...candidate.order, minProfit: candidate.payout + 1n }],
-    }), /unprofitable/);
+    await assert.rejects(executor.simulate({ ...candidate.order, minProfit: candidate.payout + 1n }), /unprofitable/);
 
     // Preexisting gifts are returned and excluded from reported profit.
     const gift = parseEther('0.001');
-    await admin.setBalance({ address: call.address, value: gift });
+    await admin.setBalance({ address: executor.address, value: gift });
     const custodyBefore = await balance(weth, lenderCustody);
     const ownerBefore = await client.getBalance({ address: owner.address });
-    const receipt = await confirmed(await sender.writeContract({
-      ...call, args: [{ ...candidate.order, minProfit: candidate.payout }],
-    }));
+    const receipt = await confirmed(await executor.send({ ...candidate.order, minProfit: candidate.payout }));
     const [settled] = parseEventLogs({ abi, eventName: 'Arbitrage', logs: receipt.logs });
     const [funded] = parseEventLogs({ abi, eventName: 'FundedBy', logs: receipt.logs });
     assert.ok(settled && funded);
+    assert.equal(settled.address.toLowerCase(), executor.address.toLowerCase());
+    assert.equal(funded.address.toLowerCase(), executor.address.toLowerCase());
     assert.equal(settled.args.profit, candidate.payout);
     assert.equal(settled.args.tip, 0n);
     assert.equal(funded.args.funding, 1);
@@ -152,11 +169,11 @@ async function route(label: string, buy: Pool, sell: Pool) {
     const net = settled.args.profit - receipt.gasUsed * receipt.effectiveGasPrice;
     assert.ok(net > 0n, 'local net must cover fork gas');
     assert.equal((await client.getBalance({ address: owner.address })) - ownerBefore, gift + net);
-    assert.equal(await client.getBalance({ address: call.address }), 0n);
-    assert.equal(await balance(weth, call.address), 0n);
-    assert.equal(await balance(usdc, call.address), 0n);
+    assert.equal(await client.getBalance({ address: executor.address }), 0n);
+    assert.equal(await balance(weth, executor.address), 0n);
+    assert.equal(await balance(usdc, executor.address), 0n);
     assert.equal(await client.readContract({
-      address: weth, abi: erc20Abi, functionName: 'allowance', args: [call.address, lender],
+      address: weth, abi: erc20Abi, functionName: 'allowance', args: [executor.address, lender],
     }), 0n);
     console.log(`✓ ${label}: Aave repaid, exact wallet payout, no residual balance or approval`);
   } finally {
@@ -164,11 +181,67 @@ async function route(label: string, buy: Pool, sell: Pool) {
   }
 }
 
+async function proxyUpgradeFixture() {
+  const release = keccak256(ARBITRUM_FLASH_ARB_LOGIC_RUNTIME);
+  const compatibleTestRelease = keccak256(ARBITRUM_FLASH_ARB_RUNTIME);
+  const compatibleTestCreation = encodeDeployData({ abi, bytecode: ARBITRUM_FLASH_ARB_BYTECODE, args: [owner.address] });
+  const receipt = await confirmed(await sender.deployContract({
+    abi: FLASH_ARB_PROXY_ABI, bytecode: FLASH_ARB_PROXY_BYTECODE, account: owner,
+    args: [ARBITRUM_FLASH_ARB_LOGIC_BYTECODE, release],
+  }));
+  const proxy = receipt.contractAddress;
+  assert.ok(proxy);
+  const [installed] = parseEventLogs({ abi: FLASH_ARB_PROXY_ABI, eventName: 'Upgraded', logs: receipt.logs });
+  assert.ok(installed);
+  const initialImplementation = installed.args.implementation;
+  assert.equal(await client.getCode({ address: initialImplementation }), ARBITRUM_FLASH_ARB_LOGIC_RUNTIME);
+  assert.equal(await client.readContract({ address: initialImplementation, abi, functionName: 'owner' }), initialImplementation);
+  assert.equal(await client.getCode({ address: proxy }), FLASH_ARB_PROXY_RUNTIME);
+  assert.equal(await client.readContract({ address: proxy, abi, functionName: 'owner' }), owner.address);
+  assert.equal(await client.readContract({ address: proxy, abi: FLASH_ARB_PROXY_ABI, functionName: 'upgradeAdmin' }), owner.address);
+
+  const currentHeight = await l2Block();
+  await assert.rejects(client.simulateContract({ ...call, address: proxy, abi: proxyOrderAbi, args: [{ ...basic, maxBlock: currentHeight + 3n }] }), /InvalidExecution/);
+  await assert.rejects(pinned(proxy, release).simulate({ ...basic, maxBlock: currentHeight - 1n }), /expired/);
+  await assert.rejects(client.simulateContract({
+    address: proxy, abi, functionName: 'executeOperation', args: [weth, 1n, 0n, proxy, '0x'], account: fixture,
+  }), /callback context/);
+  await route('Pinned proxy before upgrade', lowFeeV3, highFeeV3, pinned(proxy, release));
+
+  const upgrade = { address: proxy, abi: FLASH_ARB_PROXY_ABI, functionName: 'upgradeRelease', account: owner } as const;
+  const switchRelease = [compatibleTestCreation, release, compatibleTestRelease] as const;
+  const repeatRelease = [ARBITRUM_FLASH_ARB_LOGIC_BYTECODE, release, release] as const;
+  await assert.rejects(client.simulateContract({ ...upgrade, account: fixture, args: switchRelease }), /Unauthorized/);
+  await assert.rejects(client.simulateContract({ ...upgrade, args: repeatRelease }), /WrongImplementation/);
+  await assert.rejects(client.simulateContract({
+    ...upgrade, args: [ARBITRUM_FLASH_ARB_LOGIC_BYTECODE, release, compatibleTestRelease],
+  }), /WrongImplementation/);
+  await confirmed(await sender.writeContract({ ...upgrade, args: switchRelease }));
+  await assert.rejects(pinned(proxy, release).simulate({ ...basic, maxBlock: (await l2Block()) + 3n }), /WrongImplementation/);
+
+  const update = await confirmed(await sender.writeContract({
+    ...upgrade, args: [ARBITRUM_FLASH_ARB_LOGIC_BYTECODE, compatibleTestRelease, release],
+  }));
+  const [updated] = parseEventLogs({ abi: FLASH_ARB_PROXY_ABI, eventName: 'Upgraded', logs: update.logs });
+  assert.ok(updated);
+  const next = updated.args.implementation;
+  assert.notEqual(next, initialImplementation);
+  assert.equal(await client.getCode({ address: next }), ARBITRUM_FLASH_ARB_LOGIC_RUNTIME);
+  const implementationSlot = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+  assert.equal((await client.getStorageAt({ address: proxy, slot: implementationSlot }))?.slice(-40), next.slice(2).toLowerCase());
+  assert.equal(await client.getCode({ address: proxy }), FLASH_ARB_PROXY_RUNTIME);
+  assert.equal(await client.readContract({ address: proxy, abi, functionName: 'owner' }), owner.address);
+  assert.equal(await client.readContract({ address: proxy, abi: FLASH_ARB_PROXY_ABI, functionName: 'upgradeAdmin' }), owner.address);
+  await route('Pinned proxy native ETH v4 after upgrade', v4Native, highFeeV3, pinned(proxy, release));
+  console.log('✓ Proxy rejected invalid and unpinned releases and upgraded at the same address');
+}
+
 const beforeSkew = await admin.snapshot();
 await skewPool(weth, usdc, 3000, parseEther('100'));
 await route('Uniswap v3 → v3', lowFeeV3, highFeeV3);
 await route('native ETH Uniswap v4 → Uniswap v3', v4Native, highFeeV3);
 await route('WETH Uniswap v4 → Uniswap v3', v4Weth, highFeeV3);
+await proxyUpgradeFixture();
 await admin.revert({ id: beforeSkew });
 
 await skewPool(weth, usdc, 500, parseEther('100'));

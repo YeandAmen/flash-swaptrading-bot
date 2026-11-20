@@ -1,13 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { formatEther, isAddress, isAddressEqual, keccak256, parseEventLogs, type Address, type Hash } from 'viem';
+import { formatEther, isAddress, isAddressEqual, keccak256, parseEventLogs, type Address, type Hash, type Hex } from 'viem';
 import { CONFIG, DATA_DIR } from '../config.js';
-import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest } from '../network-test.js';
+import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest, type FlashTestOptions } from '../network-test.js';
 import { NetworkActivity } from '../network-activity.js';
 import { writeJson } from '../persistence.js';
 import { loadOrCreateWallet } from '../wallet.js';
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
-import { verifyArbitrumExecutor } from './deployment.js';
+import { verifyArbitrumExecutor, type ArbitrumExecutor } from './proxy.js';
 import { prepareArbitrumOrder } from './execution.js';
 import { arbitrumTestLeads } from './test-leads.js';
 import { arbitrumChainId, arbitrumClient, arbitrumEthUsd, discoverArbitrumPools, scanArbitrum, type ArbQuote } from './market.js';
@@ -28,6 +28,7 @@ export class ArbitrumWorker {
   private markets: Awaited<ReturnType<typeof discoverArbitrumPools>> = [];
   private refreshAfter = 0;
   private verified = false;
+  private executorCheckAt = 0;
   private journal: Journal | null = null;
   private active = false;
   private halted = fs.existsSync(haltedFile);
@@ -40,6 +41,9 @@ export class ArbitrumWorker {
     address: isAddress(this.contract) ? this.contract : null,
     owner: isAddress(this.owner) ? this.owner : null,
     verified: false,
+    kind: null as ArbitrumExecutor['kind'] | null,
+    implementation: null as Address | null,
+    releaseHash: null as Hex | null,
     status: this.contract ? 'Awaiting executor verification' : 'No executor configured',
     hash: null as Hash | null,
     block: null as number | null,
@@ -57,9 +61,9 @@ export class ArbitrumWorker {
 
   view() { return { ...this.summary, deployment: this.deployment, logs: this.activity.view(), test: flashTestView(this.journal?.test) }; }
 
-  queueTest(id: string) {
+  queueTest(id: string, options?: FlashTestOptions) {
     if (!this.journal || this.summary.mode !== 'live' || this.halted || this.journal.pending) throw new Error('Arbitrum live wallet is not ready for a test');
-    const test = queueFlashTest(this.journal.test, id);
+    const test = queueFlashTest(this.journal.test, id, Date.now(), options);
     if (test !== this.journal.test) {
       this.save({ ...this.journal, test });
       this.activity.record('info', 'Queued one Arbitrum mainnet flash-loan test');
@@ -111,19 +115,28 @@ export class ArbitrumWorker {
     this.activity.record('info', 'Live signing armed');
   }
 
+  private async verifyExecutor() {
+    this.deployment.verified = false;
+    const executor = await verifyArbitrumExecutor(this.client, this.contract, this.owner);
+    this.deployment = { ...this.deployment, ...executor, verified: true, status: executor.kind === 'proxy'
+      ? 'ERC-1967 proxy, owner, admin and implementation verified' : 'Standalone executor bytecode and owner verified' };
+    this.executorCheckAt = Date.now() + 60_000;
+  }
+
   async scan() {
     this.active = true;
     if (!this.verified) {
       if (await this.client.getChainId() !== arbitrumChainId) throw new Error('RPC must report Arbitrum One');
       if (this.summary.executor) {
-        await verifyArbitrumExecutor(this.client, this.contract, this.owner);
-        this.deployment = { ...this.deployment, verified: true, status: 'Executor bytecode and owner verified' };
+        await this.verifyExecutor();
         this.activity.record('info', this.deployment.status, `https://arbiscan.io/address/${this.contract}`);
         void this.checkDeployment();
       } else if (this.executionEnabled) throw new Error('Configure a verified Arbitrum executor before enabling live');
       if (this.executionEnabled) this.openJournal();
       this.verified = true;
       if (this.executionEnabled && !this.halted) this.summary.mode = 'live';
+    } else if (this.deployment.kind === 'proxy' && Date.now() >= this.executorCheckAt) {
+      await this.verifyExecutor();
     }
     if (isAddress(this.owner)) {
       this.summary.balanceEth = formatEther(await this.client.getBalance({ address: this.owner }));
@@ -140,7 +153,7 @@ export class ArbitrumWorker {
     const test = this.summary.mode === 'live' && !this.journal?.pending && activeFlashTest(selectedTest) ? selectedTest : null;
     this.summary.simulated = 0;
     this.summary.netEstimateUsd = null;
-    if (test && this.summary.executor) {
+    if (test && test.minimumNetUsd === undefined && this.summary.executor) {
       const leads = arbitrumTestLeads(this.markets, block);
       if (leads.length) {
         test.checked += leads.length;
@@ -148,7 +161,7 @@ export class ArbitrumWorker {
         if (await this.tryOrders(leads, ethUsd, test)) return;
       }
     }
-    const result = await scanArbitrum(this.client, block, this.markets, !!test);
+    const result = await scanArbitrum(this.client, block, this.markets, test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test);
     if (test) test.checked += result.quotedRoutes;
     this.summary.block = Number(block);
     this.summary.pools = this.markets.reduce((sum, market) => sum + market.pools.length, 0);
@@ -172,12 +185,13 @@ export class ArbitrumWorker {
       - this.journal.recent.filter((row) => row.at > Date.now() - dayMs).reduce((sum, row) => sum + row.gasUsd, 0)) : txLimitUsd;
     for (const candidate of candidates) {
       this.summary.simulated += 1;
-      const prepared = await prepareArbitrumOrder(this.client, this.contract, this.owner, candidate, ethUsd, minNetUsd, available, !!test)
+      const prepared = await prepareArbitrumOrder(this.client, this.contract, this.owner, candidate, ethUsd, Math.max(minNetUsd, test?.minimumNetUsd ?? 0), available,
+        !!test && test.minimumNetUsd === undefined, this.deployment.releaseHash ?? undefined)
         .catch(() => null);
-      if (!prepared) continue;
+      if (!prepared || (test?.minimumLoanUsd !== undefined && Number(formatEther(candidate.order.amountIn)) * ethUsd < test.minimumLoanUsd)) continue;
       this.summary.netEstimateUsd = prepared.netUsd;
       this.summary.status = test ? 'Test route passed repayment and gas checks' : 'Executable quote passed profit and gas checks';
-      if (this.summary.mode !== 'live' || !this.active || !this.journal || !canTest()) return true;
+      if (this.summary.mode !== 'live' || !this.active || !this.journal || !this.deployment.verified || !canTest()) return true;
       const { account } = loadOrCreateWallet();
       if (!isAddressEqual(account.address, this.owner)) throw new Error('Wallet does not match the Arbitrum executor owner');
       const [nonce, pending, balance, head] = await Promise.all([

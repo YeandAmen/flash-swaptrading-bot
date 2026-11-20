@@ -1,18 +1,22 @@
-import { formatEther, encodeFunctionData, decodeFunctionResult, parseEther, type Address } from 'viem';
+import { formatEther, encodeFunctionData, decodeFunctionResult, parseEther, type Address, type Hex } from 'viem';
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
+import { arbitrumPinnedCall } from './proxy.js';
 import type { ArbitrumClient, ArbQuote } from './market.js';
 
 export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Address, owner: Address, candidate: ArbQuote,
-  ethUsd: number, minimumNetUsd: number, maximumFeeUsd: number, gasOnlyTest = false) {
+  ethUsd: number, minimumNetUsd: number, maximumFeeUsd: number, gasOnlyTest = false, release?: Hex) {
   const minNet = gasOnlyTest ? 0n : parseEther((minimumNetUsd / ethUsd).toFixed(18));
   if (maximumFeeUsd <= 0 || candidate.payout <= minNet) return null;
   const head = await client.getBlock();
   if (head.number > candidate.order.maxBlock + 50n || Math.abs(Date.now() - Number(head.timestamp) * 1000) > 5_000) return null;
   // Broad snapshot quotes can take several L2 blocks. Refresh the deadline only for an exact live check.
   const deadline = head.number + 10n;
-  const encode = (minProfit: bigint) => encodeFunctionData({
-    abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', args: [{ ...candidate.order, maxBlock: deadline, minProfit }],
-  });
+  const encode = (minProfit: bigint) => {
+    const data = encodeFunctionData({
+      abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', args: [{ ...candidate.order, maxBlock: deadline, minProfit }],
+    });
+    return release ? arbitrumPinnedCall(data, release) : data;
+  };
   const [estimated, fees] = await Promise.all([
     client.estimateGas({ account: owner, to: contract, data: encode(1n) }), client.estimateFeesPerGas(),
   ]);

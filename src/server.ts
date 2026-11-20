@@ -257,12 +257,18 @@ app.post('/api/solana/arm', (req, res) => {
 app.post('/api/arbitrum/disarm', control(() => disarmArbitrum()));
 for (const [chain, queue] of [['arbitrum', queueArbitrumTest], ['solana', queueSolanaTest]] as const) {
   app.post(`/api/${chain}/test-once`, (req, res) => {
-    const { id, confirm } = req.body ?? {};
+    const { id, confirm, minimumNetUsd, minimumLoanUsd } = req.body ?? {};
     if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
       res.status(400).json({ error: 'Confirm TEST and supply a unique request ID.' });
       return;
     }
-    if (allowLiveControl(res)) void control(() => queue(id))(req, res);
+    if ((minimumNetUsd !== undefined && (typeof minimumNetUsd !== 'number' || !Number.isFinite(minimumNetUsd) || minimumNetUsd <= 0 || minimumNetUsd > 1000))
+      || (minimumLoanUsd !== undefined && (minimumNetUsd === undefined || typeof minimumLoanUsd !== 'number'
+        || !Number.isFinite(minimumLoanUsd) || minimumLoanUsd < 1 || minimumLoanUsd > 100000))) {
+      res.status(400).json({ error: 'A loan floor requires a valid positive after-fee profit.' });
+      return;
+    }
+    if (allowLiveControl(res)) void control(() => queue(id, { minimumNetUsd, minimumLoanUsd }))(req, res);
   });
 }
 app.post('/api/arbitrum/arm', (req, res) => {
@@ -300,20 +306,22 @@ app.post('/api/mev/arm', (req, res) => {
   void control(() => { ethereumIntent.set('mev', true); mev.arm(); })(req, res);
 });
 app.post('/api/mev/test-once', (req, res) => {
-  const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false, publicFunctional = false, minimumNetUsd } = req.body ?? {};
+  const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false, publicFunctional = false, minimumNetUsd, minimumLoanUsd } = req.body ?? {};
   if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)
     || typeof maximumGasUsd !== 'number' || !Number.isFinite(maximumGasUsd) || maximumGasUsd <= 0
     || typeof requireGasCoverage !== 'boolean' || typeof privateSubmission !== 'boolean' || typeof publicFunctional !== 'boolean'
     || (publicFunctional && (privateSubmission || (requireGasCoverage && minimumNetUsd === undefined)))
     || (minimumNetUsd !== undefined && (typeof minimumNetUsd !== 'number' || !Number.isFinite(minimumNetUsd)
-      || minimumNetUsd <= 0 || !requireGasCoverage || (!privateSubmission && !publicFunctional)))) {
+      || minimumNetUsd <= 0 || !requireGasCoverage || (!privateSubmission && !publicFunctional)))
+    || (minimumLoanUsd !== undefined && (minimumNetUsd === undefined || typeof minimumLoanUsd !== 'number'
+      || !Number.isFinite(minimumLoanUsd) || minimumLoanUsd < 1))) {
     res.status(400).json({ error: 'Confirm TEST with a request ID, maximum gas cost, and optional gas coverage requirement.' });
     return;
   }
   if (!allowArming(res)) return;
   const mev = engine.mev;
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
-  void control(() => mev.queueGasOnlyTest(id, maximumGasUsd, requireGasCoverage, privateSubmission, publicFunctional, minimumNetUsd))(req, res);
+  void control(() => mev.queueGasOnlyTest(id, maximumGasUsd, requireGasCoverage, privateSubmission, publicFunctional, minimumNetUsd, minimumLoanUsd))(req, res);
 });
 app.post('/api/mev/disarm', control(() => {
   try { ethereumIntent.set('mev', false); } finally { engine.mev?.disarm(); }

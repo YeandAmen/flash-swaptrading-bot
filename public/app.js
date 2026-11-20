@@ -193,6 +193,10 @@ function renderArbitrum(arb) {
   const address = deployment?.address ?? arb?.executor;
   const links = [];
   if (typeof address === 'string') links.push(networkLink('arbitrum', 'address', address, `Executor ${compactAddress(address)} ↗`));
+  if (deployment?.kind === 'proxy') {
+    links.push('<span class="sub">Upgradeable ERC-1967 proxy</span>');
+    links.push(networkLink('arbitrum', 'address', deployment.implementation, 'Implementation ↗'));
+  }
   if (verified) links.push('<span class="pos">Bytecode verified</span>');
   else if (typeof deployment?.status === 'string' && deployment.status) links.push(`<span class="sub">${esc(deployment.status)}</span>`);
   if (typeof deployment?.owner === 'string') {
@@ -824,6 +828,17 @@ $('panicPaperBtn').onclick = async () => { await api('/api/panic', { kind: 'pape
 $('resetPaperBtn').onclick = async () => { if (confirm('Reset the paper portfolio?')) { await api('/api/paper/reset'); refresh(); } };
 $('btBtn').onclick = async () => { await api('/api/backtest'); refresh(); };
 
+function syncNetworkNav() {
+  const links = [...$('networkNav').querySelectorAll('a')];
+  const selected = links.find((link) => link.hash === location.hash) ?? links[0];
+  for (const link of links) {
+    if (link === selected) link.setAttribute('aria-current', 'location');
+    else link.removeAttribute('aria-current');
+  }
+}
+
+window.addEventListener('hashchange', syncNetworkNav);
+syncNetworkNav();
 refresh();
 setInterval(() => { if (!stateRequest) void refresh(); }, 4000);
 setInterval(() => { if (S?.lastTickAt) $('cAgo').textContent = ago(S.lastTickAt); }, 1000);

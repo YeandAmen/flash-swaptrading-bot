@@ -24,6 +24,7 @@ const tokens = [
 ] as const;
 const tiers = [[100, 1], [500, 10], [3000, 60], [10000, 200]] as const;
 const amounts = ['0.05', '0.25', '1', '4', '16'].map((size) => parseEther(size));
+const profitTestAmounts = ['0.25', '1', '4', '8', '16', '32', '64'].map((size) => parseEther(size));
 const testAmounts = ['0.0002', '0.0006', '0.0018', '0.005', '0.015', '0.05', '0.1', '0.25', '1', '4', '16'].map((size) => parseEther(size));
 const keyAbi = parseAbiParameters('address,address,uint24,int24,address');
 const factoryAbi = parseAbi(['function getPool(address,address,uint24) view returns (address)']);
@@ -96,7 +97,7 @@ export async function arbitrumEthUsd(client: ArbitrumClient, blockNumber?: bigin
   return Number(price) / 1e8;
 }
 
-export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[], test = false) {
+export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[], test: boolean | number = false) {
   const [premiumBps, config, available, ethUsd] = await Promise.all([
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'FLASHLOAN_PREMIUM_TOTAL', blockNumber }),
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'getConfiguration', args: [weth], blockNumber }),
@@ -105,7 +106,8 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
   ]);
   const active = (config & (1n << 56n)) !== 0n && (config & (1n << 60n)) === 0n && (config & (1n << 63n)) !== 0n;
   if (!active) throw new Error('Aave WETH flash loans are disabled');
-  const sizes = test ? testAmounts : amounts;
+  const sizes = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
+    : test ? testAmounts : amounts;
   const buys = markets.flatMap((market) => market.pools.flatMap((pool) =>
     sizes.filter((size) => size <= available).map((size) => ({ market, pool, size }))));
   const bought = await client.multicall({
