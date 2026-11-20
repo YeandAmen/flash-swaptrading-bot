@@ -697,7 +697,7 @@ export class MevSearcher {
     const shortlistNet: number[] = [];
     const observedNet = (netUsd: number) => shortlistNet.push(netUsd);
     const canTest = () => !this.pending && this.activeGasOnlyTest() === test && this.canMeetSendDeadline(r);
-    if (test?.privateSubmission && canTest()) {
+    if (test?.privateSubmission && !MEV.directProtected && canTest()) {
       await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
     }
     const signed = await this.scanShortlist(selected, r, nextMaxBase, policy, generation, observedNet,
@@ -706,7 +706,7 @@ export class MevSearcher {
     if (!signed && !this.stopping && !this.pending && additions.length && enoughTime) {
       await this.scanShortlist(additions, r, nextMaxBase, policy, generation, observedNet, true);
     }
-    if (test && !test.privateSubmission && enoughTime && canTest()) {
+    if (test && (test.privateSubmission ? MEV.directProtected : enoughTime) && canTest()) {
       await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
     }
     block.decisionMs = Math.round(performance.now() - started);
@@ -717,7 +717,7 @@ export class MevSearcher {
   private async scanShortlist(selected: Candidate[], r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy,
     generation: number, observedNet: (usd: number) => void, broadenSizes: boolean): Promise<boolean> {
     const canTryLive = () => this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending()
-      && !this.activeGasOnlyTest()?.privateSubmission;
+      && (MEV.directProtected || !this.activeGasOnlyTest()?.privateSubmission);
     const canTryFallback = () => canTryLive() && !this.host.tradePending()
       && (CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS);
     const allowFallback = canTryFallback();
@@ -1176,7 +1176,7 @@ export class MevSearcher {
       };
       const queued = direct ? this.activeGasOnlyTest() : null;
       const matched = queued && signingGasUsd <= queued.maximumGasUsd
-        && (offer.funding !== 0 || queued.requireGasCoverage) && (!queued.privateSubmission || queued === test) ? queued : null;
+        && (offer.funding !== 0 || queued.requireGasCoverage) && (!queued.privateSubmission || privateSubmission) ? queued : null;
       Object.assign(opp, {
         gasOnlyTestId: matched?.id,
         hash, status: 'sent', gasEth: submission.gasEth, tipEth: submission.tipEth,
