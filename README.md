@@ -114,7 +114,9 @@ Direct mode scans in paper mode with the bundled implementation while the gas ca
 
 The route is simulated at the latest head and enforces the minimum profit through its two-block execution deadline. A public transaction can still be mined later and spend gas on a revert. The bot holds its wallet nonce until it sees a confirmed receipt or a confirmed replacement. [Ethereum transaction fees](https://ethereum.org/developers/docs/gas/) · [EIP-1559](https://eips.ethereum.org/EIPS/eip-1559)
 
-The dashboard reports the previous 30 minutes of observed blocks, candidate routes, simulations, and best simulated net result. The scanner can backfill a brief read gap after scanning the current head. Live sends use current-head data. The timing of on-chain trades depends on available price spreads, gas, and Ethereum inclusion.
+The bot targets a confirmed direct fill every 30 minutes. After 25 minutes without a confirmed direct fill, it checks up to eight routes instead of the usual three, favoring extra tokens and checking more sizes when the current head still has time. Tune the extended route budget with `MEV_DIRECT_CADENCE_MAX_ROUTES`. The dashboard reports the last confirmed direct fill, queued and unrecovered block reads, and the previous 30 minutes of activity. The scanner backfills brief gaps in the background and uses current-head data for live sends. Transaction timing depends on available price spreads, gas, and Ethereum inclusion.
+
+`MEV_MAX_LOAN_USD` caps the flash-loan principal in USD equivalent at $1,000,000 by default. Sizing and final signing apply the cap using the current ETH/USD quote. Gas limits separately cap wallet spend.
 
 
 ## 5. Test with fake funds
@@ -149,6 +151,8 @@ Remove-Item Env:FORK_BLOCK_NUMBER
 Ethereum block `26451239` contains the canonical PancakeSwap v3 and Uniswap v4 pools used by the V2 fixture. Choose another archive snapshot by setting `FORK_BLOCK_NUMBER`. Use the `ANVIL` environment variable for a locally installed executable outside your `PATH`.
 
 ## 6. Deploy and upgrade the FlashArb proxy
+
+New deployments use the FlashArb proxy. The repository keeps the original V2 and V3 sources and bytecode for deployed-contract verification, receipt recovery, and fork tests.
 
 Paper scanning is available after startup. The default `ALLOW_LIVE_TRADING=off` blocks signing, including contract actions. Set it to `on` and restart the bot when you want to authorize a deployment or upgrade.
 

@@ -28,8 +28,6 @@
     "wallet:fork-test": "node scripts/fork-test.mjs cli-wallet-forktest",
     "wallet:local-test": "node scripts/fork-test.mjs cli-wallet-forktest --standalone",
     "build:contract": "node scripts/build-contract.mjs",
-    "mev:v2:bytecode": "node dist/cli-mev-v2-bytecode.js",
-    "mev:v3:bytecode": "node dist/cli-mev-v2-bytecode.js v3",
     "mev:scan": "node dist/cli-mev-scan.js"
   },
   "dependencies": {

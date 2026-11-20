@@ -277,12 +277,14 @@ function render() {
     const timing = lb?.decisionMs == null ? '' : ` · ${lb.readMs} ms pool reads, ${lb.decisionMs} ms decisions`;
     const missingReads = lb?.failedChunks > 0 ? ` · ${lb.failedChunks} pool batches unavailable` : '';
     const P = X.settings?.activeProfitPolicy;
+    const maxLoanUsd = X.settings?.maxLoanUsd;
+    const loanCap = Number.isFinite(maxLoanUsd) ? ` · Loan cap ${usd(maxLoanUsd, Number.isInteger(maxLoanUsd) ? 0 : 2)}` : '';
     const padding = P?.gasPaddingPct == null ? '' : ` · ${Math.round(P.gasPaddingPct * 100)}% gas buffer`;
     const bidding = direct && Number.isFinite(P?.minNetUsd) ? ` · ${usd(P.minNetUsd)} minimum net per attempt${padding}`
       : P?.idle ? ` · idle bidding with a ${usd(P.minNetUsd)} net floor and up to ${Math.round(P.builderTipPct * 100)}% of after-gas profit bid${padding}` : '';
     const transport = X.mode === 'live' ? '' : direct ? 'Direct Ethereum transactions · ' : 'Private bundles · ';
     $('mevStatus').textContent = (staleScan ? 'Scan is stale · ' : '') + `${transport}${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
-      coverage + bidding + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
+      coverage + loanCap + bidding + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
     const st = X.stats;
     $('mevBlocks').textContent = st.blocks.toLocaleString();
     const B = X.bestThisHour?.exact ? X.bestThisHour : null;
@@ -308,6 +310,7 @@ function render() {
       : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
   }
   renderMevWindow(X?.scanWindow, isDirectMev(X) ? X.settings.direct : null);
+  renderMevCadence(isDirectMev(X) ? X.cadence : null);
   renderMevControls(X);
 
   // log
@@ -330,18 +333,40 @@ function renderMevWindow(scanWindow, gas) {
   const scan = $('mevScanWindow');
   scan.hidden = !scanWindow;
   if (scanWindow) {
-    const { blocks, candidates, simulations, bestNetUsd, caughtUp, missedSnapshots } = scanWindow;
+    const { blocks, candidates, simulations, bestNetUsd, caughtUp, missedSnapshots, queuedSnapshots } = scanWindow;
     const metrics = [
       `${blocks.toLocaleString()} blocks`, `${candidates.toLocaleString()} candidates`, `${simulations.toLocaleString()} simulations`,
     ];
     if (Number.isFinite(bestNetUsd)) metrics.push(`best simulated net ${usd(bestNetUsd)}`);
     if (caughtUp > 0) metrics.push(`${caughtUp.toLocaleString()} recovered snapshot${caughtUp === 1 ? '' : 's'} since restart`);
+    if (queuedSnapshots > 0) metrics.push(`${queuedSnapshots.toLocaleString()} queued snapshot${queuedSnapshots === 1 ? '' : 's'}`);
     if (missedSnapshots > 0) metrics.push(`${missedSnapshots.toLocaleString()} unrecovered gap${missedSnapshots === 1 ? '' : 's'} since restart`);
     scan.textContent = 'Last 30 minutes · ' + metrics.join(' · ');
   }
   const costs = $('mevDirectGas');
   costs.hidden = !gas;
   if (gas) costs.textContent = `Direct gas · ${usd(gas.spentGasUsd)} spent in 24 hours · limits ${usd(gas.maxGasUsd)} per attempt and ${usd(gas.dailyGasUsd)} per 24 hours`;
+}
+
+function renderMevCadence(cadence) {
+  const element = $('mevDirectCadence');
+  element.hidden = !cadence;
+  if (!cadence) return;
+
+  const { state, elapsedMs, lastLandedAt, intervalMs, routeLimit, baseRouteLimit } = cadence;
+  const minuteMs = 60_000;
+  const target = Math.round(intervalMs / minuteMs);
+  const remainingMs = Number.isFinite(elapsedMs) ? intervalMs - elapsedMs : null;
+  const due = remainingMs === null ? 'scanning for a fill'
+    : remainingMs > 0 ? `due in ${Math.ceil(remainingMs / minuteMs)} min` : 'due now';
+  const timing = state === 'paper' ? 'paper mode' : state === 'overdue' ? 'overdue' : due;
+  const parts = [`${target}-minute direct trade target`, timing];
+  if (routeLimit > baseRouteLimit) {
+    parts.push(`expanded search checks up to ${routeLimit} routes per block`);
+  }
+  parts.push(Number.isFinite(lastLandedAt) && lastLandedAt > 0
+    ? `last confirmed direct fill ${time(lastLandedAt)}` : 'no confirmed direct fills');
+  element.textContent = parts.join(' · ');
 }
 
 function submissionDetails(submission, openSubmissions) {
