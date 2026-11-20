@@ -42,7 +42,8 @@ const RECENT_BUNDLE_LIMIT = 10;
 const DASHBOARD_RECENT_LIMIT = 15;
 const DASHBOARD_BUNDLE_LIMIT = 5;
 const MAX_STARTUP_TRACE_BUNDLES = 6;
-const DIRECT_WINDOW = 2;
+const DIRECT_WINDOW = 1;
+const DIRECT_SEND_LEAD_MS = 1_500;
 const WINDOW_MS = 30 * 60_000;
 const GAS_LEDGER_HOURS = 24;
 const hourOf = (time: number) => Math.floor(time / HOUR);
@@ -937,6 +938,11 @@ export class MevSearcher {
     return CONFIG.forkMode || Date.now() < r.timestamp * 1000 + SLOT_MS;
   }
 
+  private canMeetSendDeadline(r: Pick<BlockRead, 'timestamp'>): boolean {
+    if (MEV.submission !== 'direct') return this.beforeNextSlot(r);
+    return CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() > DIRECT_SEND_LEAD_MS;
+  }
+
   private skipOpportunity(opp: MevOpp, note: string) {
     opp.status = 'skipped';
     opp.note = note;
@@ -958,27 +964,37 @@ export class MevSearcher {
     const { candidate: c, opp } = offer;
     if (test && (this.activeGasOnlyTest() !== test || MEV.submission !== 'direct' || offer.funding === 0 || offer.profit < 1n)) return null;
     if (!contract) return this.skipOpportunity(opp, `verified ${this.contractLabel} unavailable`);
-    if (!this.beforeNextSlot(r)) return this.skipOpportunity(opp, 'target slot passed before gas estimation');
+    if (!this.canMeetSendDeadline(r)) return this.skipOpportunity(opp, 'too late to prepare a fresh send');
     const ethUsd = this.host.ethUsd();
     if (!validPrice(ethUsd)) return this.skipOpportunity(opp, 'ETH/USD price unavailable');
     const loanCap = loanLimitWei(MEV.maxLoanUsd, ethUsd);
     if (loanCap === null || offer.amount > loanCap) return this.skipOpportunity(opp, 'flash loan exceeds the USD cap');
     const minimumNet = this.minimumNet(ethUsd, policy);
     const direct = MEV.submission === 'direct';
-    const target = r.blockNumber + BigInt(direct ? DIRECT_WINDOW : 1);
+    const target = r.blockNumber + 1n;
     const encode = (tip: bigint, minProfit: bigint) => this.liveData(encodeArbitrage(offer.funding, {
       buy: c.A, sell: c.B, token: c.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
     }));
     try {
-      // Estimate with the builder payment path enabled, then simulate the exact calldata and gas limit.
+      // Estimate the applicable payment path before simulating exact calldata and gas.
       this.file.stats.rpcCalls++;
-      const [estimate, fees] = await Promise.all([
+      const [estimate, ordinaryTip, fasterTip] = await Promise.all([
         mevReadClient.estimateGas({ account: this.host.account, to: contract, data: encode(direct ? 0n : 1n, 1n), blockNumber: r.blockNumber }),
-        direct ? directPriorityFee(directPriorityCap()).then((priority) => directFees(r.nextBaseFee, priority, DIRECT_WINDOW))
-          : { maxFeePerGas: r.nextBaseFee, maxPriorityFeePerGas: 0n },
+        direct ? directPriorityFee(directPriorityCap()) : 0n,
+        direct ? directPriorityFee(directPriorityCap(), true) : 0n,
       ]);
       const paddedBps = 10_000n + BigInt(Math.round(policy.gasPaddingPct * 10_000));
       const gas = (estimate * paddedBps + 9_999n) / 10_000n;
+      let fees = directFees(r.nextBaseFee, ordinaryTip, DIRECT_WINDOW);
+      if (fasterTip > ordinaryTip) {
+        const fasterFees = directFees(r.nextBaseFee, fasterTip, DIRECT_WINDOW);
+        const fasterBudget = gas * fasterFees.maxFeePerGas;
+        const fasterGasUsd = eth(fasterBudget) * ethUsd;
+        if (this.withinDirectGasBudget(fasterGasUsd, Date.now())
+          && (test ? fasterGasUsd <= test.maximumGasUsd : offer.profit - fasterBudget >= minimumNet)) {
+          fees = fasterFees;
+        }
+      }
       const gasBudget = gas * fees.maxFeePerGas;
       if (direct && !this.withinDirectGasBudget(eth(gasBudget) * ethUsd, Date.now())) {
         return this.skipOpportunity(opp, 'direct route exceeds an approved gas limit');
@@ -1008,7 +1024,7 @@ export class MevSearcher {
     const { opp } = offer;
     const skip = (note: string) => { this.skipOpportunity(opp, note); };
     const stillLive = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
-      && !this.deploying && !this.host.tradePending() && this.beforeNextSlot(r);
+      && !this.deploying && !this.host.tradePending() && this.canMeetSendDeadline(r);
     const canSend = () => stillLive() && (!test || this.activeGasOnlyTest() === test);
     if (!canSend()) return skip('target slot passed or MEV became unavailable before signing');
     if (this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
@@ -1024,20 +1040,29 @@ export class MevSearcher {
       }
       if (balance < gasBudget) return skip('wallet ETH does not cover the padded gas budget');
       if (direct && !this.withinDirectGasBudget(eth(gasBudget) * ethUsd, Date.now())) return skip('direct gas limit reached');
-      const head = await this.head();
+      if (direct) this.file.stats.rpcCalls++;
+      const [head, pendingCheck] = await Promise.all([
+        this.head(),
+        direct ? mevReadClient.call({ account, to: contract, data, gas, ...fees, value: 0n, blockTag: 'pending' })
+          .catch((error) => ({ data: undefined, failure: reasonOf(error) })) : undefined,
+      ]);
       if (head.hash !== r.hash || !canSend()) return skip('block changed or MEV was disarmed before signing');
+      if (direct && (!pendingCheck?.data || decodeArbitrage(pendingCheck.data) < minimumProfit)) {
+        const failure = pendingCheck && 'failure' in pendingCheck ? pendingCheck.failure : 'insufficient profit';
+        return skip('pending-state simulation: ' + failure);
+      }
       const currentEthUsd = this.host.ethUsd();
       const currentLoanCap = loanLimitWei(MEV.maxLoanUsd, currentEthUsd);
       if (currentLoanCap === null || offer.amount > currentLoanCap) return skip('flash loan exceeds the USD cap at signing');
       const signingGasUsd = eth(gasBudget) * (currentEthUsd ?? ethUsd);
-      if (test && (signingGasUsd > test.maximumGasUsd || !this.withinDirectGasBudget(signingGasUsd, Date.now()))) {
-        return skip('gas-only test would exceed its gas cap at signing');
-      }
+      if (direct && !this.withinDirectGasBudget(signingGasUsd, Date.now())) return skip('direct gas limit reached at signing');
+      if (test && signingGasUsd > test.maximumGasUsd) return skip('gas-only test would exceed its gas cap at signing');
       const signed = await account.signTransaction({
         chainId: publicClient.chain.id, type: 'eip1559', to: contract, data, nonce, gas,
         ...fees, value: 0n,
       });
-      if (!canSend()) return skip('MEV was disarmed before sending');
+      if (direct && (await this.head()).hash !== r.hash) return skip('block changed after signing before broadcast');
+      if (!canSend()) return skip('target slot passed or MEV was disarmed before broadcast');
       const hash = keccak256(signed);
       const startedAt = Date.now();
       const kind = direct ? 'direct' as const : undefined;

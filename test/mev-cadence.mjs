@@ -20,6 +20,7 @@ Object.assign(process.env, {
   MEV_DIRECT_MAX_GAS_USD: '10',
   MEV_DIRECT_DAILY_GAS_USD: '25',
   MEV_DIRECT_MIN_NET_USD: '0.05',
+  MEV_DIRECT_MAX_PRIORITY_GWEI: '0.25',
   MEV_MAX_SIMS_PER_BLOCK: '3',
   MEV_DIRECT_CADENCE_MAX_ROUTES: '8',
   MEV_MAX_LOAN_USD: '1000000',
@@ -62,7 +63,7 @@ function snapshot(now) {
 try {
   const { directCadence, extraRoutes, loanLimitWei } = await import('../dist/mev/cadence.js');
   const { mevReadClient } = await import('../dist/chain.js');
-  const { MEV } = await import('../dist/config.js');
+  const { CONFIG, MEV } = await import('../dist/config.js');
   const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
   const { MevSearcher } = await import('../dist/mev/searcher.js');
   const { routeInputSizes } = await import('../dist/mev/sizing.js');
@@ -103,12 +104,16 @@ try {
   }
 
   const testId = 'cadence-gas-test';
-  async function scan({ age, profit, finalProfit = coversGas, paper = false, staleHead = false, historical = false,
-    maximumTestGasUsd }) {
+  async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
+    paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
+    submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
+    const journaled = [];
     const seenAtSign = [];
+    const finalStates = new Map();
+    const block = snapshot(nearingNextBlock ? Math.floor(now / 1_000) * 1_000 - 11_000 : now);
     const searcher = newSearcher(async (tx) => {
       signed.push(tx);
       seenAtSign.push(...simulated);
@@ -120,37 +125,64 @@ try {
     searcher.contractReady = !paper;
     searcher.file.v2Contract = address(2);
     searcher.reconcileWallet = async () => {};
-    searcher.writeState = () => {};
-    searcher.head = async () => ({ number: staleHead ? 101n : 100n, hash: hash(staleHead ? 101 : 100) });
+    searcher.writeState = () => { if (searcher.file.pending) journaled.push(searcher.file.pending); };
+    searcher.head = async () => {
+      const number = staleHead || (headChangesDuringSigning && signed.length) ? 101n : 100n;
+      return { number, hash: hash(number), timestamp: BigInt(block.timestamp) };
+    };
     searcher.submitSignedDirect = async (pending) => { submitted.push(pending); };
+    searcher.submitSignedBundle = async (pending) => { submitted.push(pending); };
     searcher.simulate = async (token, _buy, _sell, amount, _maxBlock, blockNumber) => {
       assert.equal(blockNumber, 100n);
       assert.ok(amount <= 500n * oneEth, 'every simulated amount stays under the $1m WETH cap');
       simulated.add(token.token.symbol);
       return { ok: true, profit: typeof profit === 'function' ? profit(token.token.symbol) : profit };
     };
-    mevReadClient.getFeeHistory = async () => ({ reward: [[100_000_000n]] });
+    mevReadClient.getFeeHistory = async ({ rewardPercentiles }) => {
+      assert.deepEqual(rewardPercentiles, [50, 75]);
+      return { reward: [[100_000_000n, 300_000_000n]] };
+    };
     mevReadClient.estimateGas = async ({ blockNumber }) => {
       assert.equal(blockNumber, 100n);
       return 150_000n;
     };
-    mevReadClient.call = async ({ blockNumber }) => {
+    mevReadClient.call = async ({ blockNumber, blockTag, to, data, gas }) => {
+      const call = { to, data, gas };
+      if (blockTag === 'pending') {
+        assert.equal(blockNumber, undefined);
+        finalStates.set('pending', call);
+        if (pendingError) throw new Error('Pending state unavailable');
+        return { data: hash(pendingProfit) };
+      }
       assert.equal(blockNumber, 100n);
+      finalStates.set('pinned', call);
       return { data: hash(finalProfit) };
     };
     mevReadClient.getBalance = async () => oneEth;
 
-    const previousFunding = MEV.funding;
+    const original = { funding: MEV.funding, submission: MEV.submission, directMaxGasUsd: MEV.directMaxGasUsd };
+    const originalConfig = { allowLiveTrading: CONFIG.allowLiveTrading, forkMode: CONFIG.forkMode };
+    const originalNow = Date.now;
     try {
+      if (nearingNextBlock) {
+        // Exercise the real-time guard while every RPC and signer remains stubbed.
+        CONFIG.allowLiveTrading = true;
+        CONFIG.forkMode = false;
+        Date.now = () => Math.floor(now / 1_000) * 1_000;
+      }
+      MEV.submission = submission;
+      MEV.directMaxGasUsd = maximumDirectGasUsd;
       if (maximumTestGasUsd !== undefined) {
         MEV.funding = 'aave';
         searcher.file.proxyContract = address(2);
         searcher.queueGasOnlyTest(testId, maximumTestGasUsd);
       }
-      await searcher.onBlock(snapshot(now), historical);
-      return { simulated, signed, submitted, seenAtSign, test: searcher.view().gasOnlyTest };
+      await searcher.onBlock(block, historical);
+      return { simulated, signed, submitted, journaled, seenAtSign, finalStates, test: searcher.view().gasOnlyTest };
     } finally {
-      MEV.funding = previousFunding;
+      Object.assign(MEV, original);
+      Object.assign(CONFIG, originalConfig);
+      Date.now = originalNow;
     }
   }
 
@@ -167,6 +199,16 @@ try {
   assert.equal(fresh.signed.length, 1);
   assert.equal(fresh.submitted.length, 1);
   assert.equal(fresh.submitted[0].kind, 'direct');
+  assert.equal(fresh.submitted[0].target, '101', 'direct execution only targets the next block');
+  assert.equal(fresh.signed[0].maxPriorityFeePerGas, 250_000_000n, 'faster priority is clipped to the authorized tip cap');
+  assert.equal(fresh.signed[0].maxFeePerGas, 1_250_000_000n, 'the signed fee only budgets for the next block');
+  assert.equal(decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: fresh.signed[0].data }).args[0].maxBlock, 101n,
+    'the signed contract deadline matches the journal target');
+  assert.deepEqual([...fresh.finalStates.keys()].sort(), ['pending', 'pinned'], 'both states are checked before a direct send');
+  assert.deepEqual(fresh.finalStates.get('pending'), fresh.finalStates.get('pinned'));
+  assert.deepEqual(fresh.finalStates.get('pending'), {
+    to: fresh.signed[0].to, data: fresh.signed[0].data, gas: fresh.signed[0].gas,
+  }, 'both final checks use the exact transaction sent to the signer');
   assert.ok(fresh.seenAtSign.length <= baseLimit, 'an executable first-wave route should not wait on scan expansion');
 
   const late = await scan({
@@ -180,9 +222,51 @@ try {
   assert.equal(changedProfit.signed.length, 0, 'the final simulation must still cover gas and minimum profit');
   assert.equal(changedProfit.submitted.length, 0);
 
+  const lostPendingProfit = await scan({ age: 31 * minute, profit: coversGas, pendingProfit: underGas });
+  assert.ok(lostPendingProfit.finalStates.has('pending'));
+  assert.equal(lostPendingProfit.signed.length, 0, 'the transaction is not signed if the pending state loses the spread');
+  assert.equal(lostPendingProfit.journaled.length, 0);
+  assert.equal(lostPendingProfit.submitted.length, 0);
+
+  const failedPendingRead = await scan({ age: 31 * minute, profit: coversGas, pendingError: true });
+  assert.ok(failedPendingRead.finalStates.has('pending'));
+  assert.equal(failedPendingRead.signed.length, 0, 'a failed pending read cannot authorize a stale transaction');
+
   const stale = await scan({ age: 31 * minute, profit: coversGas, staleHead: true });
   assert.equal(stale.signed.length, 0, 'a newer block invalidates the old live candidate');
   assert.equal(stale.submitted.length, 0);
+
+  const staleSignature = await scan({ age: 31 * minute, profit: coversGas, headChangesDuringSigning: true });
+  assert.equal(staleSignature.signed.length, 1);
+  assert.equal(staleSignature.journaled.length, 0, 'a signature from the old head does not reserve the wallet');
+  assert.equal(staleSignature.submitted.length, 0, 'a new head invalidates a direct transaction before broadcast');
+
+  const tooLateForTarget = await scan({ age: 31 * minute, profit: coversGas, nearingNextBlock: true });
+  assert.equal(tooLateForTarget.signed.length, 0, 'a direct route needs a minimum lead before the next block');
+  assert.equal(tooLateForTarget.journaled.length, 0);
+
+  // At $2,000/ETH, 187,500 padded gas costs $0.46875 at the faster fee and $0.4125 at the standard fee.
+  const standardPriority = await scan({ age: 31 * minute, profit: coversGas, maximumDirectGasUsd: 0.43 });
+  assert.equal(standardPriority.submitted.length, 1);
+  assert.equal(standardPriority.signed[0].maxPriorityFeePerGas, 100_000_000n);
+  assert.equal(standardPriority.signed[0].maxFeePerGas, 1_100_000_000n);
+
+  const thinProfit = 245_000_000_000_000n;
+  const protectProfit = await scan({ age: 31 * minute, profit: thinProfit, finalProfit: thinProfit });
+  assert.equal(protectProfit.submitted.length, 1);
+  assert.equal(protectProfit.signed[0].maxPriorityFeePerGas, 100_000_000n,
+    'the faster fee is skipped if it would eat into the configured profit floor');
+
+  const directCapReached = await scan({ age: 31 * minute, profit: coversGas, maximumDirectGasUsd: 0.01 });
+  assert.equal(directCapReached.signed.length, 0, 'next-block acceleration still honors the direct gas ceiling');
+  assert.equal(directCapReached.submitted.length, 0);
+
+  const bundle = await scan({ age: 24 * minute, profit: coversGas, pendingError: true, submission: 'bundle' });
+  assert.equal(bundle.signed.length, 1);
+  assert.equal(bundle.submitted.length, 1);
+  assert.equal(bundle.submitted[0].kind, undefined);
+  assert.equal(bundle.submitted[0].target, '101');
+  assert.deepEqual([...bundle.finalStates.keys()], ['pinned'], 'bundle submission does not depend on public pending state');
 
   const paper = await scan({ age: 31 * minute, profit: coversGas, paper: true });
   assert.ok(paper.simulated.size > baseLimit);
@@ -207,6 +291,12 @@ try {
   const insufficientGross = await scan({ age: 24 * minute, profit: underGas, finalProfit: 0n, maximumTestGasUsd: 2 });
   assert.equal(insufficientGross.signed.length, 0, 'the final simulation must still repay and produce residual proceeds');
   assert.equal(insufficientGross.test.status, 'queued');
+
+  const insufficientPendingGross = await scan({
+    age: 24 * minute, profit: underGas, finalProfit: underGas, pendingProfit: 0n, maximumTestGasUsd: 2,
+  });
+  assert.equal(insufficientPendingGross.signed.length, 0, 'gas-only testing cannot skip pending repayment verification');
+  assert.equal(insufficientPendingGross.test.status, 'queued');
 
   const ordinaryTest = await scan({ age: 24 * minute, profit: coversGas, maximumTestGasUsd: 2 });
   assert.equal(ordinaryTest.signed.length, 1);
@@ -239,7 +329,7 @@ try {
   const restarted = newSearcher(async () => assert.fail('journal recovery must not sign'));
   assert.equal(restarted.file.stats.lastDirectLandedAt, journal.file.stats.lastDirectLandedAt);
 
-  console.log('PASS: direct cadence, loan cap, extra routes, profit and freshness gates, and confirmed-fill persistence');
+  console.log('PASS: direct cadence, next-block expiry, pending-state and pre-broadcast checks, gas limits, and confirmed-fill persistence');
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

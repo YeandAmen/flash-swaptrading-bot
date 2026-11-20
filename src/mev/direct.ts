@@ -11,28 +11,32 @@ const directClient = createClient({
 
 const PRIORITY_CACHE_MS = 24_000;
 const DEFAULT_PRIORITY_FEE = parseGwei('0.1');
-let cachedTip: { fee: bigint; expiresAt: number } | undefined;
-let readingTip: Promise<bigint> | undefined;
+let cachedTip: { fee: bigint; fasterFee: bigint; expiresAt: number } | undefined;
+let readingTip: Promise<void> | undefined;
 
 /** Use recent Ethereum tips and cap the recommendation at the operator's limit. */
-export async function directPriorityFee(maximumWei: bigint): Promise<bigint> {
+export async function directPriorityFee(maximumWei: bigint, faster = false): Promise<bigint> {
   if (maximumWei <= 0n) throw new RangeError('Direct priority fee cap must be positive');
   if (!cachedTip || Date.now() >= cachedTip.expiresAt) {
-    readingTip ??= mevReadClient.getFeeHistory({ blockCount: 10, rewardPercentiles: [50] })
+    readingTip ??= mevReadClient.getFeeHistory({ blockCount: 10, rewardPercentiles: [50, 75] })
       .then(({ reward }) => {
-        const samples = reward?.flat().sort((a, b) => a === b ? 0 : a < b ? -1 : 1) ?? [];
-        return samples[Math.floor(samples.length / 2)] ?? DEFAULT_PRIORITY_FEE;
+        const [ordinary, expedited] = [0, 1].map((index) => {
+          const samples = (reward ?? []).flatMap((row) => row[index] === undefined ? [] : [row[index]])
+            .sort((a, b) => a === b ? 0 : a < b ? -1 : 1);
+          return samples[Math.floor(samples.length / 2)];
+        });
+        const fee = ordinary ?? DEFAULT_PRIORITY_FEE;
+        const fasterFee = expedited !== undefined && expedited > fee ? expedited : fee;
+        cachedTip = { fee, fasterFee, expiresAt: Date.now() + PRIORITY_CACHE_MS };
       })
-      .catch(() => DEFAULT_PRIORITY_FEE)
-      .then((fee) => {
-        cachedTip = { fee, expiresAt: Date.now() + PRIORITY_CACHE_MS };
-        return fee;
+      .catch(() => {
+        cachedTip = { fee: DEFAULT_PRIORITY_FEE, fasterFee: DEFAULT_PRIORITY_FEE, expiresAt: Date.now() + PRIORITY_CACHE_MS };
       })
       .finally(() => { readingTip = undefined; });
     await readingTip;
   }
 
-  const estimate = cachedTip?.fee ?? DEFAULT_PRIORITY_FEE;
+  const estimate = (faster ? cachedTip?.fasterFee : cachedTip?.fee) ?? DEFAULT_PRIORITY_FEE;
   const priority = estimate < MIN_PRIORITY_FEE_WEI ? MIN_PRIORITY_FEE_WEI : estimate;
   return priority > maximumWei ? maximumWei : priority;
 }
