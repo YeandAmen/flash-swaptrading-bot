@@ -197,6 +197,8 @@ export const RISK = {
  * Scanning is always on (paper mode); real bundles need "Arm MEV" in the dashboard.
  */
 const configuredMevV2 = str('MEV_V2_CONTRACT_ADDRESS').trim();
+const mevBuilderTipPct = num('MEV_BUILDER_TIP_PCT', 0.5);
+const mevMinNetUsd = num('MEV_MIN_NET_USD', 0.05);
 export type MevFundingMode = 'auto' | 'pool' | 'aave' | 'morpho';
 export const MEV = {
   enabled: str('MEV', 'on') !== 'off',
@@ -205,8 +207,10 @@ export const MEV = {
   minPoolWeth: num('MEV_MIN_POOL_WETH', 2), // ignore pools holding less WETH than this
   universe: str('MEV_UNIVERSE', 'all'), // independently check the public list; 'spot' only uses the spot/core universe
   maxTrackedPools: num('MEV_MAX_TRACKED_POOLS', 480),
-  builderTipPct: num('MEV_BUILDER_TIP_PCT', 0.5), // share of the after-gas profit paid to the block builder
-  minNetUsd: num('MEV_MIN_NET_USD', 0.05), // smallest after-gas, after-tip profit worth a bundle
+  builderTipPct: mevBuilderTipPct, // share of the after-gas profit paid to the block builder
+  minNetUsd: mevMinNetUsd, // smallest after-gas, after-tip profit worth a bundle
+  idleBuilderTipPct: num('MEV_IDLE_BUILDER_TIP_PCT', mevBuilderTipPct),
+  idleMinNetUsd: num('MEV_IDLE_MIN_NET_USD', mevMinNetUsd),
   maxSimsPerBlock: num('MEV_MAX_SIMS_PER_BLOCK', 3),
   builders: str('MEV_BUILDERS', 'https://relay.flashbots.net,https://rpc.titanbuilder.xyz,https://rpc.beaverbuild.org,https://rpc.quasar.win')
     .split(',').map((s) => s.trim()).filter(Boolean),
@@ -252,5 +256,8 @@ check(MEV.universe === 'all' || MEV.universe === 'spot', 'MEV_UNIVERSE must be a
 check(Number.isInteger(MEV.maxTrackedPools) && MEV.maxTrackedPools >= 16 && MEV.maxTrackedPools <= 1000, 'MEV_MAX_TRACKED_POOLS must be 16..1000');
 frac('MEV_BUILDER_TIP_PCT', MEV.builderTipPct);
 check(MEV.minNetUsd >= 0.01, 'MEV_MIN_NET_USD must be >= 0.01');
+frac('MEV_IDLE_BUILDER_TIP_PCT', MEV.idleBuilderTipPct);
+check(MEV.idleBuilderTipPct >= MEV.builderTipPct, 'MEV_IDLE_BUILDER_TIP_PCT must be at least MEV_BUILDER_TIP_PCT');
+check(MEV.idleMinNetUsd >= 0.01 && MEV.idleMinNetUsd <= MEV.minNetUsd, 'MEV_IDLE_MIN_NET_USD must be between 0.01 and MEV_MIN_NET_USD');
 check(Number.isInteger(MEV.maxSimsPerBlock) && MEV.maxSimsPerBlock >= 1 && MEV.maxSimsPerBlock <= 10, 'MEV_MAX_SIMS_PER_BLOCK must be 1..10');
 check(MEV.builders.every((u) => /^https:\/\//.test(u)), 'MEV_BUILDERS must be https URLs separated by commas');

@@ -20,6 +20,7 @@ const STATE_FILE = path.join(DATA_DIR, 'mev.json');
 /** Address where paper-mode simulations place the contract code (eth_call state override; nothing is deployed). */
 const SIM_ADDR: Address = '0x00000000000000000000000000000000000ab1e5';
 const HOUR = 3_600_000;
+const IDLE_BID_AFTER_MS = 30 * 60_000;
 const SLOT_MS = 12_000;
 const HEAD_RETRY_MS = 400;
 const POOL_READS_PER_CHUNK = 160;
@@ -85,6 +86,7 @@ interface MevStats {
   profitable: number; // still profitable after gas
   bundles: number;
   landed: number;
+  lastLandedAt?: number;
   netEth: number;
   netUsd: number;
   rpcCalls: number;
@@ -171,6 +173,12 @@ interface PreparedOffer {
   tip: bigint;
   minimumProfit: bigint;
   net: bigint;
+}
+
+interface ProfitPolicy {
+  idle: boolean;
+  minNetUsd: number;
+  builderTipPct: number;
 }
 
 interface RouteCooldown {
@@ -454,7 +462,8 @@ export class MevSearcher {
     const cands: Candidate[] = [];
     const now = Date.now();
     const ethUsd = this.host.ethUsd();
-    const minimumNet = validPrice(ethUsd) ? this.minimumNet(ethUsd) : 20_000_000_000_000n;
+    const policy = this.profitPolicy(now);
+    const minimumNet = validPrice(ethUsd) ? this.minimumNet(ethUsd, policy) : 20_000_000_000_000n;
     let est: { net: number; gross: number; gas: number; symbol: string } | null = null;
     for (const [ti, t] of r.tokens.entries()) {
       const res = t.pools.map((p, pi) => reservesOf(t, p, r.results, r.at[ti][pi]));
@@ -488,12 +497,12 @@ export class MevSearcher {
       const alternative = cands.find((c) => c.t.token.address !== leadingToken);
       if (alternative) selected[selected.length - 1] = alternative;
     }
-    const shortlisted = await Promise.all(selected.map((c) => this.evaluate(c, r, nextMaxBase)));
+    const shortlisted = await Promise.all(selected.map((c) => this.evaluate(c, r, nextMaxBase, policy)));
     const offers = shortlisted.filter((offer) => offer !== null).sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
     block.decisionMs = Math.round(performance.now() - started);
     const canTryLive = () => this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending();
     if (canTryLive()) {
-      const prepared = await Promise.all(offers.map((offer) => this.prepareLive(offer, r)));
+      const prepared = await Promise.all(offers.map((offer) => this.prepareLive(offer, r, policy)));
       const ranked = prepared.filter((offer) => offer !== null).sort((a, b) => {
         const byNet = a.net - b.net;
         const difference = byNet === 0n ? a.tip - b.tip : byNet;
@@ -554,7 +563,7 @@ export class MevSearcher {
     }
   }
 
-  private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint): Promise<Offer | null> {
+  private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy): Promise<Offer | null> {
     const st = this.file.stats;
     st.candidates++;
     const key = `${poolIdentity(c.A)}|${poolIdentity(c.B)}`;
@@ -607,7 +616,7 @@ export class MevSearcher {
     opp.grossEth = eth(b.profit);
     opp.netEth = eth(net);
     opp.netUsd = validPrice(ethUsd) ? opp.netEth * ethUsd : 0;
-    const minNetWei = validPrice(ethUsd) ? this.minimumNet(ethUsd) : 20_000_000_000_000n;
+    const minNetWei = validPrice(ethUsd) ? this.minimumNet(ethUsd, policy) : 20_000_000_000_000n;
     if (net < minNetWei) {
       // estimate far above reality = an illusion of the quick math: back off for longer
       const illusion = Number(b.profit) / 1e18 < c.est * 0.1;
@@ -624,7 +633,7 @@ export class MevSearcher {
     }
     this.cooldown.delete(key);
     st.profitable++;
-    const tip = this.builderTip(net, minNetWei);
+    const tip = this.builderTip(net, minNetWei, policy);
     opp.tipEth = eth(tip);
     opp.netEth = eth(net - tip);
     opp.netUsd = validPrice(ethUsd) ? opp.netEth * ethUsd : 0;
@@ -633,12 +642,26 @@ export class MevSearcher {
     return { candidate: c, amount: b.amount, profit: b.profit, funding: b.funding, score: net - tip, opp };
   }
 
-  private minimumNet(ethUsd: number): bigint {
-    return BigInt(Math.max(1, Math.ceil(MEV.minNetUsd / ethUsd * 1e18)));
+  private profitPolicy(now: number): ProfitPolicy {
+    const { stats, armedAt } = this.file;
+    // Old journals with no landed bundles already record how long the scanner has been running.
+    const since = stats.lastLandedAt ?? (stats.landed === 0 ? stats.since : armedAt);
+    const configured = MEV.idleBuilderTipPct !== MEV.builderTipPct || MEV.idleMinNetUsd !== MEV.minNetUsd;
+    const idle = configured && this.liveArmed(this.armGeneration) && this.contractReady
+      && since !== null && Number.isFinite(since) && since > 0 && now - since >= IDLE_BID_AFTER_MS;
+    return {
+      idle,
+      minNetUsd: idle ? MEV.idleMinNetUsd : MEV.minNetUsd,
+      builderTipPct: idle ? MEV.idleBuilderTipPct : MEV.builderTipPct,
+    };
   }
 
-  private builderTip(afterGas: bigint, minimumNet: bigint): bigint {
-    const proposed = (afterGas * BigInt(Math.round(MEV.builderTipPct * 10_000))) / 10_000n;
+  private minimumNet(ethUsd: number, policy: ProfitPolicy): bigint {
+    return BigInt(Math.max(1, Math.ceil(policy.minNetUsd / ethUsd * 1e18)));
+  }
+
+  private builderTip(afterGas: bigint, minimumNet: bigint, policy: ProfitPolicy): bigint {
+    const proposed = (afterGas * BigInt(Math.round(policy.builderTipPct * 10_000))) / 10_000n;
     const room = afterGas - minimumNet;
     return proposed < room ? proposed : room;
   }
@@ -654,14 +677,14 @@ export class MevSearcher {
     return null;
   }
 
-  private async prepareLive(offer: Offer, r: BlockRead): Promise<PreparedOffer | null> {
+  private async prepareLive(offer: Offer, r: BlockRead, policy: ProfitPolicy): Promise<PreparedOffer | null> {
     const contract = this.selectedContract;
     const { candidate: c, opp } = offer;
     if (!contract) return this.skipOpportunity(opp, 'verified FlashArbV2 unavailable');
     if (!this.beforeNextSlot(r)) return this.skipOpportunity(opp, 'target slot passed before gas estimation');
     const ethUsd = this.host.ethUsd();
     if (!validPrice(ethUsd)) return this.skipOpportunity(opp, 'ETH/USD price unavailable');
-    const minimumNet = this.minimumNet(ethUsd);
+    const minimumNet = this.minimumNet(ethUsd, policy);
     const target = r.blockNumber + 1n;
     const encode = (tip: bigint, minProfit: bigint) => encodeArbitrage(offer.funding, {
       buy: c.A, sell: c.B, token: c.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
@@ -674,7 +697,7 @@ export class MevSearcher {
       const gasBudget = gas * r.nextBaseFee;
       const afterGas = offer.profit - gasBudget;
       if (afterGas < minimumNet) return this.skipOpportunity(opp, 'below configured profit floor with padded gas');
-      const tip = this.builderTip(afterGas, minimumNet);
+      const tip = this.builderTip(afterGas, minimumNet, policy);
       if (tip === 0n) return this.skipOpportunity(opp, 'profit does not cover a builder payment above the configured floor');
       const minimumProfit = tip + gasBudget + minimumNet;
       return { offer, contract, ethUsd, gas, gasBudget, tip, minimumProfit, data: encode(tip, minimumProfit), net: afterGas - tip };
@@ -888,7 +911,12 @@ export class MevSearcher {
     f.pending = null;
     f.recent = [outcome, ...f.recent.filter((item) => item.hash !== outcome.hash)].slice(0, 60);
     if (included) {
-      f.stats = { ...f.stats, landed: f.stats.landed + (outcome.status === 'landed' ? 1 : 0), netEth: f.stats.netEth + outcome.netEth, netUsd: f.stats.netUsd + outcome.netUsd };
+      const landed = outcome.status === 'landed';
+      f.stats = {
+        ...f.stats, landed: f.stats.landed + (landed ? 1 : 0),
+        lastLandedAt: landed ? Date.now() : f.stats.lastLandedAt,
+        netEth: f.stats.netEth + outcome.netEth, netUsd: f.stats.netUsd + outcome.netUsd,
+      };
     }
     try {
       this.writeState();
@@ -1164,7 +1192,11 @@ export class MevSearcher {
       pending: this.pending ? { hash: this.pending.hash, target: Number(this.pending.target) } : null,
       deploymentPending: f.deployTx,
       recent: f.recent.slice(0, 15),
-      settings: { tipPct: MEV.builderTipPct, minNetUsd: MEV.minNetUsd, minPoolWeth: MEV.minPoolWeth, builders: MEV.builders.map((u) => new URL(u).hostname) },
+      settings: {
+        tipPct: MEV.builderTipPct, minNetUsd: MEV.minNetUsd, minPoolWeth: MEV.minPoolWeth,
+        activeProfitPolicy: this.profitPolicy(Date.now()),
+        builders: MEV.builders.map((u) => new URL(u).hostname),
+      },
     };
   }
 }

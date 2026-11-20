@@ -224,8 +224,10 @@ function render() {
       : '';
     const timing = lb?.decisionMs == null ? '' : ` · ${lb.readMs} ms pool reads, ${lb.decisionMs} ms decisions`;
     const missingReads = lb?.failedChunks > 0 ? ` · ${lb.failedChunks} pool batches unavailable` : '';
+    const P = X.settings?.activeProfitPolicy;
+    const idleBid = P?.idle ? ` · idle bidding with a ${usd(P.minNetUsd)} net floor and up to ${Math.round(P.builderTipPct * 100)}% of after-gas profit bid` : '';
     $('mevStatus').textContent = `${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
-      coverage + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
+      coverage + idleBid + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
     const st = X.stats;
     $('mevBlocks').textContent = st.blocks.toLocaleString();
     const B = X.bestThisHour?.exact ? X.bestThisHour : null;
