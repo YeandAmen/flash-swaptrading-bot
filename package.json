@@ -23,10 +23,12 @@
     "wallet:export": "node dist/cli-wallet.js export",
     "mev-fork-test": "node scripts/fork-test.mjs cli-mev-v2-forktest",
     "mev-v2-fork-test": "node scripts/fork-test.mjs cli-mev-v2-forktest",
+    "mev-v3-fork-test": "node scripts/fork-test.mjs cli-mev-v3-forktest",
     "wallet:fork-test": "node scripts/fork-test.mjs cli-wallet-forktest",
     "wallet:local-test": "node scripts/fork-test.mjs cli-wallet-forktest --standalone",
     "build:contract": "node scripts/build-contract.mjs",
     "mev:v2:bytecode": "node dist/cli-mev-v2-bytecode.js",
+    "mev:v3:bytecode": "node dist/cli-mev-v2-bytecode.js v3",
     "mev:scan": "node dist/cli-mev-scan.js"
   },
   "dependencies": {

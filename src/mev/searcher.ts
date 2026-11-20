@@ -9,6 +9,7 @@ import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../e
 import type { McResult } from '../market.js';
 import { writeJson } from '../persistence.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
+import { FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
 import { bundleTraceRequests, requestBuilderTrace } from './builder-trace.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
 import { sendBundle, type BuilderResult } from './bundles.js';
@@ -266,8 +267,11 @@ export class MevSearcher {
     });
   }
 
-  private get selectedContract() { return this.file.v2Contract ?? null; }
-  private get configuredContract() { return MEV.v2ContractAddress; }
+  private get isV3() { return MEV.v3ContractAddress !== null; }
+  private get contractLabel() { return this.isV3 ? 'FlashArbV3' : 'FlashArbV2'; }
+  private get contractRuntime() { return this.isV3 ? FLASH_ARB_V3_RUNTIME : FLASH_ARB_V2_RUNTIME; }
+  private get selectedContract() { return MEV.v3ContractAddress ?? this.file.v2Contract ?? null; }
+  private get configuredContract() { return MEV.v3ContractAddress ?? MEV.v2ContractAddress; }
 
   private get pending() { return this.file.pending; }
 
@@ -335,7 +339,7 @@ export class MevSearcher {
     if (!MEV.enabled) return 'Off (MEV=off in .env)';
     if (this.deploying) return 'Deploying FlashArbV2…';
     if (this.file.deployTx) return 'Waiting for the deployment transaction to settle';
-    if (this.file.armed && !this.contractReady) return 'Verifying the FlashArbV2 contract…';
+    if (this.file.armed && !this.contractReady) return `Verifying the ${this.contractLabel} contract…`;
     if (this.file.armed) return 'Live mode: eligible bundles go to the configured builders';
     return 'Paper mode: every block is scanned and simulated, nothing is sent';
   }
@@ -600,7 +604,7 @@ export class MevSearcher {
         data,
         stateOverride: contract
           ? undefined
-          : [{ address: SIM_ADDR, code: FLASH_ARB_V2_RUNTIME, stateDiff: [{ slot: pad('0x0'), value: pad(this.host.account.address) }] }],
+          : [{ address: SIM_ADDR, code: this.contractRuntime, stateDiff: [{ slot: pad('0x0'), value: pad(this.host.account.address) }] }],
       });
       if (!res.data) return { ok: false, reason: 'no result', reverted: false };
       return { ok: true, profit: decodeArbitrage(res.data) };
@@ -617,7 +621,7 @@ export class MevSearcher {
     const previous = this.previousSizes.get(key);
     const sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previous && Date.now() - previous.at < 10 * 60_000 ? previous.amount : undefined);
     if (!sizes.length) return null;
-    const trials = fundingTrials(MEV.funding, sizes);
+    const trials = fundingTrials(MEV.funding, sizes, this.isV3);
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));
     st.rpcCalls += sims.length;
     st.simulated++;
@@ -745,7 +749,7 @@ export class MevSearcher {
   private async prepareLive(offer: Offer, r: BlockRead, policy: ProfitPolicy): Promise<PreparedOffer | null> {
     const contract = this.selectedContract;
     const { candidate: c, opp } = offer;
-    if (!contract) return this.skipOpportunity(opp, 'verified FlashArbV2 unavailable');
+    if (!contract) return this.skipOpportunity(opp, `verified ${this.contractLabel} unavailable`);
     if (!this.beforeNextSlot(r)) return this.skipOpportunity(opp, 'target slot passed before gas estimation');
     const ethUsd = this.host.ethUsd();
     if (!validPrice(ethUsd)) return this.skipOpportunity(opp, 'ETH/USD price unavailable');
@@ -1050,7 +1054,7 @@ export class MevSearcher {
     this.file.armed = true;
     this.file.armedAt = Date.now();
     this.status = this.modeText();
-    this.host.log('MEV live arming requested. Verifying FlashArbV2.', 'warn');
+    this.host.log(`MEV live arming requested. Verifying ${this.contractLabel}.`, 'warn');
     void this.verifyForArm(address, generation);
   }
 
@@ -1065,12 +1069,12 @@ export class MevSearcher {
     if (wasArmed) this.host.log(`MEV arbitrage disarmed ${reason}. Scanning continues in paper mode.`, 'warn');
   }
 
-  private async contractOk(addr: Address): Promise<boolean> {
+  private async contractOk(addr: Address, runtime: Hex = this.contractRuntime): Promise<boolean> {
     const [code, owner] = await Promise.all([
       publicClient.getCode({ address: addr }).catch(() => undefined),
       publicClient.readContract({ address: addr, abi: FLASH_ARB_V2_ABI, functionName: 'owner' }).catch(() => null),
     ]);
-    return code?.toLowerCase() === FLASH_ARB_V2_RUNTIME.toLowerCase() && owner?.toLowerCase() === this.host.account.address.toLowerCase();
+    return code?.toLowerCase() === runtime.toLowerCase() && owner?.toLowerCase() === this.host.account.address.toLowerCase();
   }
 
   private clearDeployment(deployment?: { address: Address; gasWei: bigint }) {
@@ -1120,7 +1124,7 @@ export class MevSearcher {
     if (f.deployNonce !== null) this.host.exec.noteNonceUsed(f.deployNonce);
     if (receipt.status === 'success') {
       if (!receipt.contractAddress || receipt.from.toLowerCase() !== this.host.account.address.toLowerCase()
-        || (f.deployVersion === 'v2' && !await this.contractOk(receipt.contractAddress))) {
+        || (f.deployVersion === 'v2' && !await this.contractOk(receipt.contractAddress, FLASH_ARB_V2_RUNTIME))) {
         throw new Error('Confirmed deployment could not be verified');
       }
       this.clearDeployment({ address: receipt.contractAddress, gasWei: receipt.gasUsed * receipt.effectiveGasPrice });
@@ -1133,7 +1137,7 @@ export class MevSearcher {
 
   private async verifyForArm(address: Address, generation: number) {
     try {
-      if (!await this.contractOk(address)) throw new Error('FlashArbV2 bytecode or bot wallet ownership could not be verified.');
+      if (!await this.contractOk(address)) throw new Error(`${this.contractLabel} bytecode or bot wallet ownership could not be verified.`);
       if (!this.liveArmed(generation)) return;
       if (!this.selectedContract) {
         const previous = this.file.v2Contract;
@@ -1147,7 +1151,7 @@ export class MevSearcher {
       }
       this.contractReady = true;
       this.status = this.modeText();
-      this.host.log(`[mev] Verified FlashArbV2 at ${address}`);
+      this.host.log(`[mev] Verified ${this.contractLabel} at ${address}`);
     } catch (error) {
       if (this.liveArmed(generation)) {
         this.host.log('[mev] Arming stopped: ' + errMsg(error), 'warn');
@@ -1234,10 +1238,10 @@ export class MevSearcher {
       armed: f.armed,
       contract: this.selectedContract,
       configuredContract: this.configuredContract,
-      contractVersion: 'v2',
+      contractVersion: this.isV3 ? 'v3' : 'v2',
       fundingMode: MEV.funding,
-      deployedAt: f.v2DeployedAt ?? null,
-      deployGasUsd: f.v2DeployGasUsd ?? 0,
+      deployedAt: this.isV3 ? null : f.v2DeployedAt ?? null,
+      deployGasUsd: this.isV3 ? 0 : f.v2DeployGasUsd ?? 0,
       tokens: this.tokens.length,
       pools: this.tokens.reduce((s, t) => s + t.pools.length, 0),
       venues,

@@ -146,7 +146,20 @@ Paper scanning is available after startup. If the live controls are disabled, ch
 3. Type `DEPLOY` and authorize the action with the password from `npm run --silent dashboard:password`. The bot waits for the receipt and verifies the deployed bytecode and wallet ownership.
 4. **Arm MEV** separately when you want live arbitrage. Spot trading has its own arming control. To return to paper-only operation, set `ALLOW_LIVE_TRADING=off` and restart.
 
-The dashboard reuses a verified V2 deployment. To adopt a manually deployed copy, set `MEV_V2_CONTRACT_ADDRESS` to the FlashArbV2 address owned by the bot wallet and restart. The bot verifies its runtime and owner before use. Ethereum keeps prior V1 deployments and their transaction history on-chain. The current bot uses FlashArbV2.
+The dashboard reuses a verified V2 deployment. To adopt a manually deployed copy, set `MEV_V2_CONTRACT_ADDRESS` to the FlashArbV2 address owned by the bot wallet and restart. The bot verifies its runtime and owner before use.
+
+### Optional FlashArbV3 with Balancer V3 funding
+
+FlashArbV3 adds Balancer V3 WETH funding to the existing swap routes and lending options. It executes the two swaps, repays the lender and returns the contract's proceeds to its deploying wallet in the same transaction. The owner and runtime checks apply to the configured V3 address. [Balancer V3 flash loans](https://docs.balancer.fi/concepts/vault/flash-loans.html)
+
+```sh
+npm run build:contract -- v3
+npm run build
+FORK_BLOCK_NUMBER=26451239 npm run mev-v3-fork-test
+npm run --silent mev:v3:bytecode
+```
+
+The fork suite signs fake-funded transactions and submits them to the local Anvil node via Ethereum JSON-RPC. The last command prints creation bytecode for deployment from the bot wallet. The constructor takes no arguments. After deploying and settling any outstanding bot transactions, configure the new address as `MEV_V3_CONTRACT_ADDRESS` with any V2 address setting removed, then restart. Use `MEV_FUNDING=auto` to compare all four funding sources or `MEV_FUNDING=balancer` for Balancer V3. Live MEV continues to use the configured private bundle destinations.
 
 Successful routes settle the loan and forward net proceeds and relevant route leftovers to the owner. An owner-only recovery path handles assets transferred to the contract outside a route. For manual deployment, use `npm run --silent mev:v2:bytecode` to obtain the public creation data and deploy from the bot wallet on Ethereum mainnet. If you change the Solidity source, rebuild it with `npm run build:contract` using `solc` 0.8.26, then run `npm run build`.
 

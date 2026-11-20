@@ -197,13 +197,15 @@ export const RISK = {
  * Scanning is always on (paper mode); real bundles need "Arm MEV" in the dashboard.
  */
 const configuredMevV2 = str('MEV_V2_CONTRACT_ADDRESS').trim();
+const configuredMevV3 = str('MEV_V3_CONTRACT_ADDRESS').trim();
 const mevBuilderTipPct = num('MEV_BUILDER_TIP_PCT', 0.5);
 const mevMinNetUsd = num('MEV_MIN_NET_USD', 0.05);
-export type MevFundingMode = 'auto' | 'pool' | 'aave' | 'morpho';
+export type MevFundingMode = 'auto' | 'pool' | 'aave' | 'morpho' | 'balancer';
 export const MEV = {
   enabled: str('MEV', 'on') !== 'off',
   funding: str('MEV_FUNDING', 'auto') as MevFundingMode,
   v2ContractAddress: configuredMevV2 ? getAddress(configuredMevV2) : null,
+  v3ContractAddress: configuredMevV3 ? getAddress(configuredMevV3) : null,
   minPoolWeth: num('MEV_MIN_POOL_WETH', 2), // ignore pools holding less WETH than this
   universe: str('MEV_UNIVERSE', 'all'), // independently check the public list; 'spot' only uses the spot/core universe
   maxTrackedPools: num('MEV_MAX_TRACKED_POOLS', 480),
@@ -252,7 +254,9 @@ check(GAS_TOPUP.belowEth > 0 && GAS_TOPUP.belowEth < 1, 'GAS_TOPUP_BELOW_ETH mus
 check(GAS_TOPUP.usd >= 1 && GAS_TOPUP.usd <= 100, 'GAS_TOPUP_USD must be 1..100');
 check(Number.isInteger(GAS_TOPUP.maxPerDay) && GAS_TOPUP.maxPerDay >= 1 && GAS_TOPUP.maxPerDay <= 24, 'GAS_TOPUP_MAX_PER_DAY must be 1..24');
 check(MEV.minPoolWeth >= 0.1, 'MEV_MIN_POOL_WETH must be >= 0.1');
-check(['auto', 'pool', 'aave', 'morpho'].includes(MEV.funding), 'MEV_FUNDING must be auto, pool, aave or morpho');
+check(['auto', 'pool', 'aave', 'morpho', 'balancer'].includes(MEV.funding), 'MEV_FUNDING must be auto, pool, aave, morpho or balancer');
+check(!(MEV.v2ContractAddress && MEV.v3ContractAddress), 'Configure only one FlashArb contract address');
+check(MEV.funding !== 'balancer' || MEV.v3ContractAddress !== null, 'MEV_FUNDING=balancer requires MEV_V3_CONTRACT_ADDRESS');
 check(MEV.universe === 'all' || MEV.universe === 'spot', 'MEV_UNIVERSE must be all or spot');
 check(Number.isInteger(MEV.maxTrackedPools) && MEV.maxTrackedPools >= 16 && MEV.maxTrackedPools <= 1000, 'MEV_MAX_TRACKED_POOLS must be 16..1000');
 frac('MEV_BUILDER_TIP_PCT', MEV.builderTipPct);

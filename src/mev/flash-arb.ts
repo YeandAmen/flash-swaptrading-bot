@@ -3,9 +3,9 @@ import type { MevFundingMode } from '../config.js';
 import { FLASH_ARB_V2_ABI } from './artifact-v2.js';
 import { toNextVenue, type ArbPool } from './pools.js';
 
-export type RouteFunding = 0 | 1 | 2;
-export const FUNDING_NAMES = ['Pool flash swap', 'Aave V3', 'Morpho Blue'] as const;
-export const EXECUTION_GAS_ADDON = [0, 95_000, 70_000] as const;
+export type RouteFunding = 0 | 1 | 2 | 3;
+export const FUNDING_NAMES = ['Pool flash swap', 'Aave V3', 'Morpho Blue', 'Balancer V3'] as const;
+export const EXECUTION_GAS_ADDON = [0, 95_000, 70_000, 100_000] as const;
 
 interface Call {
   token: Address;
@@ -29,12 +29,14 @@ export function decodeArbitrage(data: Hex): bigint {
 }
 
 /** Compare the reserve estimate and smallest trial for each lender. Explicit modes use the full grid. */
-export function fundingTrials(mode: MevFundingMode, sizes: bigint[]) {
+export function fundingTrials(mode: MevFundingMode, sizes: bigint[], includeBalancer = false) {
   if (mode === 'pool') return sizes.map((amount) => ({ funding: 0 as const, amount }));
   if (mode === 'aave') return sizes.map((amount) => ({ funding: 1 as const, amount }));
   if (mode === 'morpho') return sizes.map((amount) => ({ funding: 2 as const, amount }));
+  if (mode === 'balancer') return includeBalancer ? sizes.map((amount) => ({ funding: 3 as const, amount })) : [];
   if (!sizes.length) return [];
   const smallest = sizes.reduce((a, b) => a < b ? a : b);
   const lenderSizes = [...new Set([sizes[0], smallest])];
-  return ([0, 1, 2] as const).flatMap((funding) => (funding === 0 ? sizes : lenderSizes).map((amount) => ({ funding, amount })));
+  const sources: RouteFunding[] = includeBalancer ? [0, 1, 2, 3] : [0, 1, 2];
+  return sources.flatMap((funding) => (funding === 0 ? sizes : lenderSizes).map((amount) => ({ funding, amount })));
 }

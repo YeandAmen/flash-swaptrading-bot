@@ -8,8 +8,10 @@ const price = (p) => (p == null ? '–' : p >= 1000 ? usd(p, 0) : p >= 1 ? usd(p
 const time = (t) => new Date(t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const ago = (t) => { const s = Math.round((Date.now() - t) / 1000); return s < 60 ? s + 's ago' : Math.round(s / 60) + 'm ago'; };
+const MEV_STALE_AFTER_MS = 60_000;
 
 let S = null;
+let stateRequest = null;
 let tab = 'live';
 let qrLoaded = false;
 let panicPending = false;
@@ -33,14 +35,25 @@ async function api(path, body) {
 }
 
 async function refresh() {
+  stateRequest?.abort();
+  const request = new AbortController();
+  stateRequest = request;
+  const timeout = setTimeout(() => request.abort(), 10_000);
   try {
-    const r = await fetch('/api/state', { cache: 'no-store' });
+    const r = await fetch('/api/state', { cache: 'no-store', signal: request.signal });
     if (!r.ok) throw new Error(r.statusText);
-    S = await r.json();
+    const state = await r.json();
+    if (stateRequest !== request) return;
+    S = state;
     render();
   } catch (e) {
+    if (stateRequest !== request) return;
+    $('modePill').className = 'pill err'; $('modePill').textContent = 'OFFLINE';
     $('banner').className = 'banner bad';
     $('bannerText').textContent = 'Dashboard data is unavailable. Retrying automatically.';
+  } finally {
+    clearTimeout(timeout);
+    if (stateRequest === request) stateRequest = null;
   }
 }
 
@@ -62,6 +75,19 @@ function render() {
   // mode + banner
   const pill = $('modePill');
   const banner = $('banner');
+  const mev = S.mev;
+  const now = Number.isFinite(S.now) ? S.now : Date.now();
+  const scanAt = mev?.lastBlock?.at;
+  const scanAge = mev?.mode === 'live' && Number.isFinite(scanAt) && scanAt > 0 ? now - scanAt : null;
+  const staleScan = scanAge !== null && scanAge > MEV_STALE_AFTER_MS
+    ? `Last MEV scan was ${Math.floor(scanAge / 1000)} seconds ago.` : '';
+  const pendingTarget = mev?.pending?.target;
+  const scanBlock = mev?.lastBlock?.number;
+  const waitingForBundle = S.health?.ready === false && S.health.reason === 'Waiting for wallet transaction settlement'
+    && !S.forkMode && !mev?.lastError && !mev?.deploymentPending
+    && scanAge !== null && scanAge >= 0 && !staleScan
+    && Number.isSafeInteger(scanBlock) && Number.isSafeInteger(pendingTarget)
+    && pendingTarget >= scanBlock - 3 && pendingTarget <= scanBlock + 1;
   if (S.liveFault) {
     pill.className = 'pill err'; pill.textContent = 'RECOVERY';
     banner.className = 'banner bad'; $('bannerText').textContent = S.liveFault;
@@ -71,9 +97,16 @@ function render() {
   } else if (S.status === 'error' || S.lastError) {
     pill.className = 'pill err'; pill.textContent = S.status === 'error' ? 'ERROR' : (S.armed ? 'LIVE' : 'PAPER');
     banner.className = 'banner bad'; $('bannerText').textContent = 'Problem: ' + (S.lastError || 'unknown') + ' — the bot retries automatically.';
+  } else if (waitingForBundle) {
+    pill.className = 'pill wait'; pill.textContent = 'SETTLING';
+    banner.className = 'banner warn';
+    $('bannerText').textContent = `Scanning while the MEV bundle for block ${pendingTarget.toLocaleString()} settles.`;
   } else if (!S.health.ready) {
     pill.className = 'pill err'; pill.textContent = 'UNREADY';
     banner.className = 'banner bad'; $('bannerText').textContent = S.health.reason;
+  } else if (!S.forkMode && staleScan) {
+    pill.className = 'pill err'; pill.textContent = 'MEV STALE';
+    banner.className = 'banner bad'; $('bannerText').textContent = staleScan;
   } else if (S.forkMode) {
     pill.className = 'pill paper'; pill.textContent = 'LOCAL FORK';
     banner.className = 'banner'; $('bannerText').textContent = 'Connected to a local Ethereum fork with test funds.';
@@ -227,7 +260,7 @@ function render() {
     const P = X.settings?.activeProfitPolicy;
     const padding = P?.gasPaddingPct == null ? '' : ` · ${Math.round(P.gasPaddingPct * 100)}% gas buffer`;
     const idleBid = P?.idle ? ` · idle bidding with a ${usd(P.minNetUsd)} net floor and up to ${Math.round(P.builderTipPct * 100)}% of after-gas profit bid${padding}` : '';
-    $('mevStatus').textContent = `${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
+    $('mevStatus').textContent = (staleScan ? 'Scan is stale · ' : '') + `${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
       coverage + idleBid + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
     const st = X.stats;
     $('mevBlocks').textContent = st.blocks.toLocaleString();
@@ -282,13 +315,14 @@ function bundleDetails(submission, openBundles) {
 
 function renderMevControls(X) {
   const contract = X?.contract || X?.configuredContract;
+  const contractName = X?.contractVersion === 'v3' ? 'FlashArbV3' : 'FlashArbV2';
   const off = X?.mode === 'off';
   let reason = '';
   if (!X) reason = 'Waiting for bot status.';
   else if (off) reason = 'MEV scanning is disabled by MEV=off in .env.';
   else if (X.deploymentPending) reason = 'Waiting for the FlashArbV2 deployment receipt.';
   else if (mevDeploySubmitting || X.mode === 'deploying') reason = 'Preparing FlashArbV2 deployment…';
-  else if (X.mode === 'arming') reason = 'Checking FlashArbV2 before arming…';
+  else if (X.mode === 'arming') reason = `Checking ${contractName} before arming…`;
   else if (!S.liveTradingAllowed) reason = 'Set ALLOW_LIVE_TRADING=on in .env and restart to enable deployment and live MEV.';
   else if (!S.health.ready) reason = S.health.reason || 'Waiting for the bot to be ready.';
   else if (X.pending) reason = 'Waiting for a submitted MEV bundle to settle.';
@@ -299,7 +333,7 @@ function renderMevControls(X) {
   $('mevArmBtn').disabled = Boolean(reason || !contract);
   $('mevDisarmBtn').hidden = !X?.armed;
   $('mevContract').hidden = !contract;
-  $('mevContract').textContent = contract ? `FlashArbV2 ${contract}${X.contract ? '' : ' (configured)'}` : '';
+  $('mevContract').textContent = contract ? `${contractName} ${contract}${X.contract ? '' : ' (configured)'}` : '';
   const status = reason || (contract ? '' : 'Deploy FlashArbV2 to enable MEV arming.');
   const statusNode = $('mevDeploy');
   if (statusNode.textContent !== status) statusNode.textContent = status;
@@ -437,5 +471,5 @@ $('resetPaperBtn').onclick = async () => { if (confirm('Reset the paper portfoli
 $('btBtn').onclick = async () => { await api('/api/backtest'); refresh(); };
 
 refresh();
-setInterval(refresh, 4000);
+setInterval(() => { if (!stateRequest) void refresh(); }, 4000);
 setInterval(() => { if (S?.lastTickAt) $('cAgo').textContent = ago(S.lastTickAt); }, 1000);

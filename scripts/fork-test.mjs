@@ -7,7 +7,8 @@ import { generatePrivateKey } from 'viem/accounts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const [requestedSuite = 'cli-forktest', mode = '', ...extra] = process.argv.slice(2);
-const suite = requestedSuite === 'cli-mev-forktest' ? 'cli-mev-v2-forktest' : requestedSuite;
+const useV3 = requestedSuite === 'cli-mev-v3-forktest';
+const suite = requestedSuite === 'cli-mev-forktest' || useV3 ? 'cli-mev-v2-forktest' : requestedSuite;
 const suites = ['cli-forktest', 'cli-mev-v2-forktest', 'cli-wallet-forktest'];
 const standalone = suite === 'cli-wallet-forktest' && mode === '--standalone';
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
@@ -85,6 +86,7 @@ try {
   test = spawn(process.execPath, [testFile], { cwd: root, stdio: 'inherit', env: {
     ...env, RPC_URL: loopback, SEND_RPC_URL: loopback, FORK_MODE: '1', ALLOW_LIVE_TRADING: 'off',
     WALLET_KEY_FILE: key, DATA_DIR: path.join(temporary, 'data'), LOOP_SECONDS: '5', TOKEN_MODE: 'core',
+    MEV_FORK_USE_V3: useV3 ? '1' : '0',
   } });
   process.exitCode = await exitStatus(test);
 } catch (error) {
