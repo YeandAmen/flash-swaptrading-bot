@@ -56,6 +56,7 @@ export interface SolanaScanConfig {
 }
 
 export interface PreparedSolanaCycle {
+  testId?: string;
   transaction: Transaction;
   lastValidBlockHeight: bigint;
   simulationSlot: bigint;
@@ -252,11 +253,12 @@ function summarizeFailure(error: unknown, apiKey?: string): string {
 
 /** Build and simulate an unsigned mainnet transaction. Only the live worker can authorize a qualified candidate. */
 export async function scanSolanaCycle(config: SolanaScanConfig,
-  execute?: (candidate: PreparedSolanaCycle) => Promise<void>): Promise<SolanaScanResult> {
+  execute?: (candidate: PreparedSolanaCycle) => Promise<void>, testId?: string): Promise<SolanaScanResult> {
   if (!config.wallet) throw new Error('Set SOLANA_WALLET_ADDRESS to the public address of your Solana wallet');
   const wallet = address(config.wallet);
   const loan = usdcAmount(config.loanUsdc ?? 250, 1, 100_000, 'Loan size');
-  const minimumNet = usdcAmount(config.minNetUsdc ?? 0.05, 0.000001, 1_000, 'Minimum net profit');
+  const test = Boolean(execute && testId);
+  const minimumNet = test ? 1n : usdcAmount(config.minNetUsdc ?? 0.05, 0.000001, 1_000, 'Minimum net profit');
   const maxFeeLamports = config.maxFeeLamports ?? 50_000;
   if (!Number.isSafeInteger(maxFeeLamports) || maxFeeLamports < 5_000 || maxFeeLamports > 5_000_000) {
     throw new Error('Maximum network fee must be between 5,000 and 5,000,000 lamports');
@@ -341,7 +343,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         if (exactFee === null || exactFee > BigInt(maxFeeLamports)) throw new Error('Solana fee quote exceeds its cap or is unavailable');
         maxDebit = exactFee + baseline.rent;
         if (baseline.lamports <= maxDebit) throw new Error('Solana fee payer cannot cover the fee and required ATA rent');
-        const requiredUsdc = minimumNet + nativeCostInUsdc(maxDebit, loan, firstMinimum);
+        const requiredUsdc = minimumNet + nativeCostInUsdc(test ? baseline.rent : maxDebit, loan, firstMinimum);
         if (beforeNetwork < requiredUsdc) return { buy, sell, status: 'below-profit-floor', quotedNetBeforeNetworkUsdc: quote };
         transaction = await assemble([
           lighthouseLamports(wallet, 'equal', baseline.lamports - exactFee),
@@ -378,10 +380,13 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       // Use the first-leg guaranteed output to conservatively convert SOL fees into the same USDC units as the gain.
       const costUsdc = nativeCostInUsdc(costLamports, loan, firstMinimum);
       const net = postUsdc - preUsdc - costUsdc;
-      const qualified = fee <= BigInt(maxFeeLamports) && net >= minimumNet && beforeNetwork >= costUsdc + minimumNet
-        && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
+      // A functional test can lose only the network fee. Any account rent is still covered by the swap.
+      const protectedLamports = test ? costLamports - fee : costLamports;
+      const protectedCost = nativeCostInUsdc(protectedLamports, loan, firstMinimum);
+      const qualified = fee <= BigInt(maxFeeLamports) && postUsdc - preUsdc >= protectedCost + minimumNet
+        && beforeNetwork >= protectedCost + minimumNet && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
       if (qualified && baseline && exactFee !== null) {
-        candidates.push({ transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight, simulationSlot: execution.slot,
+        candidates.push({ ...(test ? { testId } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight, simulationSlot: execution.slot,
           maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports: baseline.rent, firstMinimum, loan, net });
       }
       return {

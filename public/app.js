@@ -73,34 +73,181 @@ function posList(list, max) {
     <div class="sub">entry ${price(p.entryMid)} · stop ${price(p.stopPrice)}${p.trailActive ? ' (trailing)' : ''} · target ${price(p.targetPrice)} · since ${time(p.entryTime)}</div></div>`).join('');
 }
 
+const networkExplorers = {
+  arbitrum: { origin: 'https://arbiscan.io', address: /^0x[0-9a-f]{40}$/i, tx: /^0x[0-9a-f]{64}$/i },
+  solana: { origin: 'https://explorer.solana.com', address: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, tx: /^[1-9A-HJ-NP-Za-km-z]{64,88}$/ },
+};
+
+function networkLink(network, kind, id, label) {
+  const explorer = networkExplorers[network];
+  if (typeof id !== 'string' || !explorer[kind].test(id)) return '';
+  return `<a href="${explorer.origin}/${kind}/${id}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`;
+}
+
+function networkLogLink(network, href) {
+  if (typeof href !== 'string') return '';
+  try {
+    const url = new URL(href);
+    if (url.origin !== networkExplorers[network].origin || url.username || url.password) return '';
+    const match = /^\/(tx|address)\/([^/]+)\/?$/.exec(url.pathname);
+    return match ? networkLink(network, match[1], match[2], 'Explorer ↗') : '';
+  } catch {
+    return '';
+  }
+}
+
+function compactAddress(address) {
+  return `${address.slice(0, 6)}…${address.slice(-4)}`;
+}
+
+const networkNumber = (value) => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString() : '–';
+const networkAge = (value) => Number.isFinite(value) && value > 0 ? ` · last scan ${ago(value)}` : '';
+const networkUsd = (value) => usd(value, Math.abs(value) < 0.01 ? 4 : 2);
+function networkGas(value, unit) {
+  if ((typeof value !== 'number' && (typeof value !== 'string' || value.trim() === ''))
+    || !Number.isFinite(Number(value)) || Number(value) < 0) return '–';
+  return `${Number(value).toLocaleString('en-US', { maximumFractionDigits: 9 })} ${unit}`;
+}
+
+function setNetworkMarkup(id, html) {
+  const element = $(id);
+  if (element.innerHTML !== html) element.innerHTML = html;
+}
+
+function networkMode(network, state, canArm) {
+  const mode = state?.mode;
+  const active = mode === 'live';
+  const badge = $(network + 'Mode');
+  badge.className = `pill ${active ? 'live' : mode === 'paper' ? 'paper' : 'wait'}`;
+  badge.textContent = active ? 'LIVE' : mode === 'paper' ? 'PAPER' : mode === 'off' ? 'OFF' : 'UNAVAILABLE';
+  $(network + 'Controls').hidden = !state?.canArm && !active;
+  const button = $(network + 'ModeBtn');
+  button.disabled = !active && !canArm;
+  button.textContent = `${active ? 'Disarm' : 'Arm'} ${network === 'arbitrum' ? 'Arbitrum' : 'Solana'}`;
+}
+
+function renderNetworkLog(network, entries, fallback) {
+  const reported = Array.isArray(entries) ? entries.filter((entry) => typeof entry?.message === 'string' && entry.message) : [];
+  const rows = reported.length ? reported.slice().sort((a, b) => (b.t ?? 0) - (a.t ?? 0)) : fallback;
+  setNetworkMarkup(network + 'Log', rows.length ? rows.slice(0, 12).map((entry) => {
+    const level = ['error', 'warn', 'trade'].includes(entry.level) ? entry.level : '';
+    const timestamp = Number.isFinite(entry.t) && entry.t > 0 ? hm(entry.t) : '–';
+    const link = networkLogLink(network, entry.link);
+    return `<div><span class="t">${timestamp}</span><span class="${level}">${esc(entry.message)}${link ? ` ${link}` : ''}</span></div>`;
+  }).join('') : '<div class="empty">No activity recorded.</div>');
+}
+
+const networkOutcomes = {
+  landed: 'Landed', finalized: 'Finalized', reverted: 'Reverted', replaced: 'Replaced',
+  failed: 'Failed', expired: 'Expired', 'invariant-breach': 'Invariant breach',
+  queued: 'Queued', scanning: 'Scanning', submitted: 'Submitted', pending: 'Pending',
+  succeeded: 'Succeeded', confirmed: 'Confirmed', complete: 'Complete', completed: 'Completed',
+  'not-found': 'No qualifying route', 'timed-out': 'Timed out',
+};
+
+function networkOutcome(status) {
+  return typeof status === 'string' ? Object.hasOwn(networkOutcomes, status)
+    ? networkOutcomes[status] : status.replaceAll('-', ' ') : 'Unknown status';
+}
+
+function renderNetworkTest(network, test) {
+  const label = $(network + 'Test');
+  label.hidden = !test;
+  if (!test) return;
+  const outcome = networkOutcome(test.status);
+  const checks = Number.isSafeInteger(test.checked) && test.checked >= 0 ? ` · ${networkNumber(test.checked)} checks` : '';
+  const queuedAt = Number.isFinite(test.queuedAt) && test.queuedAt > 0 ? ` · queued ${time(test.queuedAt)}` : '';
+  const transaction = networkLink(network, 'tx', test.hash, 'Test transaction ↗');
+  const note = typeof test.note === 'string' && test.note ? ` · ${esc(test.note)}` : '';
+  setNetworkMarkup(network + 'Test', `<b>Mainnet test</b> ${esc(outcome)}${checks}${queuedAt}${note}${transaction ? ` · ${transaction}` : ''}`);
+}
+
+function renderNetworkSettlement(network, pending, outcome) {
+  const links = [];
+  const submission = networkLink(network, 'tx', pending, 'Pending transaction ↗');
+  if (submission) links.push(submission);
+  if (outcome) {
+    const status = networkOutcome(outcome.status);
+    const receipt = networkLink(network, 'tx', outcome.hash ?? outcome.signature, `${status} ↗`) || esc(status);
+    const profit = network === 'arbitrum' ? outcome.netUsd : outcome.netUsdc;
+    const fee = network === 'arbitrum'
+      ? (Number.isFinite(outcome.gasUsd) ? networkUsd(outcome.gasUsd) : '')
+      : (Number.isFinite(outcome.feeLamports) ? networkGas(outcome.feeLamports / 1e9, 'SOL') : '');
+    links.push(`<span>${receipt}${Number.isFinite(profit) ? ` · ${networkUsd(profit)} net` : ''}${fee ? ` · ${fee} fee` : ''}</span>`);
+  }
+  setNetworkMarkup(network + 'Settlement', links.join('') || '<span class="sub">No settled transaction recorded.</span>');
+}
+
+function renderArbitrum(arb) {
+  const verified = arb?.deployment?.verified === true;
+  const canArm = arb?.canArm && (arb.deployment ? verified : arb.executor && arb.block > 0);
+  networkMode('arbitrum', arb, canArm);
+  const scanned = arb?.block > 0;
+  const status = arb?.status || 'Arbitrum state unavailable.';
+  $('arbitrumStatus').textContent = status + (scanned ? networkAge(arb.updatedAt) : '');
+  $('arbitrumBlock').textContent = scanned ? networkNumber(arb.block) : '–';
+  $('arbitrumRoutes').textContent = scanned ? networkNumber(arb.routes) : '–';
+  $('arbitrumGas').textContent = networkGas(arb?.balanceEth, 'ETH');
+
+  const deployment = arb?.deployment;
+  const address = deployment?.address ?? arb?.executor;
+  const links = [];
+  if (typeof address === 'string') links.push(networkLink('arbitrum', 'address', address, `Executor ${compactAddress(address)} ↗`));
+  if (verified) links.push('<span class="pos">Bytecode verified</span>');
+  else if (typeof deployment?.status === 'string' && deployment.status) links.push(`<span class="sub">${esc(deployment.status)}</span>`);
+  if (typeof deployment?.owner === 'string') {
+    links.push(networkLink('arbitrum', 'address', deployment.owner, `Owner ${compactAddress(deployment.owner)} ↗`));
+  }
+  links.push(networkLink('arbitrum', 'tx', deployment?.hash, 'Deployment receipt ↗'));
+  if (Number.isSafeInteger(deployment?.block) && deployment.block > 0) {
+    links.push(`<span class="sub">Deployed at L2 block ${networkNumber(deployment.block)}</span>`);
+  }
+  if (Number.isFinite(deployment?.deployedAt) && deployment.deployedAt > 0) {
+    links.push(`<span class="sub">${time(deployment.deployedAt)}</span>`);
+  }
+  setNetworkMarkup('arbitrumDeployment', links.join('') || '<span class="sub">No executor deployment recorded.</span>');
+  renderNetworkSettlement('arbitrum', arb?.pending, arb?.settled);
+  renderNetworkTest('arbitrum', arb?.test);
+  renderNetworkLog('arbitrum', arb?.logs, scanned ? [{ t: arb.updatedAt, message: status }] : []);
+}
+
+function renderSolana(solana) {
+  const execution = solana?.execution;
+  networkMode('solana', solana, solana?.canArm && execution?.ready);
+  const result = solana?.result;
+  const routes = Array.isArray(result?.routes) ? result.routes : null;
+  const checkedAt = solana?.updatedAt || Date.parse(result?.checkedAt ?? '');
+  const completed = ['Unsigned scan completed', 'Guarded live scan completed'].includes(solana?.status);
+  const qualified = routes?.filter((route) => route.qualified).length;
+  const status = completed && qualified !== undefined
+    ? `${qualified} qualifying ${qualified === 1 ? 'route' : 'routes'}` : solana?.status;
+  $('solanaStatus').textContent = (status || 'Solana state unavailable.') + networkAge(checkedAt);
+  $('solanaSlot').textContent = result?.slot > 0 ? networkNumber(result.slot) : '–';
+  $('solanaRoutes').textContent = routes ? networkNumber(routes.length) : '–';
+  $('solanaGas').textContent = networkGas(result?.walletSol, 'SOL');
+
+  const deployment = solana?.deployment;
+  const programLinks = [
+    networkLink('solana', 'address', deployment?.guardAddress, 'Lighthouse guard ↗'),
+    networkLink('solana', 'address', deployment?.lenderAddress, 'Kamino lender ↗'),
+    networkLink('solana', 'address', deployment?.routerAddress, 'Jupiter router ↗'),
+  ];
+  if (deployment?.guardVerified === true) programLinks.push('<span class="pos">Guard verified</span>');
+  else if (typeof deployment?.status === 'string' && deployment.status) programLinks.push(`<span class="sub">${esc(deployment.status)}</span>`);
+  setNetworkMarkup('solanaDeployment', programLinks.join('') || '<span class="sub">Program information unavailable.</span>');
+  renderNetworkSettlement('solana', execution?.pending, execution?.lastOutcome);
+  renderNetworkTest('solana', solana?.test);
+  const fallback = routes?.map((route) => {
+    const routeName = `${route.buy} → ${route.sell}`;
+    return { t: checkedAt, level: route.status === 'quote-error' || route.status === 'simulation-failed' ? 'warn' : '',
+      message: `${routeName} · ${networkOutcome(route.status)}${route.detail ? ` · ${route.detail}` : ''}` };
+  }) ?? [];
+  renderNetworkLog('solana', solana?.logs, fallback);
+}
+
 function renderNetworks(networks) {
-  const arb = networks?.arbitrum;
-  const solana = networks?.solana;
-  const routes = solana?.result?.routes;
-  const rows = [];
-  if (arb && arb.mode !== 'off') {
-    const executor = arb.executor ? ` <a target="_blank" rel="noopener noreferrer" href="https://arbiscan.io/address/${esc(arb.executor)}">Executor ↗</a>` : '';
-    const settled = arb.settled ? ` · <a target="_blank" rel="noopener noreferrer" href="https://arbiscan.io/tx/${esc(arb.settled.hash)}">${esc(arb.settled.status)}</a> ${usd(arb.settled.netUsd)} net` : '';
-    rows.push(['Arbitrum One', arb.mode, arb.block, arb.routes, arb.balanceEth ? `${esc(arb.balanceEth.slice(0, 12))} ETH` : '–', esc(arb.status) + executor + settled]);
-  }
-  if (solana && solana.mode !== 'off') {
-    const balance = solana.result?.walletSol;
-    const qualified = routes?.filter((route) => route.qualified).length;
-    const order = solana.execution;
-    const completed = ['Unsigned scan completed', 'Guarded live scan completed'].includes(solana.status);
-    const status = completed && qualified !== undefined ? `${qualified} qualifying routes` : solana.status;
-    const outcome = order?.lastOutcome;
-    const settled = outcome ? ` · <a target="_blank" rel="noopener noreferrer" href="https://explorer.solana.com/tx/${esc(outcome.signature)}">${esc(outcome.status)}</a>${Number.isFinite(outcome.netUsdc) ? ` ${usd(outcome.netUsdc)} net` : ''}` : '';
-    rows.push(['Solana', solana.mode, solana.result?.slot, routes?.length, Number.isFinite(balance) ? `${balance.toFixed(6)} SOL` : '–',
-      esc(order?.pending ? 'Waiting for transaction settlement' : status) + settled]);
-  }
-  $('extraNetworks').hidden = rows.length === 0;
-  $('arbitrumModeBtn').hidden = !arb?.canArm;
-  $('arbitrumModeBtn').textContent = arb?.mode === 'live' ? 'Disarm Arbitrum' : 'Arm Arbitrum';
-  $('solanaModeBtn').hidden = !solana?.canArm;
-  $('solanaModeBtn').textContent = solana?.mode === 'live' ? 'Disarm Solana' : 'Arm Solana';
-  $('extraNetworkRows').innerHTML = rows.map(([name, mode, block, routes, balance, status]) =>
-    `<tr><td>${name}</td><td>${esc(mode)}</td><td class="r">${block ? block.toLocaleString() : '–'}</td><td class="r">${routes ?? '–'}</td><td class="r">${balance}</td><td>${status}</td></tr>`).join('');
+  renderArbitrum(networks?.arbitrum);
+  renderSolana(networks?.solana);
 }
 
 function render() {

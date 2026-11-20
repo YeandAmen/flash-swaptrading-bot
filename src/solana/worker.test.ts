@@ -93,7 +93,13 @@ test('Solana journals before raw send and restores one pending signature across 
         assert.deepEqual(Buffer.from(tx.messageBytes), Buffer.from(candidate.transaction.messageBytes));
         assert.equal(params[1].skipPreflight, false);
         assert.equal(params[1].maxRetries, 0);
-        assert.equal(JSON.parse(fs.readFileSync(journal, 'utf8')).pending.signature, sig);
+        const saved = JSON.parse(fs.readFileSync(journal, 'utf8'));
+        assert.equal(saved.pending.signature, sig);
+        if (candidate.testId) {
+          assert.equal(saved.pending.testId, candidate.testId);
+          assert.equal(saved.test.status, 'submitted');
+          assert.equal(saved.test.hash, sig);
+        }
         seenSignatures.add(sig);
         pendingSignature = sig;
         throw new Error('Mock send acknowledgment was lost');
@@ -121,6 +127,7 @@ test('Solana journals before raw send and restores one pending signature across 
   await original.initialize();
   assert.equal(original.summary.ready, true);
   assert.equal(original.summary.armed, false);
+  assert.throws(() => original.queueTest('readiness-check'), /ready and armed/);
   const conflicting = makeWorker();
   await assert.rejects(() => conflicting.initialize(), /Another Solana worker/);
   original.arm();
@@ -181,12 +188,52 @@ test('Solana journals before raw send and restores one pending signature across 
   assert.equal(restarted.summary.lastOutcome?.status, 'expired');
   assert.equal(restarted.summary.spentFeeLamports, fee);
 
-  restarted.disarm();
+  // Only the scoped test can accept a bounded network-fee loss, and the actual simulation
+  // must still leave one micro-USDC after protecting the loan and account rent.
+  slot = 91;
+  height = 80;
+  blockhashValid = true;
+  const testId = 'one-solana-test';
+  candidate = { ...testCandidate(wallet, JUPITER), net: -457n, testId };
+  await restarted.submit(candidate);
+  assert.equal(rawSendCount, 2);
+  assert.equal(restarted.queueTest(testId).status, 'queued');
+  restarted.recordTestScan(testId, 2);
+  assert.equal(restarted.activeTest()?.checked, 2);
+  simulationMeta.postTokenBalances = [token(USDC, '1291360', 6), token(WRAPPED_SOL, '90000000', 9)];
+  await restarted.submit(candidate);
+  assert.equal(rawSendCount, 2);
+  assert.equal(restarted.activeTest()?.id, testId);
+
+  simulationMeta.postTokenBalances = [token(USDC, '1291361', 6), token(WRAPPED_SOL, '90000000', 9)];
+  await restarted.submit(candidate);
+  assert.equal(rawSendCount, 3);
+  assert.equal(restarted.summary.test?.status, 'submitted');
+  assert.equal(restarted.activeTest(), null);
+  restarted.recordTestScan(testId, 2);
+  assert.equal(restarted.summary.test?.checked, 4);
   restarted.stop();
+
+  const restartTest = makeWorker();
+  await restartTest.initialize();
+  assert.equal(restartTest.summary.test?.status, 'submitted');
+  assert.equal(restartTest.summary.test?.hash, pendingSignature);
+  finalizedReceipt = 'success';
+  await restartTest.reconcile();
+  assert.equal(restartTest.summary.test?.status, 'landed');
+  assert.equal(restartTest.summary.lastOutcome?.netUsdc, -0.000457);
+  assert.equal(restartTest.summary.lastOutcome?.walletDebitLamports, fee + rent);
+  assert.equal(restartTest.summary.spentFeeLamports, 2 * fee);
+  assert.equal(restartTest.queueTest(testId).status, 'landed');
+  await restartTest.submit(candidate);
+  assert.equal(rawSendCount, 3);
+  restartTest.disarm();
+  restartTest.stop();
 
   const afterDisarm = makeWorker();
   await afterDisarm.initialize();
   assert.equal(afterDisarm.summary.armed, false);
-  assert.equal(afterDisarm.summary.spentFeeLamports, fee);
+  assert.equal(afterDisarm.summary.spentFeeLamports, 2 * fee);
+  assert.equal(afterDisarm.summary.test?.status, 'landed');
   afterDisarm.stop();
 });

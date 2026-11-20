@@ -2,12 +2,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { formatEther, isAddress, isAddressEqual, keccak256, parseEventLogs, type Address, type Hash } from 'viem';
 import { CONFIG, DATA_DIR } from '../config.js';
+import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest } from '../network-test.js';
+import { NetworkActivity } from '../network-activity.js';
 import { writeJson } from '../persistence.js';
 import { loadOrCreateWallet } from '../wallet.js';
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
 import { verifyArbitrumExecutor } from './deployment.js';
 import { prepareArbitrumOrder } from './execution.js';
-import { arbitrumChainId, arbitrumClient, discoverArbitrumPools, scanArbitrum } from './market.js';
+import { arbitrumTestLeads } from './test-leads.js';
+import { arbitrumChainId, arbitrumClient, arbitrumEthUsd, discoverArbitrumPools, scanArbitrum, type ArbQuote } from './market.js';
 
 const journalFile = path.join(DATA_DIR, 'arbitrum-trades.json');
 const haltedFile = path.join(DATA_DIR, 'arbitrum-disarmed.json');
@@ -17,7 +20,7 @@ const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
 type Pending = { hash: Hash; nonce: number; ethUsd: number; budgetUsd: number };
 type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'replaced'; gasUsd: number; netUsd: number; at: number };
-type Journal = { pending: Pending | null; recent: Settlement[] };
+type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest };
 
 export class ArbitrumWorker {
   private readonly client = arbitrumClient(process.env.ARBITRUM_RPC_URL);
@@ -32,6 +35,17 @@ export class ArbitrumWorker {
   readonly owner = (process.env.ARBITRUM_OWNER_ADDRESS ?? '') as Address;
   readonly enabled = process.env.ARBITRUM === 'on' && !CONFIG.forkMode;
 
+  private readonly activity = new NetworkActivity();
+  private deployment = {
+    address: isAddress(this.contract) ? this.contract : null,
+    owner: isAddress(this.owner) ? this.owner : null,
+    verified: false,
+    status: this.contract ? 'Awaiting executor verification' : 'No executor configured',
+    hash: null as Hash | null,
+    block: null as number | null,
+    deployedAt: null as number | null,
+  };
+
   summary = {
     mode: (this.enabled ? 'paper' : 'off') as 'off' | 'paper' | 'live',
     canArm: this.enabled && this.executionEnabled,
@@ -41,13 +55,52 @@ export class ArbitrumWorker {
     balanceEth: null as string | null, pending: null as Hash | null, settled: null as Settlement | null,
   };
 
+  view() { return { ...this.summary, deployment: this.deployment, logs: this.activity.view(), test: flashTestView(this.journal?.test) }; }
+
+  queueTest(id: string) {
+    if (!this.journal || this.summary.mode !== 'live' || this.halted || this.journal.pending) throw new Error('Arbitrum live wallet is not ready for a test');
+    const test = queueFlashTest(this.journal.test, id);
+    if (test !== this.journal.test) {
+      this.save({ ...this.journal, test });
+      this.activity.record('info', 'Queued one Arbitrum mainnet flash-loan test');
+    }
+  }
+
+  scanError(message: string) {
+    this.summary.status = message;
+    this.activity.record('error', message);
+  }
+
+  private async checkDeployment() {
+    const hash = process.env.ARBITRUM_DEPLOYMENT_TX;
+    if (!hash || !/^0x[0-9a-f]{64}$/i.test(hash)) return;
+    try {
+      const receipt = await this.client.getTransactionReceipt({ hash: hash as Hash });
+      if (receipt.status !== 'success' || !receipt.contractAddress || !isAddressEqual(receipt.contractAddress, this.contract)
+        || !isAddressEqual(receipt.from, this.owner)) {
+        this.activity.record('warn', 'Configured deployment receipt does not match the executor and owner');
+        return;
+      }
+      const block = await this.client.getBlock({ blockNumber: receipt.blockNumber });
+      const deployedAt = Number(block.timestamp) * 1000;
+      this.deployment = { ...this.deployment, hash: receipt.transactionHash, block: Number(receipt.blockNumber), deployedAt };
+      this.activity.record('info', `Executor deployed in block ${receipt.blockNumber}`, `https://arbiscan.io/tx/${hash}`, deployedAt);
+    } catch {
+      this.activity.record('warn', 'Arbitrum deployment receipt could not be loaded');
+    }
+  }
+
   stop() { this.active = false; }
 
   disarm() {
     if (!this.enabled || !this.executionEnabled) return;
     this.halted = true;
     this.summary.mode = 'paper';
+    this.activity.record('warn', 'Live signing disarmed');
     writeJson(haltedFile, true);
+    if (this.journal?.test?.status === 'queued') {
+      this.save({ ...this.journal, test: { ...this.journal.test, status: 'expired', note: 'Canceled when live signing was disarmed.' } });
+    }
   }
 
   arm() {
@@ -55,14 +108,19 @@ export class ArbitrumWorker {
     fs.rmSync(haltedFile, { force: true });
     this.halted = false;
     this.summary.mode = 'live';
+    this.activity.record('info', 'Live signing armed');
   }
 
   async scan() {
     this.active = true;
     if (!this.verified) {
       if (await this.client.getChainId() !== arbitrumChainId) throw new Error('RPC must report Arbitrum One');
-      if (this.summary.executor) await verifyArbitrumExecutor(this.client, this.contract, this.owner);
-      else if (this.executionEnabled) throw new Error('Configure a verified Arbitrum executor before enabling live');
+      if (this.summary.executor) {
+        await verifyArbitrumExecutor(this.client, this.contract, this.owner);
+        this.deployment = { ...this.deployment, verified: true, status: 'Executor bytecode and owner verified' };
+        this.activity.record('info', this.deployment.status, `https://arbiscan.io/address/${this.contract}`);
+        void this.checkDeployment();
+      } else if (this.executionEnabled) throw new Error('Configure a verified Arbitrum executor before enabling live');
       if (this.executionEnabled) this.openJournal();
       this.verified = true;
       if (this.executionEnabled && !this.halted) this.summary.mode = 'live';
@@ -78,29 +136,48 @@ export class ArbitrumWorker {
       this.markets = markets;
       this.refreshAfter = Date.now() + 5 * 60_000;
     }
-    const result = await scanArbitrum(this.client, block, this.markets);
+    const selectedTest = this.journal?.test;
+    const test = this.summary.mode === 'live' && !this.journal?.pending && activeFlashTest(selectedTest) ? selectedTest : null;
+    this.summary.simulated = 0;
+    this.summary.netEstimateUsd = null;
+    if (test && this.summary.executor) {
+      const leads = arbitrumTestLeads(this.markets, block);
+      if (leads.length) {
+        test.checked += leads.length;
+        const ethUsd = await arbitrumEthUsd(this.client, block);
+        if (await this.tryOrders(leads, ethUsd, test)) return;
+      }
+    }
+    const result = await scanArbitrum(this.client, block, this.markets, !!test);
+    if (test) test.checked += result.quotedRoutes;
     this.summary.block = Number(block);
     this.summary.pools = this.markets.reduce((sum, market) => sum + market.pools.length, 0);
     this.summary.routes = result.quotedRoutes;
-    this.summary.simulated = 0;
-    this.summary.netEstimateUsd = null;
     this.summary.updatedAt = Date.now();
     this.summary.status = result.best ? 'Comparing exact payout and fees' : 'No positive payout after loan fees';
+    this.activity.record('info', `Block ${block}: ${result.quotedRoutes} routes across ${this.summary.pools} pools. ${this.summary.status}.`, undefined, this.summary.updatedAt);
     if (!this.summary.executor || !result.best || this.journal?.pending) {
       if (this.journal?.pending) this.summary.status = 'Waiting for transaction receipt';
       else if (result.best) this.summary.status = 'Flash payout quoted. Deploy executor to check full fees.';
       return;
     }
+    if (!await this.tryOrders(result.opportunities.slice(0, 3), result.ethUsd, test) && this.summary.status !== 'Daily gas budget used') {
+      this.summary.status = test ? 'No fresh route passed repayment and gas checks' : 'No fresh route passed padded gas and payout floor';
+    }
+  }
+
+  private async tryOrders(candidates: ArbQuote[], ethUsd: number, test: FlashTest | null): Promise<boolean> {
+    const canTest = () => !test || (this.journal?.test === test && activeFlashTest(test));
     const available = this.journal ? Math.min(txLimitUsd, dailyLimitUsd
       - this.journal.recent.filter((row) => row.at > Date.now() - dayMs).reduce((sum, row) => sum + row.gasUsd, 0)) : txLimitUsd;
-    for (const candidate of result.opportunities.slice(0, 3)) {
+    for (const candidate of candidates) {
       this.summary.simulated += 1;
-      const prepared = await prepareArbitrumOrder(this.client, this.contract, this.owner, candidate, result.ethUsd, minNetUsd, available)
+      const prepared = await prepareArbitrumOrder(this.client, this.contract, this.owner, candidate, ethUsd, minNetUsd, available, !!test)
         .catch(() => null);
       if (!prepared) continue;
       this.summary.netEstimateUsd = prepared.netUsd;
-      this.summary.status = 'Executable quote passed profit and gas checks';
-      if (this.summary.mode !== 'live' || !this.active || !this.journal) return;
+      this.summary.status = test ? 'Test route passed repayment and gas checks' : 'Executable quote passed profit and gas checks';
+      if (this.summary.mode !== 'live' || !this.active || !this.journal || !canTest()) return true;
       const { account } = loadOrCreateWallet();
       if (!isAddressEqual(account.address, this.owner)) throw new Error('Wallet does not match the Arbitrum executor owner');
       const [nonce, pending, balance, head] = await Promise.all([
@@ -109,16 +186,20 @@ export class ArbitrumWorker {
         this.client.getBalance({ address: account.address }),
         this.client.getBlockNumber({ cacheTime: 0 }),
       ]);
-      if (nonce !== pending || balance < prepared.gasBudget || head >= prepared.deadline || !this.active || this.halted) return;
+      if (nonce !== pending || balance < prepared.gasBudget || head >= prepared.deadline || !this.active || this.halted || !canTest()) return true;
       const serializedTransaction = await account.signTransaction({ ...prepared.tx, type: 'eip1559', chainId: arbitrumChainId, nonce });
-      if (!this.active || this.halted) return;
+      if (!this.active || this.halted || !canTest()) return true;
       const hash = keccak256(serializedTransaction);
-      this.save({ ...this.journal, pending: { hash, nonce, ethUsd: result.ethUsd, budgetUsd: prepared.worstGasUsd } });
+      this.save({ ...this.journal, pending: { hash, nonce, ethUsd, budgetUsd: prepared.worstGasUsd },
+        ...(test ? { test: { ...test, status: 'submitted', hash, note: 'Waiting for the Arbitrum receipt.' } } : {}),
+      });
       this.summary.status = 'Waiting for transaction receipt';
+      this.activity.record('info', test ? 'Mainnet test submitted' : 'Arbitrum route submitted', `https://arbiscan.io/tx/${hash}`);
       await this.client.sendRawTransaction({ serializedTransaction });
-      return;
+      return true;
     }
-    this.summary.status = available > 0 ? 'No fresh route passed padded gas and payout floor' : 'Daily gas budget used';
+    if (available <= 0) this.summary.status = 'Daily gas budget used';
+    return false;
   }
 
   private openJournal() {
@@ -131,10 +212,23 @@ export class ArbitrumWorker {
     }
     this.summary.pending = this.journal.pending?.hash ?? null;
     this.summary.settled = this.journal.recent[0] ?? null;
+    if (this.summary.settled) this.logSettlement(this.summary.settled);
+  }
+
+  private logSettlement(outcome: Settlement) {
+    this.activity.record(outcome.status === 'landed' ? 'trade' : 'warn',
+      `Arbitrum transaction ${outcome.status}. Gas $${outcome.gasUsd.toFixed(4)}, net $${outcome.netUsd.toFixed(4)}.`,
+      `https://arbiscan.io/tx/${outcome.hash}`, outcome.at);
   }
 
   private save(next: Journal) {
+    const outcome = next.recent[0];
+    if (outcome && next.test?.status === 'submitted' && next.test.hash === outcome.hash) {
+      next = { ...next, test: { ...next.test, status: outcome.status === 'landed' ? 'landed' : 'failed',
+        note: `Confirmed ${outcome.status}. Gas $${outcome.gasUsd.toFixed(4)}, net $${outcome.netUsd.toFixed(4)}.` } };
+    }
     writeJson(journalFile, next);
+    if (outcome && this.journal?.recent[0]?.hash !== outcome.hash) this.logSettlement(outcome);
     this.journal = next;
     this.summary.pending = next.pending?.hash ?? null;
     this.summary.settled = next.recent[0] ?? null;
@@ -147,7 +241,7 @@ export class ArbitrumWorker {
     if (!receipt) {
       const nonce = await this.client.getTransactionCount({ address: this.owner });
       if (nonce <= pending.nonce) return;
-      this.save({ pending: null, recent: [{
+      this.save({ ...journal, pending: null, recent: [{
         hash: pending.hash, status: 'replaced', gasUsd: pending.budgetUsd, netUsd: 0, at: Date.now(),
       }, ...journal.recent.filter((row) => row.at > Date.now() - dayMs)] });
       return;
@@ -159,7 +253,7 @@ export class ArbitrumWorker {
     const fee = receipt.gasUsed * receipt.effectiveGasPrice;
     const landed = receipt.status === 'success' && event;
     const proceeds = landed ? event.args.profit - event.args.tip : 0n;
-    this.save({ pending: null, recent: [{
+    this.save({ ...journal, pending: null, recent: [{
       hash: pending.hash, status: landed ? 'landed' : 'reverted', gasUsd: Number(formatEther(fee)) * pending.ethUsd,
       netUsd: Number(formatEther(proceeds - fee)) * pending.ethUsd, at: Date.now(),
     }, ...journal.recent.filter((row) => row.at > Date.now() - dayMs)] });

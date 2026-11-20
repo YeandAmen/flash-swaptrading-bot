@@ -7,6 +7,7 @@ import {
   signTransaction,
   type Address, type Blockhash, type KeyPairSigner, type Signature,
 } from '@solana/kit';
+import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest } from '../network-test.js';
 import { writeJson } from '../persistence.js';
 import { readPrivateFile, writePrivateFile } from '../private-file.js';
 import { LIGHTHOUSE, verifyLighthouseDeployment } from './guard.js';
@@ -16,6 +17,8 @@ import type { PreparedSolanaCycle, SolanaScanConfig } from './scan.js';
 const DAILY_FEE_CAP = 2_000_000n;
 const NATIVE_RESERVE = 15_000_000n;
 const MAX_ATA_RENT = 6_000_000n;
+const MAX_TEST_FEE = 50_000n;
+const MIN_TEST_RETAINED_USDC = 1n;
 const MAX_CANDIDATE_AGE_SLOTS = 8n;
 const MIN_BLOCKS_TO_EXPIRY = 5n;
 const MAX_BLOCKS_TO_EXPIRY = 160n;
@@ -47,6 +50,7 @@ interface Pending {
   firstMinimum: string;
   loan: string;
   minimumNet: string;
+  testId?: string;
 }
 interface Outcome {
   signature: Signature;
@@ -68,6 +72,7 @@ interface Journal {
   pending: Pending | null;
   lastOutcome: Outcome | null;
   fees: FeeSpend[];
+  test?: FlashTest;
 }
 
 function rpcDeadline() {
@@ -109,6 +114,21 @@ function decodeJournal(text: string, wallet: Address): Journal {
       throw new Error('Invalid Solana settlement journal');
     }
   }
+  if (state.test !== undefined) {
+    const test = state.test;
+    if (!test || typeof test.id !== 'string' || !test.id.length || !naturalInteger(test.queuedAt)
+      || !naturalInteger(test.expiresAt) || test.expiresAt <= test.queuedAt || !naturalInteger(test.checked)
+      || !['queued', 'submitted', 'landed', 'failed', 'expired'].includes(test.status) || typeof test.note !== 'string'
+      || (test.status === 'queued' && test.hash !== null)
+      || (test.status === 'submitted' && (!state.pending || test.hash !== state.pending.signature
+        || test.id !== state.pending.testId))) {
+      throw new Error('Invalid Solana flash test journal');
+    }
+    if (test.hash !== null) signature(test.hash);
+  }
+  if (state.pending?.testId !== undefined && (state.test?.status !== 'submitted' || state.test.id !== state.pending.testId)) {
+    throw new Error('Solana pending test does not match the journaled request');
+  }
   return state;
 }
 
@@ -130,6 +150,10 @@ function walletToken(balances: AssetBalances, wallet: Address, mint: Address): b
     ? sum + uint(token.uiTokenAmount.amount) : sum, 0n);
 }
 
+function nativeCostUsdc(lamports: bigint, loan: bigint, firstMinimum: bigint): bigint {
+  return (lamports * loan + firstMinimum - 1n) / firstMinimum;
+}
+
 function accountOutcome(meta: Balances, wallet: Address, loan: bigint, firstMinimum: bigint) {
   const beforeUsdc = walletToken(meta.preTokenBalances, wallet, USDC);
   const afterUsdc = walletToken(meta.postTokenBalances, wallet, USDC);
@@ -140,11 +164,20 @@ function accountOutcome(meta: Balances, wallet: Address, loan: bigint, firstMini
   if (beforeNative === undefined || afterNative === undefined || meta.fee == null || meta.fee <= 0n) return null;
   const debit = beforeNative - afterNative;
   const cost = debit > meta.fee ? debit : meta.fee;
-  const networkUsdc = (cost * loan + firstMinimum - 1n) / firstMinimum;
+  const proceeds = beforeUsdc === null || afterUsdc === null ? null : afterUsdc - beforeUsdc;
   return {
     fee: meta.fee, cost, wsolPreserved: beforeWsol !== null && afterWsol !== null && afterWsol >= beforeWsol,
-    net: beforeUsdc === null || afterUsdc === null ? null : afterUsdc - beforeUsdc - networkUsdc,
+    net: proceeds === null ? null : proceeds - nativeCostUsdc(cost, loan, firstMinimum),
+    retainedBeforeFee: proceeds === null ? null : proceeds - nativeCostUsdc(cost - meta.fee, loan, firstMinimum),
+    feeUsdc: nativeCostUsdc(meta.fee, loan, firstMinimum),
   };
+}
+
+function meetsOutcomeFloor(outcome: NonNullable<ReturnType<typeof accountOutcome>>, minimum: bigint, isTest: boolean): boolean {
+  if (outcome.net === null || !outcome.wsolPreserved) return false;
+  if (!isTest) return outcome.net >= minimum;
+  return outcome.retainedBeforeFee !== null && outcome.retainedBeforeFee >= minimum
+    && outcome.net >= minimum - outcome.feeUsdc;
 }
 
 function running(pid: number): boolean {
@@ -213,6 +246,7 @@ export class SolanaLiveWorker {
       status: this.status, pending: pending?.signature ?? null,
       pendingFeeLamports: pending ? Number(pending.feeLamports) : 0,
       lastOutcome: this.journal?.lastOutcome ?? null,
+      test: flashTestView(this.journal?.test),
       spentFeeLamports: Number(this.spentFees()), dailyFeeCapLamports: Number(DAILY_FEE_CAP),
       nativeReserveLamports: Number(NATIVE_RESERVE), minimumNetUsdc: Number(this.minimumNet) / 1_000_000,
       maxFeeLamports: Number(this.feeCap),
@@ -258,11 +292,38 @@ export class SolanaLiveWorker {
     this.status = this.journal.pending ? 'Solana waiting for finalized receipt' : 'Live Solana scanning';
   }
 
+  queueTest(id: string): FlashTest {
+    if (typeof id !== 'string' || !id.length || id.length > 128) throw new Error('Invalid Solana flash test request');
+    if (!this.signer || !this.journal?.armed || this.stopped) throw new Error('Solana live worker must be ready and armed');
+    if (this.journal.test?.id === id) return flashTestView(this.journal.test)!;
+    if (this.journal.pending) throw new Error('A Solana transaction is already pending');
+    const test = queueFlashTest(this.journal.test, id);
+    this.save({ ...this.journal, test });
+    return test;
+  }
+
+  activeTest(): FlashTest | null {
+    if (!this.signer || this.stopped || !this.journal?.armed || this.journal.pending) return null;
+    const test = this.journal.test;
+    return activeFlashTest(test) ? test : null;
+  }
+
+  recordTestScan(id: string, checked = 1): void {
+    const test = this.journal?.test;
+    if (test?.id === id && this.journal && this.lease && !this.stopped
+      && (test.status === 'queued' || test.status === 'submitted') && naturalInteger(checked) && checked > 0) {
+      this.save({ ...this.journal, test: { ...test, checked: test.checked + checked } });
+    }
+  }
+
   disarm(): void {
     this.generation++;
     this.status = this.journal?.pending ? 'Solana disarmed, reconciling its pending signature' : 'Solana live sending disarmed';
     if (this.journal?.armed && this.lease && !this.stopped) {
-      const next = { ...this.journal, armed: false };
+      const test = this.journal.test;
+      const expired = activeFlashTest(test) ? { ...test, status: 'expired' as const,
+        note: 'Solana was disarmed before submission. No test transaction sent.' } : test;
+      const next = { ...this.journal, armed: false, test: expired };
       this.journal = next;
       this.save(next);
     }
@@ -296,14 +357,23 @@ export class SolanaLiveWorker {
 
   async submit(candidate: PreparedSolanaCycle): Promise<void> {
     if (!this.signer || this.stopped || this.busy || !this.journal?.armed || this.journal.pending) return;
+    const test = candidate.testId === undefined ? null : this.activeTest();
+    if (candidate.testId !== undefined && test?.id !== candidate.testId) return;
+    const minimum = test ? MIN_TEST_RETAINED_USDC : this.minimumNet;
     this.busy = true;
     const generation = this.generation;
-    const canSend = () => !this.stopped && generation === this.generation && this.journal?.armed && !this.journal.pending;
+    const canSend = () => !this.stopped && generation === this.generation && this.journal?.armed && !this.journal.pending
+      && (!test || this.activeTest()?.id === test.id);
     try {
-      if (candidate.net < this.minimumNet || candidate.feeLamports <= 0n || candidate.feeLamports > this.feeCap
+      if (candidate.feeLamports <= 0n || candidate.feeLamports > this.feeCap || (test && candidate.feeLamports > MAX_TEST_FEE)
         || candidate.rentLamports < 0n || candidate.rentLamports > MAX_ATA_RENT || candidate.firstMinimum <= 0n || candidate.loan <= 0n
         || candidate.maximumLamportDebit !== candidate.feeLamports + candidate.rentLamports
         || this.spentFees() + candidate.feeLamports > DAILY_FEE_CAP) {
+        this.status = 'Solana candidate skipped by profit or fee budget';
+        return;
+      }
+      const allowedLoss = test ? nativeCostUsdc(candidate.feeLamports, candidate.loan, candidate.firstMinimum) : 0n;
+      if (candidate.net < minimum - allowedLoss) {
         this.status = 'Solana candidate skipped by profit or fee budget';
         return;
       }
@@ -349,7 +419,7 @@ export class SolanaLiveWorker {
       if (context.slot < head.absoluteSlot || context.slot - candidate.simulationSlot > MAX_CANDIDATE_AGE_SLOTS
         || !measured || measured.fee !== candidate.feeLamports || measured.cost > candidate.maximumLamportDebit
         || (simulation.postBalances?.[0] ?? 0n) < NATIVE_RESERVE
-        || !measured.wsolPreserved || measured.net === null || measured.net < this.minimumNet) {
+        || !meetsOutcomeFloor(measured, minimum, Boolean(test))) {
         this.status = 'Solana final simulation did not satisfy the profit and cost guards';
         return;
       }
@@ -360,14 +430,18 @@ export class SolanaLiveWorker {
       const wire = getBase64EncodedWireTransaction(signed);
       const sig = getSignatureFromTransaction(signed);
       if (this.journal.lastOutcome?.signature === sig) return;
+      const queued = this.journal.test;
+      const submitted = test && queued
+        ? { ...queued, status: 'submitted' as const, hash: sig, note: 'Submitted once. Waiting for a finalized receipt.' } : queued;
       const pending: Pending = {
         signature: sig, blockhash, lastValidBlockHeight: candidate.lastValidBlockHeight.toString(),
         minContextSlot: context.slot.toString(), feeLamports: candidate.feeLamports.toString(),
         maximumLamportDebit: candidate.maximumLamportDebit.toString(),
-        firstMinimum: candidate.firstMinimum.toString(), loan: candidate.loan.toString(), minimumNet: this.minimumNet.toString(),
+        firstMinimum: candidate.firstMinimum.toString(), loan: candidate.loan.toString(), minimumNet: minimum.toString(),
+        testId: test?.id,
       };
       // Persist the exact signature before contacting a sender. Uncertain sends stay pending.
-      this.save({ ...this.journal, pending });
+      this.save({ ...this.journal, pending, test: submitted });
       this.status = 'Solana awaiting RPC submission';
       const acknowledged = await this.rpc.sendTransaction(wire, {
         encoding: 'base64', skipPreflight: false, preflightCommitment: LIVE_COMMITMENT,
@@ -434,7 +508,7 @@ export class SolanaLiveWorker {
     const measured = accountOutcome(meta, this.wallet, uint(pending.loan), uint(pending.firstMinimum));
     if (!measured || (!meta.err && measured.net === null)) throw new Error('Solana finalized receipt omitted wallet changes');
     const breached = measured.fee !== uint(pending.feeLamports) || measured.cost > uint(pending.maximumLamportDebit)
-      || (!meta.err && (!measured.wsolPreserved || measured.net! < uint(pending.minimumNet)));
+      || (!meta.err && !meetsOutcomeFloor(measured, uint(pending.minimumNet), pending.testId !== undefined));
     const status = breached ? 'invariant-breach' : meta.err ? 'failed' : 'finalized';
     this.finish(pending, { signature: pending.signature, status, at: Date.now(), slot: Number(receipt.slot),
       feeLamports: Number(measured.fee), walletDebitLamports: Number(measured.cost),
@@ -444,8 +518,17 @@ export class SolanaLiveWorker {
   private finish(pending: Pending, outcome: Outcome): void {
     if (this.stopped || !this.journal || this.journal.pending?.signature !== pending.signature) return;
     const fees = outcome.feeLamports > 0 ? [...this.journal.fees, { at: outcome.at, feeLamports: outcome.feeLamports }] : this.journal.fees;
+    let test = this.journal.test;
+    if (test && pending.testId === test.id) {
+      const status = outcome.status === 'finalized' ? 'landed' : outcome.status === 'expired' ? 'expired' : 'failed';
+      const note = status === 'landed' ? 'Finalized. The flash loan and rent were covered by the swaps.'
+        : status === 'expired' ? 'Signature expired without landing. No transaction fee was charged.'
+          : outcome.status === 'invariant-breach' ? 'Receipt did not satisfy the wallet protection checks. Solana was disarmed.'
+            : 'The test reverted. Check the finalized fee and transaction receipt.';
+      test = { ...test, status, note };
+    }
     this.save({ ...this.journal, armed: this.journal.armed && outcome.status !== 'invariant-breach',
-      pending: null, lastOutcome: outcome, fees });
+      pending: null, lastOutcome: outcome, fees, test });
     this.status = `Solana transaction ${outcome.status}`;
   }
 }

@@ -241,3 +241,8 @@ npm run solana:test
 For live Solana, set `ALLOW_LIVE_TRADING=on`, `SOLANA_LIVE=on`, and `SOLANA_WALLET_KEY_FILE` to the absolute path of the owner-only Solana CLI JSON keypair. Restart and arm Solana from the dashboard. The signer must match `SOLANA_WALLET_ADDRESS`. The worker restores the stored arming choice after restart and uses the immutable Lighthouse program to enforce a post-repayment wallet profit floor. It keeps one submitted signature pending until it settles or expires.
 
 The default Solana minimum is 0.05 USDC after transaction fees and any in-transaction token-account rent. The default network fee ceiling is 0.00005 SOL per transaction and 0.002 SOL over 24 hours. The worker maintains a 0.015 SOL gas reserve. A transaction that lands and reverts can still pay its network fee.
+
+
+The dashboard's Arbitrum One and Solana cards show each scanner's latest block or slot, deployment or program verification, recent route logs, and transaction receipts. Set `ARBITRUM_DEPLOYMENT_TX` to show the verified Arbitrum deployment receipt and timestamp.
+
+An explicitly authorized one-time mainnet smoke test keeps the usual maximum network fee and waits for positive swap proceeds after repayment. The test can spend that transaction's network fee. Solana also requires proceeds to cover any token-account rent. The dashboard shows whether the one-time test was queued, submitted, settled, or expired.

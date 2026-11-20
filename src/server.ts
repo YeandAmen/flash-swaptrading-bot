@@ -7,7 +7,7 @@ import { CONFIG, DATA_DIR, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMAL
 import { endpointOrigin, redactDiagnostic } from './diagnostics.js';
 import { EthereumIntent } from './ethereum-intent.js';
 import { Engine } from './engine.js';
-import { armArbitrum, armSolana, disarmArbitrum, disarmSolana, expansionView, startExpansion, stopExpansion } from './expansion.js';
+import { armArbitrum, armSolana, disarmArbitrum, disarmSolana, expansionView, queueArbitrumTest, queueSolanaTest, startExpansion, stopExpansion } from './expansion.js';
 import { DeploymentFeeLimitError, DeploymentGasError } from './executor.js';
 import type { PortfolioState } from './types.js';
 
@@ -255,6 +255,16 @@ app.post('/api/solana/arm', (req, res) => {
   if (allowLiveControl(res)) void control(() => armSolana())(req, res);
 });
 app.post('/api/arbitrum/disarm', control(() => disarmArbitrum()));
+for (const [chain, queue] of [['arbitrum', queueArbitrumTest], ['solana', queueSolanaTest]] as const) {
+  app.post(`/api/${chain}/test-once`, (req, res) => {
+    const { id, confirm } = req.body ?? {};
+    if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+      res.status(400).json({ error: 'Confirm TEST and supply a unique request ID.' });
+      return;
+    }
+    if (allowLiveControl(res)) void control(() => queue(id))(req, res);
+  });
+}
 app.post('/api/arbitrum/arm', (req, res) => {
   if (req.body?.confirm !== 'ARBITRUM') { res.status(400).json({ error: 'Type ARBITRUM to arm' }); return; }
   if (allowLiveControl(res)) void control(() => armArbitrum())(req, res);

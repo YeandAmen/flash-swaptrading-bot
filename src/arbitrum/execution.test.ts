@@ -51,3 +51,15 @@ test('Arbitrum signing gate requires fresh execution to cover padded gas and the
   assert.equal(await prepareArbitrumOrder(clientFor({ payout: 1n }).client, contract, owner, profitable, 2_000, 0.05, 0.50), null);
   assert.equal(await prepareArbitrumOrder(clientFor({ feeCap: 2_000_000_000n }).client, contract, owner, profitable, 2_000, 0.05, 0.50), null);
 });
+
+
+test('an explicit Arbitrum test isolates the network fee exception', async () => {
+  const tiny = { ...profitable, payout: 1000n };
+  const fixture = clientFor({ payout: 1000n });
+  assert.equal(await prepareArbitrumOrder(fixture.client, contract, owner, tiny, 2_000, 0.05, 0.50), null);
+  const allowed = await prepareArbitrumOrder(fixture.client, contract, owner, tiny, 2_000, 0.05, 0.50, true);
+  assert.ok(allowed && allowed.netUsd < 0);
+  assert.equal(fixture.finalMinProfit(), 1n);
+  assert.equal(await prepareArbitrumOrder(fixture.client, contract, owner, tiny, 2_000, 0.05, 0.01, true), null);
+  assert.equal(await prepareArbitrumOrder(clientFor({ payout: 0n }).client, contract, owner, tiny, 2_000, 0.05, 0.50, true), null);
+});

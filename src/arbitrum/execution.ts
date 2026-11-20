@@ -3,8 +3,8 @@ import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
 import type { ArbitrumClient, ArbQuote } from './market.js';
 
 export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Address, owner: Address, candidate: ArbQuote,
-  ethUsd: number, minimumNetUsd: number, maximumFeeUsd: number) {
-  const minNet = parseEther((minimumNetUsd / ethUsd).toFixed(18));
+  ethUsd: number, minimumNetUsd: number, maximumFeeUsd: number, gasOnlyTest = false) {
+  const minNet = gasOnlyTest ? 0n : parseEther((minimumNetUsd / ethUsd).toFixed(18));
   if (maximumFeeUsd <= 0 || candidate.payout <= minNet) return null;
   const head = await client.getBlock();
   if (head.number > candidate.order.maxBlock + 50n || Math.abs(Date.now() - Number(head.timestamp) * 1000) > 5_000) return null;
@@ -19,8 +19,8 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
   const gas = (estimated * 125n + 99n) / 100n;
   const gasBudget = gas * fees.maxFeePerGas;
   const worstGasUsd = Number(formatEther(gasBudget)) * ethUsd;
-  if (worstGasUsd > maximumFeeUsd || candidate.payout * 9n / 10n < gasBudget + minNet) return null;
-  const minimum = gasBudget + minNet;
+  if (worstGasUsd > maximumFeeUsd || (!gasOnlyTest && candidate.payout * 9n / 10n < gasBudget + minNet)) return null;
+  const minimum = gasOnlyTest ? 1n : gasBudget + minNet;
   const data = encode(minimum);
   const tx = { to: contract, data, gas, ...fees };
   const [exact, finalState, currentHead] = await Promise.all([
@@ -30,6 +30,6 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
   ]);
   if (!finalState.data || exact > gas || currentHead >= deadline) return null;
   const payout = decodeFunctionResult({ abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', data: finalState.data });
-  if (payout * 9n / 10n < minimum) return null;
+  if ((gasOnlyTest ? payout : payout * 9n / 10n) < minimum) return null;
   return { tx, deadline, worstGasUsd, gasBudget, netUsd: Number(formatEther(payout - gasBudget)) * ethUsd };
 }
