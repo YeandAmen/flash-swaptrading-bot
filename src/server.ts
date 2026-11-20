@@ -269,17 +269,18 @@ app.post('/api/mev/arm', (req, res) => {
   void control(() => mev.arm())(req, res);
 });
 app.post('/api/mev/test-once', (req, res) => {
-  const { confirm, id, maximumGasUsd, requireGasCoverage = false } = req.body ?? {};
+  const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false } = req.body ?? {};
   if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)
     || typeof maximumGasUsd !== 'number' || !Number.isFinite(maximumGasUsd) || maximumGasUsd <= 0
-    || typeof requireGasCoverage !== 'boolean') {
+    || typeof requireGasCoverage !== 'boolean' || typeof privateSubmission !== 'boolean'
+    || (privateSubmission && !requireGasCoverage)) {
     res.status(400).json({ error: 'Confirm TEST with a request ID, maximum gas cost, and optional gas coverage requirement.' });
     return;
   }
   if (!allowArming(res)) return;
   const mev = engine.mev;
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
-  void control(() => mev.queueGasOnlyTest(id, maximumGasUsd, requireGasCoverage))(req, res);
+  void control(() => mev.queueGasOnlyTest(id, maximumGasUsd, requireGasCoverage, privateSubmission))(req, res);
 });
 app.post('/api/mev/disarm', control(() => engine.mev?.disarm()));
 app.post('/api/pause', (req, res) => {

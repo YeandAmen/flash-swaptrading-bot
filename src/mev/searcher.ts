@@ -12,7 +12,7 @@ import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
 import { FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
 import { bundleTraceRequests, requestBuilderTrace } from './builder-trace.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
-import { sendBundle, type BuilderResult } from './bundles.js';
+import { sendBundle, submitPrivateDirect, type BuilderResult } from './bundles.js';
 import { affordableDirectFees, directFees, directPriorityFee, findNonceConsumer } from './direct.js';
 import { submitDirect } from './direct-broadcast.js';
 import { directCadence, extraRoutes, loanLimitWei } from './cadence.js';
@@ -107,6 +107,7 @@ function retainRecent(rows: MevOpp[], limit: number, bundleLimit: number): MevOp
 
 interface BundleSubmission {
   kind?: 'direct';
+  privateSubmission?: true;
   target: number;
   startedAt: number;
   leadMs: number;
@@ -142,6 +143,7 @@ interface GasOnlyTest {
   id: string;
   maximumGasUsd: number;
   requireGasCoverage: boolean;
+  privateSubmission: boolean;
   expiresAt: number;
   blocksChecked: number;
   routesChecked: number;
@@ -180,6 +182,7 @@ interface MevFile {
 
 interface PendingBundle {
   kind?: 'direct';
+  privateSubmission?: true;
   hash: Hex;
   nonce: number;
   target: string;
@@ -400,6 +403,7 @@ export class MevSearcher {
         if (!/^0x[0-9a-f]{64}$/i.test(pending.hash) || !/^0x[0-9a-f]{40}$/i.test(pending.contract)
           || !/^\d+$/.test(pending.target) || !Number.isSafeInteger(pending.nonce) || pending.nonce < 0
           || (pending.kind !== undefined && pending.kind !== 'direct')
+          || (pending.privateSubmission !== undefined && (pending.privateSubmission !== true || pending.kind !== 'direct'))
           || (pending.kind === 'direct' && (!Number.isSafeInteger(pending.opp?.block) || pending.opp.block < 0))
           || !validPrice(pending.ethUsd) || !pending.opp || pending.opp.hash !== pending.hash) throw new Error('invalid bundle journal');
         const recorded = f.recent.find((o) => o?.hash === pending.hash);
@@ -689,14 +693,17 @@ export class MevSearcher {
     const simulatedBefore = this.file.stats.simulated;
     const shortlistNet: number[] = [];
     const observedNet = (netUsd: number) => shortlistNet.push(netUsd);
+    const canTest = () => !this.pending && this.activeGasOnlyTest() === test && this.canMeetSendDeadline(r);
+    if (test?.privateSubmission && canTest()) {
+      await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
+    }
     const signed = await this.scanShortlist(selected, r, nextMaxBase, policy, generation, observedNet,
       broadenSizes && additions.length === 0);
     const enoughTime = CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS;
     if (!signed && !this.stopping && !this.pending && additions.length && enoughTime) {
       await this.scanShortlist(additions, r, nextMaxBase, policy, generation, observedNet, true);
     }
-    if (test && !this.pending && this.activeGasOnlyTest() === test
-      && (CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS)) {
+    if (test && !test.privateSubmission && enoughTime && canTest()) {
       await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
     }
     block.decisionMs = Math.round(performance.now() - started);
@@ -706,7 +713,8 @@ export class MevSearcher {
 
   private async scanShortlist(selected: Candidate[], r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy,
     generation: number, observedNet: (usd: number) => void, broadenSizes: boolean): Promise<boolean> {
-    const canTryLive = () => this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending();
+    const canTryLive = () => this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending()
+      && !this.activeGasOnlyTest()?.privateSubmission;
     const canTryFallback = () => canTryLive() && !this.host.tradePending()
       && (CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS);
     const allowFallback = canTryFallback();
@@ -752,7 +760,10 @@ export class MevSearcher {
   private async scanGasOnlyTest(test: GasOnlyTest, candidates: Candidate[], r: BlockRead, nextMaxBase: bigint,
     policy: ProfitPolicy, generation: number) {
     test.blocksChecked++;
-    const top = candidates.sort((a, b) => b.estimatedNet - a.estimatedNet).slice(0, GAS_ONLY_TEST_ROUTES);
+    candidates.sort((a, b) => b.estimatedNet - a.estimatedNet);
+    const top = test.privateSubmission
+      ? extraRoutes(candidates, [], GAS_ONLY_TEST_ROUTES + 2, (candidate) => candidate.t.token.address.toLowerCase())
+      : candidates.slice(0, GAS_ONLY_TEST_ROUTES);
     test.routesChecked += top.length;
     const routes = await Promise.all(top.map((candidate) => this.evaluate(candidate, r, nextMaxBase, policy, false, undefined, true, test)));
     const offers = routes.flatMap((route) => route?.primary ? [route.primary] : [])
@@ -1018,7 +1029,8 @@ export class MevSearcher {
       let fees = directFees(r.nextBaseFee, 0n, DIRECT_WINDOW);
       if (direct) {
         const now = Date.now();
-        const ordinaryTip = preferredTip < priorityCap ? preferredTip : priorityCap;
+        // A deadline-protected test bids as high as its padded gas and profit limits allow.
+        const ordinaryTip = test?.privateSubmission ? priorityCap : preferredTip < priorityCap ? preferredTip : priorityCap;
         const minimumTip = priorityCap < MIN_PRIORITY_FEE_WEI ? priorityCap : MIN_PRIORITY_FEE_WEI;
         const maxGasUsd = Math.min(this.availableDirectGasUsd(now), test?.maximumGasUsd ?? Infinity);
         const maxGasWei = loanLimitWei(maxGasUsd, ethUsd);
@@ -1131,21 +1143,22 @@ export class MevSearcher {
       const hash = keccak256(signed);
       const startedAt = Date.now();
       const kind = direct ? 'direct' as const : undefined;
+      const privateSubmission = test?.privateSubmission ? true as const : undefined;
       const submission: BundleSubmission = {
-        kind,
+        kind, privateSubmission,
         target: Number(target), startedAt, leadMs: r.timestamp * 1000 + SLOT_MS - startedAt,
         priorityGwei: direct ? Number(fees.maxPriorityFeePerGas) / 1e9 : undefined,
         gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(net) * ethUsd, builders: [],
       };
       const queued = direct ? this.activeGasOnlyTest() : null;
       const matched = queued && signingGasUsd <= queued.maximumGasUsd
-        && (offer.funding !== 0 || queued.requireGasCoverage) ? queued : null;
+        && (offer.funding !== 0 || queued.requireGasCoverage) && (!queued.privateSubmission || queued === test) ? queued : null;
       Object.assign(opp, {
         gasOnlyTestId: matched?.id,
         hash, status: 'sent', gasEth: submission.gasEth, tipEth: submission.tipEth,
         netEth: eth(net), netUsd: submission.netUsd, note: direct ? 'awaiting direct RPC submission' : 'awaiting builder replies', submission,
       });
-      const pending = { kind, hash, nonce, target: target.toString(), contract, ethUsd, opp };
+      const pending = { kind, privateSubmission, hash, nonce, target: target.toString(), contract, ethUsd, opp };
       const recent = this.file.recent.slice();
       const attempts = this.file.stats.directAttempts;
       const lastTest = this.file.lastGasOnlyTest;
@@ -1188,10 +1201,11 @@ export class MevSearcher {
     }
     const startedAt = performance.now();
     try {
-      await submitDirect(signed);
+      if (pending.privateSubmission) await submitPrivateDirect(signed, BigInt(pending.target), canSubmit);
+      else await submitDirect(signed);
       const rpcAckMs = Math.round(performance.now() - startedAt);
       if (this.pending === pending) {
-        pending.opp.note = 'direct Ethereum RPC accepted; awaiting receipt';
+        pending.opp.note = pending.privateSubmission ? 'private relay accepted; awaiting receipt' : 'direct Ethereum RPC accepted; awaiting receipt';
         if (pending.opp.submission) pending.opp.submission.rpcAckMs = rpcAckMs;
       }
       this.host.log(`[mev] Direct transaction ${pending.hash} submitted. RPC acknowledged in ${rpcAckMs} ms. Route deadline is block ${pending.target}.`);
@@ -1271,7 +1285,7 @@ export class MevSearcher {
     if (!p) return;
     const target = BigInt(p.target);
     const confirmations = CONFIG.forkMode ? 0n : RECEIPT_CONFIRMATIONS;
-    if (p.kind !== 'direct' && current < target + confirmations) return;
+    if ((p.kind !== 'direct' || p.privateSubmission) && current < target + confirmations) return;
     const receipt = await this.receipt(p.hash);
     if (receipt) {
       if (current < receipt.blockNumber + confirmations) return;
@@ -1316,7 +1330,7 @@ export class MevSearcher {
       this.host.log(`[mev] ${p.kind === 'direct' ? 'Direct transaction' : 'Bundle'} ${p.hash} ${outcome.status}: ${outcome.note}`, outcome.status === 'landed' ? 'trade' : 'warn');
       return;
     }
-    if (p.kind === 'direct') {
+    if (p.kind === 'direct' && !p.privateSubmission) {
       const confirmedBlock = current - confirmations;
       const first = BigInt(p.opp.block) + 1n;
       if (confirmedBlock < first) return;
@@ -1331,11 +1345,13 @@ export class MevSearcher {
       }
       return;
     }
+    // Private one-shot transactions never reach the public mempool and expire at the relay.
+    const kind = p.privateSubmission ? 'Private transaction' : 'Bundle';
     const nonceAtTarget = await publicClient.getTransactionCount({ address: this.host.account.address, blockNumber: target });
     this.file.stats.rpcCalls++;
     if (nonceAtTarget <= p.nonce) {
       this.finishBundle({ ...p.opp, status: 'not included', note: 'target block passed without using this nonce', netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
-      this.host.log(`[mev] Bundle for block ${target} not included. Wallet nonce was unused in the target block.`);
+      this.host.log(`[mev] ${kind} for block ${target} not included. Wallet nonce was unused in the target block.`);
     } else {
       const block = await publicClient.getBlock({ blockNumber: target, includeTransactions: true });
       this.file.stats.rpcCalls++;
@@ -1344,7 +1360,7 @@ export class MevSearcher {
       if (tx && tx.hash.toLowerCase() !== p.hash.toLowerCase()) {
         this.host.exec.noteNonceUsed(p.nonce);
         this.finishBundle({ ...p.opp, status: 'not included', note: 'a different transaction used the nonce in the target block', netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
-        this.host.log(`[mev] Bundle for block ${target} not included. A different transaction used the wallet nonce.`);
+        this.host.log(`[mev] ${kind} for block ${target} not included. A different transaction used the wallet nonce.`);
         return;
       }
       // A changed nonce alone does not establish which hash landed.
@@ -1422,7 +1438,7 @@ export class MevSearcher {
     this.file.recent = retainRecent(rec, RECENT_LIMIT, RECENT_BUNDLE_LIMIT);
   }
 
-  queueGasOnlyTest(id: string, maximumGasUsd: number, requireGasCoverage = false) {
+  queueGasOnlyTest(id: string, maximumGasUsd: number, requireGasCoverage = false, privateSubmission = false) {
     if (this.queuedTest?.id === id || this.file.lastGasOnlyTest?.id === id
       || this.file.recent.some((row) => row?.gasOnlyTestId === id)) return;
     if (!TEST_ID.test(id) || !Number.isFinite(maximumGasUsd) || maximumGasUsd <= 0 || maximumGasUsd > MEV.directMaxGasUsd) {
@@ -1433,7 +1449,8 @@ export class MevSearcher {
       throw new Error('A verified, armed direct proxy with an available wallet is required for a test.');
     }
     if (this.activeGasOnlyTest()) throw new Error('A gas-only test is already queued.');
-    this.queuedTest = { id, maximumGasUsd, requireGasCoverage, expiresAt: Date.now() + GAS_ONLY_TEST_MS, blocksChecked: 0, routesChecked: 0 };
+    if (privateSubmission && !requireGasCoverage) throw new Error('Private tests require full gas coverage.');
+    this.queuedTest = { id, maximumGasUsd, requireGasCoverage, privateSubmission, expiresAt: Date.now() + GAS_ONLY_TEST_MS, blocksChecked: 0, routesChecked: 0 };
     const coverage = requireGasCoverage ? ' requiring full gas coverage' : '';
     this.host.log('[mev] One flash-loan test queued' + coverage + ' with a gas cap of $' + maximumGasUsd.toFixed(2) + '.');
   }

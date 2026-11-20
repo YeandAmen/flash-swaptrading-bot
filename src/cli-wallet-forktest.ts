@@ -516,6 +516,33 @@ try {
   assert.equal(await nonce(), directNonce + 1);
   assert.equal(await directExecutor.bundleNonce(), directNonce + 1, 'the next wallet action uses the next nonce');
   console.log('✓ Confirmed late direct MEV reverted after restart, accounted for wallet gas, and released the nonce');
+
+  const privateSource = lateReceipt.blockNumber;
+  const privateTarget = privateSource + 1n;
+  const privateHash = keccak256('0x1234');
+  const privateNonce = directNonce + 1;
+  const privateOpportunity = {
+    ...directOpportunity, hash: privateHash, block: Number(privateSource),
+    submission: { ...directOpportunity.submission, target: Number(privateTarget), privateSubmission: true },
+  };
+  fs.writeFileSync(mevStateFile, JSON.stringify({
+    ...finalDirect.file, pending: {
+      kind: 'direct', privateSubmission: true, nonce: privateNonce, target: privateTarget.toString(),
+      contract: oldProxy, ethUsd, hash: privateHash, opp: privateOpportunity,
+    },
+  }));
+  const recoveredPrivate = new MevSearcher(mevHost);
+  assert.equal(recoveredPrivate.view().pending?.hash, privateHash);
+  await recoveredPrivate.reconcileWallet(privateSource);
+  assert.equal(recoveredPrivate.view().pending?.hash, privateHash, 'the nonce stays reserved before the private deadline');
+  await test.mine({ blocks: 2 });
+  await recoveredPrivate.reconcileWallet(await publicClient.getBlockNumber({ cacheTime: 0 }));
+  assert.equal(recoveredPrivate.view().pending, null);
+  assert.equal(recoveredPrivate.view().recent.find((opportunity) => opportunity.hash === privateHash)?.status, 'not included');
+  assert.equal(recoveredPrivate.view().settings.direct.spentGasUsd, gasEth * ethUsd);
+  assert.equal(await nonce(), privateNonce, 'an expired private submission spends no gas and leaves the nonce unused');
+  console.log('✓ Expired private one-shot reconciled after restart without spending gas or consuming a nonce');
+
 } finally {
   MEV.v2ContractAddress = originalV2Address;
   MEV.v3ContractAddress = originalV3Address;
