@@ -74,6 +74,7 @@ function posList(list, max) {
 }
 
 const networkExplorers = {
+  ethereum: { origin: 'https://etherscan.io', address: /^0x[0-9a-f]{40}$/i, tx: /^0x[0-9a-f]{64}$/i },
   arbitrum: { origin: 'https://arbiscan.io', address: /^0x[0-9a-f]{40}$/i, tx: /^0x[0-9a-f]{64}$/i },
   solana: { origin: 'https://explorer.solana.com', address: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, tx: /^[1-9A-HJ-NP-Za-km-z]{64,88}$/ },
 };
@@ -155,7 +156,8 @@ function renderNetworkTest(network, test) {
   label.hidden = !test;
   if (!test) return;
   const outcome = networkOutcome(test.status);
-  const checks = Number.isSafeInteger(test.checked) && test.checked >= 0 ? ` · ${networkNumber(test.checked)} checks` : '';
+  const checked = test.checked ?? test.routesChecked;
+  const checks = Number.isSafeInteger(checked) && checked >= 0 ? ` · ${networkNumber(checked)} checks` : '';
   const queuedAt = Number.isFinite(test.queuedAt) && test.queuedAt > 0 ? ` · queued ${time(test.queuedAt)}` : '';
   const transaction = networkLink(network, 'tx', test.hash, 'Test transaction ↗');
   const note = typeof test.note === 'string' && test.note ? ` · ${esc(test.note)}` : '';
@@ -269,12 +271,18 @@ function render() {
   const pill = $('modePill');
   const banner = $('banner');
   const mev = S.mev;
+  renderNetworkTest('ethereum', mev?.gasOnlyTest);
   const now = Number.isFinite(S.now) ? S.now : Date.now();
   const scanAt = mev?.lastBlock?.at;
   const directPending = mev?.pending?.kind === 'direct';
   const scanAge = (mev?.mode === 'live' || directPending) && Number.isFinite(scanAt) && scanAt > 0 ? now - scanAt : null;
   const staleScan = scanAge !== null && scanAge > MEV_STALE_AFTER_MS
     ? `Last MEV scan was ${Math.floor(scanAge / 1000)} seconds ago.` : '';
+  const liveScanners = [
+    mev?.mode === 'live' && scanAge !== null && !staleScan && 'Ethereum',
+    S.networks?.arbitrum?.mode === 'live' && now - S.networks.arbitrum.updatedAt < 90_000 && 'Arbitrum',
+    S.networks?.solana?.mode === 'live' && now - S.networks.solana.updatedAt < 90_000 && 'Solana',
+  ].filter(Boolean);
   const pendingTarget = mev?.pending?.target;
   const scanBlock = mev?.lastBlock?.number;
   const waitingForMev = S.health?.ready === false && S.health.reason === 'Waiting for wallet transaction settlement'
@@ -306,6 +314,9 @@ function render() {
   } else if (S.forkMode) {
     pill.className = 'pill paper'; pill.textContent = 'LOCAL FORK';
     banner.className = 'banner'; $('bannerText').textContent = 'Connected to a local Ethereum fork with test funds.';
+  } else if (liveScanners.length) {
+    pill.className = 'pill live'; pill.textContent = 'LIVE';
+    banner.className = 'banner ok'; $('bannerText').textContent = `Flash-loan scanners active on ${liveScanners.join(', ')}.`;
   } else if (S.armed && S.liveStatus.ready) {
     pill.className = 'pill live'; pill.textContent = 'LIVE';
     banner.className = 'banner ok'; $('bannerText').textContent = 'Live trading active. ' + (S.live.lastDecision || '');
@@ -352,7 +363,10 @@ function render() {
   $('lDep').textContent = usd(L.netDepositsUsd);
   $('lReal').innerHTML = `<span class="${cls(L.realizedPnlUsd)}">${usd(L.realizedPnlUsd)}</span>`;
   $('lGas').textContent = usd(L.gasSpentUsd);
-  $('lDecision').textContent = (L.halted ? 'HALTED: ' + L.halted + ' · ' : '') + (S.armed ? L.lastDecision : S.liveStatus.reason);
+  $('spotStatus').hidden = S.liveStatus.ready;
+  $('spotStatus').textContent = S.liveStatus.reason;
+  $('lDecision').hidden = !S.armed || !L.lastDecision || L.lastDecision === S.liveStatus.reason;
+  $('lDecision').textContent = L.lastDecision || '';
   $('liveTag').innerHTML = S.armed ? '<span class="tag up">ARMED</span>' : '<span class="tag flat">OFF</span>';
 
   // paper

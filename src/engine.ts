@@ -822,7 +822,10 @@ export class Engine {
     if (!holding && eq < RISK.minTradeUsd) return { ready: false, reason: `Armed — waiting for USDC deposit (min ${usd(RISK.minTradeUsd)})` };
     const need = Math.max(RISK.minGasEth, 2 * this.ethForSwap(snap));
     if (eth < need) {
-      if (eth >= GAS_TOPUP.belowEth) return { ready: false, reason: `Armed — gas is expensive right now (${snap.baseFeeGwei.toFixed(1)} gwei); waiting for cheaper gas` };
+      if (eth >= GAS_TOPUP.belowEth) return {
+        ready: false,
+        reason: `Spot entries waiting for gas reserve. At ${snap.baseFeeGwei.toFixed(1)} gwei, new positions require ${need.toFixed(5)} ETH for entry and exit. Wallet has ${eth.toFixed(5)} ETH.`,
+      };
       if (GAS_TOPUP.enabled && eth >= this.ethForSwap(snap, 1) * 1.2 && usdc >= 1) {
         return {
           ready: false,
