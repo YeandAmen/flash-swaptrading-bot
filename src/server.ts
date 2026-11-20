@@ -268,6 +268,18 @@ app.post('/api/mev/arm', (req, res) => {
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
   void control(() => mev.arm())(req, res);
 });
+app.post('/api/mev/test-once', (req, res) => {
+  const { confirm, id, maximumGasUsd } = req.body ?? {};
+  if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)
+    || typeof maximumGasUsd !== 'number' || !Number.isFinite(maximumGasUsd) || maximumGasUsd <= 0) {
+    res.status(400).json({ error: 'Confirm TEST with a request ID and maximum gas cost.' });
+    return;
+  }
+  if (!allowArming(res)) return;
+  const mev = engine.mev;
+  if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
+  void control(() => mev.queueGasOnlyTest(id, maximumGasUsd))(req, res);
+});
 app.post('/api/mev/disarm', control(() => engine.mev?.disarm()));
 app.post('/api/pause', (req, res) => {
   const paused = Boolean(req.body?.paused);

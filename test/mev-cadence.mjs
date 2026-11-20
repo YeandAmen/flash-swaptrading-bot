@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { decodeFunctionData } from 'viem';
 
 const temporary = mkdtempSync(join(tmpdir(), 'eth-mev-cadence-'));
 const loopback = 'http://127.0.0.1:18647';
@@ -39,7 +40,7 @@ function snapshot(now) {
   const results = [];
   for (let i = 0; i < maxLimit; i++) {
     tokens.push({
-      token: { symbol: 'TEST' + i, address: address(100 + i), decimals: 18 },
+      token: { symbol: 'TEST' + i, address: address(100 + i), decimals: 18, core: true },
       wethIs0: true,
       pools: [
         { address: address(200 + i), kind: 0, venue: 'Uniswap v2', v2: true, fee: 0.003 },
@@ -61,6 +62,8 @@ function snapshot(now) {
 try {
   const { directCadence, extraRoutes, loanLimitWei } = await import('../dist/mev/cadence.js');
   const { mevReadClient } = await import('../dist/chain.js');
+  const { MEV } = await import('../dist/config.js');
+  const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
   const { MevSearcher } = await import('../dist/mev/searcher.js');
   const { routeInputSizes } = await import('../dist/mev/sizing.js');
   const now = Date.now();
@@ -99,7 +102,9 @@ try {
     });
   }
 
-  async function scan({ age, profit, finalProfit = coversGas, paper = false, staleHead = false, historical = false }) {
+  const testId = 'cadence-gas-test';
+  async function scan({ age, profit, finalProfit = coversGas, paper = false, staleHead = false, historical = false,
+    maximumTestGasUsd }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -135,8 +140,18 @@ try {
     };
     mevReadClient.getBalance = async () => oneEth;
 
-    await searcher.onBlock(snapshot(now), historical);
-    return { simulated, signed, submitted, seenAtSign };
+    const previousFunding = MEV.funding;
+    try {
+      if (maximumTestGasUsd !== undefined) {
+        MEV.funding = 'aave';
+        searcher.file.proxyContract = address(2);
+        searcher.queueGasOnlyTest(testId, maximumTestGasUsd);
+      }
+      await searcher.onBlock(snapshot(now), historical);
+      return { simulated, signed, submitted, seenAtSign, test: searcher.view().gasOnlyTest };
+    } finally {
+      MEV.funding = previousFunding;
+    }
   }
 
   const opening = await scan({ age: 24 * minute, profit: underGas });
@@ -178,6 +193,27 @@ try {
   assert.equal(backfill.simulated.size, 0, 'backfilled snapshots stop at ranking');
   assert.equal(backfill.signed.length, 0);
   assert.equal(backfill.submitted.length, 0);
+
+  const allowedTest = await scan({ age: 24 * minute, profit: underGas, finalProfit: underGas, maximumTestGasUsd: 2 });
+  assert.equal(allowedTest.signed.length, 1, 'the explicit one-shot path can sign a gross-positive route below its gas cost');
+  assert.equal(allowedTest.submitted[0].opp.gasOnlyTestId, testId);
+  assert.equal(allowedTest.test.status, 'submitted');
+  assert.equal(decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: allowedTest.signed[0].data }).args[0].minProfit, 1n);
+
+  const cappedTest = await scan({ age: 24 * minute, profit: underGas, finalProfit: underGas, maximumTestGasUsd: 0.01 });
+  assert.equal(cappedTest.signed.length, 0);
+  assert.equal(cappedTest.test.status, 'queued');
+
+  const insufficientGross = await scan({ age: 24 * minute, profit: underGas, finalProfit: 0n, maximumTestGasUsd: 2 });
+  assert.equal(insufficientGross.signed.length, 0, 'the final simulation must still repay and produce residual proceeds');
+  assert.equal(insufficientGross.test.status, 'queued');
+
+  const ordinaryTest = await scan({ age: 24 * minute, profit: coversGas, maximumTestGasUsd: 2 });
+  assert.equal(ordinaryTest.signed.length, 1);
+  assert.equal(ordinaryTest.submitted[0].opp.gasOnlyTestId, testId);
+  assert.equal(ordinaryTest.test.status, 'submitted');
+  assert.ok(decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: ordinaryTest.signed[0].data }).args[0].minProfit > 1n,
+    'a normal-level profit opportunity consumes the request without lowering its profit floor');
 
   const journal = newSearcher(async () => assert.fail('receipt settlement must not sign'));
   const previousFill = now - 31 * minute;

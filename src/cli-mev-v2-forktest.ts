@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createPublicClient, createTestClient, createWalletClient, encodeFunctionData, getAddress, http, keccak256, parseAbi, parseEther, parseEventLogs, type Address, type Hex } from 'viem';
+import { createPublicClient, createTestClient, createWalletClient, decodeFunctionData, encodeFunctionData, getAddress, http, keccak256, parseAbi, parseEther, parseEventLogs, type Address, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import { erc20Abi, nextBaseFee } from './chain.js';
@@ -218,10 +218,14 @@ async function sellFixtureTokensOnSushi() {
   }));
 }
 
-async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, profit: bigint, funding: RouteFunding) {
+async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, profit: bigint, funding: RouteFunding, gasOnly: boolean) {
   const saved = { submission: MEV.submission, directMinNetUsd: MEV.directMinNetUsd,
     directMaxGasUsd: MEV.directMaxGasUsd, directDailyGasUsd: MEV.directDailyGasUsd };
-  Object.assign(MEV, { submission: 'direct', directMinNetUsd: 0.01, directMaxGasUsd: 100, directDailyGasUsd: 100 });
+  const maximumTestGasUsd = 1.5;
+  Object.assign(MEV, {
+    submission: 'direct', directMinNetUsd: 0.01,
+    directMaxGasUsd: gasOnly ? maximumTestGasUsd : 100, directDailyGasUsd: gasOnly ? 4 : 100,
+  });
   const ethUsd = 2_000;
   const logs: string[] = [];
   const searcher = new MevSearcher({
@@ -250,8 +254,36 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
       sizeEth, grossEth, gasEth: 0, tipEth: 0, netEth: grossEth, netUsd: grossEth * ethUsd, status: 'would send' };
     const offer = { candidate: { t: market, A: buy, B: sell, dx: sizeEth, est: grossEth, estimatedNet: grossEth, gasUnits: 0 },
       amount, profit, funding, score: profit, opp };
-    const prepared = await searcher['prepareLive'](offer, point, searcher['profitPolicy'](Date.now()));
+    const policy = searcher['profitPolicy'](Date.now());
+    const testId = 'a71aa610-43f9-457f-88b7-5cbaf6531764';
+    if (gasOnly) {
+      assert.equal(await searcher['prepareLive'](offer, point, policy), null,
+        'the ordinary trading policy must reject the gas-only fixture');
+      assert.throws(() => searcher.queueGasOnlyTest(testId, maximumTestGasUsd + 0.01), /gas cap/);
+      searcher.queueGasOnlyTest('low-budget-test', 0.001);
+      const lowBudget = searcher['queuedTest'];
+      assert.ok(lowBudget);
+      assert.equal(await searcher['prepareLive'](offer, point, policy, lowBudget), null,
+        'a test must reject even a valid route when its padded gas quote exceeds the one-shot budget');
+      lowBudget.expiresAt = Date.now() - 1;
+      assert.equal(searcher.view().gasOnlyTest?.status, 'expired');
+      searcher.queueGasOnlyTest(testId, maximumTestGasUsd);
+      assert.equal(searcher.view().gasOnlyTest?.id, testId);
+      assert.equal(searcher.view().gasOnlyTest?.status, 'queued');
+    }
+    const prepared = await searcher['prepareLive'](offer, point, policy, gasOnly ? searcher['queuedTest'] ?? undefined : undefined);
     assert.ok(prepared, opp.note);
+    if (gasOnly) {
+      const pinned = decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data: prepared.data });
+      assert.equal(pinned.functionName, 'executePinned');
+      assert.equal(pinned.args[0], implementationHash);
+      const execution = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: pinned.args[1] });
+      assert.equal(execution.functionName, 'execute');
+      assert.equal(execution.args[0].minProfit, 1n, 'contract must enforce repayment and positive proceeds');
+      assert.equal(execution.args[0].tip, 0n);
+      assert.equal(execution.args[0].funding, funding);
+      assert.ok(Number(prepared.gasBudget) / 1e18 * ethUsd <= maximumTestGasUsd);
+    }
     await searcher['sendLive'](prepared, point, searcher['armGeneration']);
     const submitted = searcher.view();
     assert.ok(submitted.pending?.hash, opp.note);
@@ -259,6 +291,10 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     assert.deepEqual(submitted.recent[0]?.submission?.builders, []);
     assert.equal(submitted.stats.bundles, bundles);
     assert.equal(submitted.stats.directAttempts, directAttempts + 1);
+    if (gasOnly) {
+      assert.equal(submitted.gasOnlyTest?.status, 'submitted');
+      assert.equal(submitted.gasOnlyTest?.hash, submitted.pending.hash);
+    }
     assert.ok(logs.some((line) => line.includes('Direct transaction') && line.includes('submitted.')), logs.join(' | '));
 
     const receipt = await confirmed(submitted.pending.hash);
@@ -269,9 +305,32 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     assert.equal(settled.recent[0]?.status, 'landed');
     assert.equal(settled.recent[0]?.hash, receipt.transactionHash);
     assert.equal(settled.recent[0]?.tipEth, 0);
-    assert.ok((settled.recent[0]?.netUsd ?? 0) > 0, 'settled direct route covered actual gas');
     const gasUsd = Number(receipt.gasUsed * receipt.effectiveGasPrice) / 1e18 * ethUsd;
     assert.ok(Math.abs(settled.settings.direct.spentGasUsd - initialGasUsd - gasUsd) < 1e-9);
+    const netUsd = settled.recent[0]?.netUsd ?? 0;
+    if (gasOnly) {
+      assert.ok(netUsd < 0 && netUsd >= -gasUsd, 'the completed test can lose at most its actual gas cost');
+      assert.equal(settled.gasOnlyTest?.status, 'landed');
+      assert.equal(settled.gasOnlyTest?.hash, receipt.transactionHash);
+      const sent = await publicClient.getTransaction({ hash: receipt.transactionHash });
+      assert.equal(sent.value, 0n, 'test attaches no funds to the call');
+      assert.ok(gasUsd <= maximumTestGasUsd);
+
+      const next = await searcher['head']();
+      const nextPoint = { ...point, blockNumber: next.number, timestamp: Number(next.timestamp), hash: next.hash };
+      const retry = { ...prepared, offer: { ...offer, opp: { ...opp, hash: undefined, submission: undefined } } };
+      await searcher['sendLive'](retry, nextPoint, searcher['armGeneration']);
+      assert.equal(searcher.view().pending, null);
+      assert.equal(searcher.view().stats.directAttempts, directAttempts + 1,
+        'a consumed test cannot submit on the next head');
+      const restarted = new MevSearcher(searcher['host']);
+      restarted.queueGasOnlyTest(testId, maximumTestGasUsd);
+      assert.equal(restarted.view().gasOnlyTest?.status, 'landed');
+      assert.equal(restarted.view().gasOnlyTest?.hash, receipt.transactionHash,
+        'replaying the same test ID after restart must leave the settled receipt in place');
+    } else {
+      assert.ok(netUsd > 0, 'settled direct route covered actual gas');
+    }
     return receipt.transactionHash;
   } finally {
     searcher.stop();
@@ -279,14 +338,16 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
   }
 }
 
-async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: RouteFunding, direct = false) {
+async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: RouteFunding, direct: boolean | 'gas-only' = false) {
   const point = await fork.snapshot();
   try {
     const maxBlock = (await publicClient.getBlockNumber({ cacheTime: 0 })) + 3n;
     const prepare = { funding, token: ADDR.usdc, buy: toNextVenue(buy), sell: toNextVenue(sell), minProfit: 1n, tip: useV3 ? 0n : 1n, maxBlock };
     let profitable: { args: typeof prepare & { amountIn: bigint }; profit: bigint } | undefined;
     const errors: string[] = [];
-    for (const size of ['0.5', '0.15', '0.05', '1']) {
+    const gasOnly = direct === 'gas-only';
+    const sizes = gasOnly ? ['0.0000001', '0.000001', '0.00001'] : ['0.5', '0.15', '0.05', '1'];
+    for (const size of sizes) {
       const amountIn = parseEther(size);
       const args = { ...prepare, amountIn };
       try {
@@ -296,7 +357,7 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: Ro
         }) : await publicClient.simulateContract({
           address: contract, abi: FLASH_ARB_V2_ABI, functionName: 'execute', account: owner.address, args: [args],
         });
-        if (simulated.result > parseEther('0.002')) {
+        if (simulated.result > (gasOnly ? 0n : parseEther('0.002'))) {
           profitable = { args, profit: simulated.result };
           break;
         }
@@ -311,7 +372,7 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: Ro
     const custodyBalance = custody ? await balanceOf(ADDR.weth, custody) : 0n;
     let hash: Hex;
     if (direct) {
-      hash = await sendWithSearcher(buy, sell, order.amountIn, profitable.profit, funding);
+      hash = await sendWithSearcher(buy, sell, order.amountIn, profitable.profit, funding, gasOnly);
     } else if (useV3) {
       const fees = await publicClient.estimateFeesPerGas();
       const nonce = await publicClient.getTransactionCount({ address: owner.address, blockTag: 'pending' });
@@ -345,7 +406,12 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: Ro
     }
     const expected = payout.args.profit - payout.args.tip - receipt.gasUsed * receipt.effectiveGasPrice;
     const ethAfter = await publicClient.getBalance({ address: owner.address });
-    assert.ok(expected > 0n, `${label} covers even test gas and builder payment`);
+    if (gasOnly) {
+      assert.ok(expected < 0n, 'the fork fixture should exercise a trade with a gas-only loss');
+      assert.ok(expected >= -(receipt.gasUsed * receipt.effectiveGasPrice));
+    } else {
+      assert.ok(expected > 0n, `${label} covers even test gas and builder payment`);
+    }
     assert.equal(ethAfter - ethBefore, expected, `${label} accrued exact proceeds to the deploying wallet`);
     assert.equal(await publicClient.getBalance({ address: contract! }), 0n);
     assert.equal(await balanceOf(ADDR.weth, contract!), 0n);
@@ -380,6 +446,7 @@ if (useProxy) {
     const beforeCurve = await fork.snapshot();
     await buyFixtureTokens(sushiV2Router, parseEther('18'));
     await testRoute('Curve Tricrypto buy with SparkLend through the direct searcher', curve, sushiV2, 4, true);
+    await testRoute('One-shot direct SparkLend test under the gas cap', curve, sushiV2, 4, 'gas-only');
     await fork.revert({ id: beforeCurve });
   }
 }
