@@ -41,7 +41,7 @@ EOF
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
     for _ in $(seq 1 40); do launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break; sleep 1; done
     launchctl bootstrap "$DOMAIN" "$PLIST"
-    echo "Installed and started. Dashboard: http://localhost:$PORT (password: npm run --silent service:token)"
+    echo "Installed and started. Dashboard: http://localhost:$PORT"
     ;;
   uninstall)
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
@@ -68,9 +68,6 @@ EOF
   logs)
     tail -n 60 "$DIR/data/server.log"
     ;;
-  token)
-    "$NODE" --input-type=module -e 'import { dashboardToken } from "./dist/dashboard-auth.js"; console.log(dashboardToken())'
-    ;;
   *)
-    echo "usage: $0 install|uninstall|restart|status|logs|token"; exit 1;;
+    echo "usage: $0 install|uninstall|restart|status|logs"; exit 1;;
 esac

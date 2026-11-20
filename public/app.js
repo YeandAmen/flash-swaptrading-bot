@@ -34,16 +34,11 @@ let mevContractQuoteRequest = 0;
 let mevContractQuote = null;
 
 async function api(path, body) {
-  const send = (authorization) => fetch(path, {
-    method: 'POST', headers: { 'content-type': 'application/json', 'x-bot-ui': '1', ...(authorization ? { authorization } : {}) },
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-bot-ui': '1' },
     body: JSON.stringify(body || {}),
   });
-  let r = await send();
-  if (r.status === 401) {
-    const password = window.prompt('Authorize this live wallet action with the local operator password (npm run --silent dashboard:password).');
-    if (!password) throw new Error('Live wallet action canceled.');
-    r = await send(`Basic ${btoa(`operator:${password.trim()}`)}`);
-  }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;

@@ -4,7 +4,6 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import QRCode from 'qrcode';
 import { formatUnits, type Hex } from 'viem';
 import { CONFIG, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from './config.js';
-import { createDashboardCredentialCheck } from './dashboard-auth.js';
 import { endpointOrigin, redactDiagnostic } from './diagnostics.js';
 import { Engine } from './engine.js';
 import { DeploymentFeeLimitError, DeploymentGasError } from './executor.js';
@@ -12,7 +11,6 @@ import type { PortfolioState } from './types.js';
 
 const engine = new Engine();
 const app = express();
-const dashboardCredentialMatches = CONFIG.allowLiveTrading ? createDashboardCredentialCheck() : null;
 const publicDir = path.join(ROOT, 'public');
 const liveTradingAllowed = CONFIG.allowLiveTrading || CONFIG.forkMode;
 app.disable('x-powered-by');
@@ -52,7 +50,7 @@ function readiness(): { ready: boolean; reason: string } {
   return { ready: true, reason: 'Market cycle is healthy' };
 }
 
-// Minimal loopback probes for monitoring. Wallet writes have a separate operator check.
+// Minimal loopback probes for monitoring.
 app.get('/api/health', (_req, res) => { res.json({ status: 'ok' }); });
 app.get('/api/ready', (_req, res) => {
   const health = readiness();
@@ -209,17 +207,13 @@ app.get('/api/qr.svg', async (_req, res) => {
 
 const kindOf = (req: Request) => (req.body?.kind === 'live' ? 'live' : 'paper') as 'paper' | 'live';
 
-function allowLiveControl(req: Request, res: Response): boolean {
+function allowLiveControl(res: Response): boolean {
   if (!liveTradingAllowed) { res.status(403).json({ error: 'Live signing is disabled in settings' }); return false; }
-  if (!CONFIG.forkMode && !dashboardCredentialMatches?.(req.headers.authorization)) {
-    res.status(401).json({ error: 'This live wallet action requires the local operator password.' });
-    return false;
-  }
   return true;
 }
 
-function allowArming(req: Request, res: Response): boolean {
-  if (!allowLiveControl(req, res)) return false;
+function allowArming(res: Response): boolean {
+  if (!allowLiveControl(res)) return false;
   const health = readiness();
   if (!health.ready) { res.status(503).json({ error: health.reason }); return false; }
   return true;
@@ -241,7 +235,7 @@ function control(operation: (req: Request) => void | Promise<void | { address: s
 
 app.post('/api/arm', (req, res) => {
   if (req.body?.confirm !== 'LIVE') { res.status(400).json({ error: 'Type LIVE to confirm' }); return; }
-  if (allowArming(req, res)) void control(() => engine.arm())(req, res);
+  if (allowArming(res)) void control(() => engine.arm())(req, res);
 });
 app.post('/api/disarm', control(() => engine.disarm()));
 for (const action of ['deploy', 'upgrade'] as const) {
@@ -259,7 +253,7 @@ for (const action of ['deploy', 'upgrade'] as const) {
       res.status(400).json({ error: 'Refresh the dashboard and confirm the FlashArb proxy release and gas quote.' });
       return;
     }
-    if (!allowArming(req, res)) return;
+    if (!allowArming(res)) return;
     const mev = engine.mev;
     if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
     void control(async () => ({
@@ -269,7 +263,7 @@ for (const action of ['deploy', 'upgrade'] as const) {
 }
 app.post('/api/mev/arm', (req, res) => {
   if (req.body?.confirm !== 'MEV') { res.status(400).json({ error: 'Type MEV to confirm' }); return; }
-  if (!allowArming(req, res)) return;
+  if (!allowArming(res)) return;
   const mev = engine.mev;
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
   void control(() => mev.arm())(req, res);
@@ -277,17 +271,17 @@ app.post('/api/mev/arm', (req, res) => {
 app.post('/api/mev/disarm', control(() => engine.mev?.disarm()));
 app.post('/api/pause', (req, res) => {
   const paused = Boolean(req.body?.paused);
-  if (paused || !liveTradingAllowed || allowLiveControl(req, res)) void control(() => engine.setPaused(paused))(req, res);
+  if (paused || !liveTradingAllowed || allowLiveControl(res)) void control(() => engine.setPaused(paused))(req, res);
 });
 app.post('/api/resume', (req, res) => {
   const kind = kindOf(req);
-  if (kind === 'paper' || allowLiveControl(req, res)) void control(() => engine.resume(kind))(req, res);
+  if (kind === 'paper' || allowLiveControl(res)) void control(() => engine.resume(kind))(req, res);
 });
 app.post('/api/paper/reset', control(() => engine.resetPaper()));
 app.post('/api/backtest', control(() => { void engine.runResearchNow(); }));
 app.post('/api/panic', (req, res) => {
   const kind = kindOf(req);
-  if (kind === 'paper' || allowLiveControl(req, res)) void control(() => engine.panic(kind))(req, res);
+  if (kind === 'paper' || allowLiveControl(res)) void control(() => engine.panic(kind))(req, res);
 });
 
 const server = app.listen(CONFIG.port, CONFIG.host, () => {

@@ -57,7 +57,7 @@ New-Item -ItemType Directory -Force -Path $walletBackup | Out-Null
 npm run --silent wallet:export -- (Join-Path $walletBackup 'eth-token-bot.key')
 ```
 
-The exported file contains one `0x`-prefixed private key in plaintext. The command prints the public address and destination, with the key stored in the restricted file. Keep it in encrypted offline storage. Anyone who obtains the key can spend the wallet’s funds. Share the repository and `.env.example` when handing the project to someone. Keep your `.env`, `DATA_DIR`, private key backups, and dashboard credential local.
+The exported file contains one `0x`-prefixed private key in plaintext. The command prints the public address and destination, with the key stored in the restricted file. Keep it in encrypted offline storage. Anyone who obtains the key can spend the wallet’s funds. Share the repository and `.env.example` when handing the project to someone. Keep your `.env`, `DATA_DIR`, and private key backups local.
 
 **To restore or import:** Before starting, set `WALLET_KEY_FILE` in `.env` to the absolute path of a protected file containing one `0x`-prefixed private key. On macOS or Linux, set `chmod 600 /absolute/path/to/wallet.key`. On Windows use an owner-only NTFS file, such as a file created by the export command. Run `npm run --silent wallet:address` and verify the address against your existing public address before funding it. If you are restoring an existing bot, also restore its data directory and wallet metadata so the bot can reconcile positions and in-flight transactions.
 
@@ -65,18 +65,11 @@ To reuse a Mac Keychain wallet on another platform, export it from the original 
 
 ## 3. Dashboard and localhost troubleshooting
 
-The dashboard uses HTTP at `http://127.0.0.1:7777`. Use the port configured by `PORT` if you changed it. Opening the dashboard and using paper controls requires no sign-in. Sensitive live wallet actions require the local operator credential. The bot generates this credential on the first startup with live signing enabled.
-
-```sh
-npm run --silent dashboard:password
-```
-
-Use `operator` if a live action asks for a username. The password is distinct from the wallet key and is stored at `DATA_DIR/dashboard-token`.
+The dashboard uses HTTP at `http://127.0.0.1:7777`. Use the port configured by `PORT` if you changed it. Arming and contract changes require the typed confirmation shown in the dashboard. Keep the service bound to loopback and use an authenticated gateway or a private tunnel for remote access. The AWS gateway uses a browser client certificate.
 
 | Symptom | Check |
 | --- | --- |
 | Connection refused | Run `npm run build` and `npm start` from the checkout, then check the terminal output. Use the displayed loopback port. If another process is already listening, stop the duplicate or set an unused `PORT`, such as `7778`, in `.env` and restart. |
-| A browser shows an old sign-in popup | Confirm that the process serving the port is the updated bot. Restart it, then open `http://127.0.0.1:7777` in a fresh private window to clear cached HTTP credentials. |
 | Dashboard is open and paper scan is still starting | Check `/api/ready` and the startup status on the page. Market discovery, archive history and MEV pool discovery use the configured RPC. Use `/api/health` to check the HTTP process. |
 | Chain or RPC error | Use an Ethereum mainnet endpoint. The RPC must report chain ID `1`. Keep the endpoint credentials inside `.env`. A provider without history or state overrides can limit backtests and eligibility simulations. |
 | Browser is on another device, container or remote host | `127.0.0.1` points to that device or environment. Open the dashboard on the host running the bot. Keep the wallet operator interface bound to loopback. |
@@ -157,7 +150,7 @@ New deployments use the FlashArb proxy. The repository keeps the original V2 and
 Paper scanning is available after startup. The default `ALLOW_LIVE_TRADING=off` blocks signing, including contract actions. Set it to `on` and restart the bot when you want to authorize a deployment or upgrade.
 
 1. Open [the local dashboard](http://127.0.0.1:7777), wait for the wallet to be ready, and select **Deploy upgradeable FlashArb**. The dialog shows the implementation hash, the estimated fee, and the exact maximum gas charge.
-2. Type `DEPLOY` and enter the operator password from `npm run --silent dashboard:password`. One transaction creates the proxy and its initial implementation. The bootstrapped proxy uses the bot wallet as its trading owner and upgrade admin.
+2. Type `DEPLOY` to confirm. One transaction creates the proxy and its initial implementation. The bootstrapped proxy uses the bot wallet as its trading owner and upgrade admin.
 3. The bot disarms Spot and MEV before signing. It selects the proxy after verifying the receipt, proxy bytecode, ERC-1967 slots, implementation bytecode, and wallet ownership. Use **Arm MEV** separately when you want live arbitrage. An existing standalone deployment remains selected until the proxy passes verification.
 4. When a later bot release includes a new approved implementation, choose **Upgrade FlashArb implementation** and confirm with `UPGRADE`. One transaction creates and activates the new implementation at the same proxy address. The gas quote covers the implementation deployment and switch. An upgrade also disarms both live modes.
 
@@ -186,7 +179,6 @@ The proxy uses standardized implementation and admin slots. [ERC-1967](https://e
 | `npm run backtest` | Backtest rules and perform a walk-forward ML evaluation locally. |
 | `npm run --silent wallet:address` | Initialize or show the public bot address. |
 | `npm run --silent wallet:export -- <absolute-path>` | Export the existing key to a new owner-only file outside the checkout. |
-| `npm run --silent dashboard:password` | Read the local operator credential for live actions. |
 
 | Setting | Purpose |
 | --- | --- |
