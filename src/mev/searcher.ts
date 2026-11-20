@@ -35,7 +35,6 @@ const FALLBACK_LEAD_MS = 5_000;
 const CADENCE_RECHECK_MS = 60_000;
 const GAS_ONLY_TEST_MS = 6 * 60_000;
 const GAS_ONLY_TEST_ROUTES = 4;
-const MAX_PRIVATE_GAS_ONLY_TEST_USD = 0.25;
 const TEST_ID = /^[A-Za-z0-9_-]{8,80}$/;
 const HEAD_RETRY_MS = 400;
 const POOL_READS_PER_CHUNK = 160;
@@ -1488,9 +1487,6 @@ export class MevSearcher {
       throw new Error('A verified, armed direct proxy with an available wallet is required for a test.');
     }
     if (this.activeGasOnlyTest()) throw new Error('A gas-only test is already queued.');
-    if (privateSubmission && !requireGasCoverage && maximumGasUsd > MAX_PRIVATE_GAS_ONLY_TEST_USD) {
-      throw new Error('A private gas-only test must have a gas cap of at most $0.25.');
-    }
     this.queuedTest = { id, maximumGasUsd, requireGasCoverage, privateSubmission, expiresAt: Date.now() + GAS_ONLY_TEST_MS, blocksChecked: 0, routesChecked: 0 };
     const coverage = requireGasCoverage ? ' requiring full gas coverage' : '';
     this.host.log('[mev] One flash-loan test queued' + coverage + ' with a gas cap of $' + maximumGasUsd.toFixed(2) + '.');

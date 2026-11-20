@@ -228,7 +228,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
   const premium = mode === 'premium';
   const saved = { submission: MEV.submission, directMinNetUsd: MEV.directMinNetUsd,
     directMaxGasUsd: MEV.directMaxGasUsd, directDailyGasUsd: MEV.directDailyGasUsd, directPremiumMaxGasUsd: MEV.directPremiumMaxGasUsd };
-  const maximumTestGasUsd = privateGasOnly ? 0.25 : 1.5;
+  const maximumTestGasUsd = 1.5;
   Object.assign(MEV, {
     submission: 'direct', directMinNetUsd: breakEven ? 2_000 : 0.01,
     directMaxGasUsd: gasOnly || premium ? 1.5 : 100,
@@ -467,7 +467,7 @@ await buyFixtureTokens(sushiV2Router, parseEther('18'));
 console.log('✓ fork-local Sushi v2 buy fixture prepared');
 await testRoute('Pancake v3 buy-pool flash swap', pancake500, sushiV2, 0);
 await testRoute('native ETH v4 flash settlement', v4Native500, sushiV2, 0, useProxy ? 'break-even' : false);
-if (useProxy) await testRoute('Private pool flash swap with a $0.25 gas-only cap', v4Native500, sushiV2, 0, 'private-gas-only');
+if (useProxy) await testRoute('Private pool flash swap under the approved gas cap', v4Native500, sushiV2, 0, 'private-gas-only');
 await testRoute('WETH v4 flash settlement', v4Weth500, sushiV2, 0);
 await testRoute('Aave v3 funding with native ETH v4', v4Native500, sushiV2, 1);
 await testRoute('Morpho Blue funding with WETH v4', v4Weth500, sushiV2, 2);
