@@ -203,6 +203,11 @@ const mevMinNetUsd = num('MEV_MIN_NET_USD', 0.05);
 export type MevFundingMode = 'auto' | 'pool' | 'aave' | 'morpho' | 'balancer' | 'spark';
 export const MEV = {
   enabled: str('MEV', 'on') !== 'off',
+  submission: str('MEV_SUBMISSION', 'bundle') as 'bundle' | 'direct',
+  directMinNetUsd: num('MEV_DIRECT_MIN_NET_USD', mevMinNetUsd),
+  directMaxGasUsd: num('MEV_DIRECT_MAX_GAS_USD', 0),
+  directDailyGasUsd: num('MEV_DIRECT_DAILY_GAS_USD', 0),
+  directMaxPriorityGwei: num('MEV_DIRECT_MAX_PRIORITY_GWEI', 0.25),
   funding: str('MEV_FUNDING', 'auto') as MevFundingMode,
   v2ContractAddress: configuredMevV2 ? getAddress(configuredMevV2) : null,
   v3ContractAddress: configuredMevV3 ? getAddress(configuredMevV3) : null,
@@ -253,6 +258,12 @@ frac('LONGTAIL_MAX_ALLOC_PCT', TOKENS.maxAllocPct, true);
 check(GAS_TOPUP.belowEth > 0 && GAS_TOPUP.belowEth < 1, 'GAS_TOPUP_BELOW_ETH must be between 0 and 1 ETH');
 check(GAS_TOPUP.usd >= 1 && GAS_TOPUP.usd <= 100, 'GAS_TOPUP_USD must be 1..100');
 check(Number.isInteger(GAS_TOPUP.maxPerDay) && GAS_TOPUP.maxPerDay >= 1 && GAS_TOPUP.maxPerDay <= 24, 'GAS_TOPUP_MAX_PER_DAY must be 1..24');
+check(['bundle', 'direct'].includes(MEV.submission), 'MEV_SUBMISSION must be bundle or direct');
+check(MEV.directMinNetUsd > 0, 'MEV_DIRECT_MIN_NET_USD must be > 0');
+check(MEV.directMaxGasUsd >= 0 && MEV.directDailyGasUsd >= MEV.directMaxGasUsd,
+  'MEV direct gas limits must be nonnegative and the daily limit must cover one transaction');
+check(MEV.directMaxPriorityGwei >= 1e-9 && MEV.directMaxPriorityGwei <= 10,
+  'MEV_DIRECT_MAX_PRIORITY_GWEI must be between 0.000000001 and 10');
 check(MEV.minPoolWeth >= 0.1, 'MEV_MIN_POOL_WETH must be >= 0.1');
 check(['auto', 'pool', 'aave', 'morpho', 'balancer', 'spark'].includes(MEV.funding), 'MEV_FUNDING must be auto, pool, aave, morpho, balancer or spark');
 check(!(MEV.v2ContractAddress && MEV.v3ContractAddress), 'Configure only one FlashArb contract address');

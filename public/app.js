@@ -9,6 +9,7 @@ const time = (t) => new Date(t).toLocaleString([], { month: 'short', day: 'numer
 const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const ago = (t) => { const s = Math.round((Date.now() - t) / 1000); return s < 60 ? s + 's ago' : Math.round(s / 60) + 'm ago'; };
 const MEV_STALE_AFTER_MS = 60_000;
+const isDirectMev = (mev) => mev?.settings?.submission === 'direct';
 
 let S = null;
 let stateRequest = null;
@@ -92,16 +93,17 @@ function render() {
   const mev = S.mev;
   const now = Number.isFinite(S.now) ? S.now : Date.now();
   const scanAt = mev?.lastBlock?.at;
-  const scanAge = mev?.mode === 'live' && Number.isFinite(scanAt) && scanAt > 0 ? now - scanAt : null;
+  const directPending = mev?.pending?.kind === 'direct';
+  const scanAge = (mev?.mode === 'live' || directPending) && Number.isFinite(scanAt) && scanAt > 0 ? now - scanAt : null;
   const staleScan = scanAge !== null && scanAge > MEV_STALE_AFTER_MS
     ? `Last MEV scan was ${Math.floor(scanAge / 1000)} seconds ago.` : '';
   const pendingTarget = mev?.pending?.target;
   const scanBlock = mev?.lastBlock?.number;
-  const waitingForBundle = S.health?.ready === false && S.health.reason === 'Waiting for wallet transaction settlement'
-    && !S.forkMode && !mev?.lastError && !mev?.deploymentPending
+  const waitingForMev = S.health?.ready === false && S.health.reason === 'Waiting for wallet transaction settlement'
+    && !S.forkMode && !mev?.lastError && !mev?.deploymentPending && !mev?.upgradePending
     && scanAge !== null && scanAge >= 0 && !staleScan
-    && Number.isSafeInteger(scanBlock) && Number.isSafeInteger(pendingTarget)
-    && pendingTarget >= scanBlock - 3 && pendingTarget <= scanBlock + 1;
+    && (directPending || (Number.isSafeInteger(scanBlock) && Number.isSafeInteger(pendingTarget)
+      && pendingTarget >= scanBlock - 3 && pendingTarget <= scanBlock + 1));
   if (S.liveFault) {
     pill.className = 'pill err'; pill.textContent = 'RECOVERY';
     banner.className = 'banner bad'; $('bannerText').textContent = S.liveFault;
@@ -111,10 +113,12 @@ function render() {
   } else if (S.status === 'error' || S.lastError) {
     pill.className = 'pill err'; pill.textContent = S.status === 'error' ? 'ERROR' : (S.armed ? 'LIVE' : 'PAPER');
     banner.className = 'banner bad'; $('bannerText').textContent = 'Problem: ' + (S.lastError || 'unknown') + ' — the bot retries automatically.';
-  } else if (waitingForBundle) {
+  } else if (waitingForMev) {
     pill.className = 'pill wait'; pill.textContent = 'SETTLING';
     banner.className = 'banner warn';
-    $('bannerText').textContent = `Scanning while the MEV bundle for block ${pendingTarget.toLocaleString()} settles.`;
+    $('bannerText').textContent = directPending
+      ? 'Scanning while the direct MEV transaction awaits on-chain settlement.'
+      : `Scanning while the MEV bundle for block ${pendingTarget.toLocaleString()} settles.`;
   } else if (!S.health.ready) {
     pill.className = 'pill err'; pill.textContent = 'UNREADY';
     banner.className = 'banner bad'; $('bannerText').textContent = S.health.reason;
@@ -263,6 +267,7 @@ function render() {
   if (X) {
     const tag = { live: 'buy', paper: 'flat', deploying: 'sell', arming: 'sell', off: 'flat' }[X.mode] || 'flat';
     $('mevMode').innerHTML = `<span class="tag ${tag}">${esc(String(X.mode).toUpperCase())}</span>`;
+    const direct = isDirectMev(X);
     const venues = Object.entries(X.venues || {}).map(([k, v]) => `${v} ${k}`).join(', ');
     const lb = X.lastBlock;
     const C = X.coverage;
@@ -273,30 +278,36 @@ function render() {
     const missingReads = lb?.failedChunks > 0 ? ` · ${lb.failedChunks} pool batches unavailable` : '';
     const P = X.settings?.activeProfitPolicy;
     const padding = P?.gasPaddingPct == null ? '' : ` · ${Math.round(P.gasPaddingPct * 100)}% gas buffer`;
-    const idleBid = P?.idle ? ` · idle bidding with a ${usd(P.minNetUsd)} net floor and up to ${Math.round(P.builderTipPct * 100)}% of after-gas profit bid${padding}` : '';
-    $('mevStatus').textContent = (staleScan ? 'Scan is stale · ' : '') + `${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
-      coverage + idleBid + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
+    const bidding = direct && Number.isFinite(P?.minNetUsd) ? ` · ${usd(P.minNetUsd)} minimum net per attempt${padding}`
+      : P?.idle ? ` · idle bidding with a ${usd(P.minNetUsd)} net floor and up to ${Math.round(P.builderTipPct * 100)}% of after-gas profit bid${padding}` : '';
+    const transport = X.mode === 'live' ? '' : direct ? 'Direct Ethereum transactions · ' : 'Private bundles · ';
+    $('mevStatus').textContent = (staleScan ? 'Scan is stale · ' : '') + `${transport}${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
+      coverage + bidding + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
     const st = X.stats;
     $('mevBlocks').textContent = st.blocks.toLocaleString();
     const B = X.bestThisHour?.exact ? X.bestThisHour : null;
     const bestVal = !B ? '<span class="sub">No successful simulation this hour</span>' : B.grossUsd != null
       ? `<span class="${B.grossUsd > B.gasUsd ? 'pos' : ''}">${usd(B.grossUsd)}</span> <span class="sub">vs ${usd(B.gasUsd)} gas</span>`
       : `${B.grossEth.toFixed(5)} <span class="sub">vs ${B.gasEth.toFixed(5)} ETH gas</span>`;
-    $('mevGap').innerHTML = bestVal + (B ? `<div class="sub">${esc(B.symbol)} · before builder bid</div>` : '');
+    $('mevGap').innerHTML = bestVal + (B ? `<div class="sub">${esc(B.symbol)}${direct ? '' : ' · before builder bid'}</div>` : '');
     $('mevSims').textContent = `${st.simulated} / ${st.profitable}`;
-    $('mevBundles').textContent = `${st.bundles} / ${st.landed}`;
+    $('mevSubmissionLabel').textContent = direct ? 'Direct attempts / landed' : 'Bundles sent / landed';
+    $('mevBundles').textContent = direct
+      ? `${st.directAttempts ?? 0} / ${st.directLanded ?? 0}`
+      : `${st.bundles} / ${st.landed - (st.directLanded ?? 0)}`;
     $('mevProfit').innerHTML = `<span class="${cls(st.netEth)}">${st.netEth.toFixed(5)} ETH</span> <span class="sub">${usd(st.netUsd)}</span>`;
     $('mevRpc').textContent = st.rpcCalls.toLocaleString();
     const rTag = { landed: 'buy', 'would send': 'buy', sent: 'sell', failed: 'down' };
     const mevBody = $('mevBody');
-    const openBundles = new Set(Array.from(mevBody.querySelectorAll('details[open]'), (item) => item.dataset.target));
+    const openSubmissions = new Set(Array.from(mevBody.querySelectorAll('details[open]'), (item) => item.dataset.target));
     mevBody.innerHTML = (X.recent || []).length ? X.recent.map((o) => `<tr><td>${hm(o.t)}</td><td><b>${esc(o.symbol)}</b></td>
       <td class="why">${esc(o.buy)} → ${esc(o.sell)}${o.funding ? `<div class="sub">${esc(o.funding)}</div>` : ''}</td><td class="r">${o.sizeEth.toFixed(3)}</td><td class="r">${o.grossEth.toFixed(5)}</td>
       <td class="r">${o.gasEth.toFixed(5)}</td><td class="r ${cls(o.netEth)}">${o.netEth.toFixed(5)}</td>
       <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
-      <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}${bundleDetails(o.submission, openBundles)}</td></tr>`).join('')
+      <span class="why">${esc(o.note || '')}</span>${o.hash && (o.status === 'landed' || (o.submission?.kind === 'direct' && !S.forkMode)) ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}${submissionDetails(o.submission, openSubmissions)}</td></tr>`).join('')
       : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
   }
+  renderMevWindow(X?.scanWindow, isDirectMev(X) ? X.settings.direct : null);
   renderMevControls(X);
 
   // log
@@ -315,12 +326,35 @@ function render() {
   ].map(([a, v]) => `<span>${a}</span><span>${v}</span>`).join('');
 }
 
-function bundleDetails(submission, openBundles) {
+function renderMevWindow(scanWindow, gas) {
+  const scan = $('mevScanWindow');
+  scan.hidden = !scanWindow;
+  if (scanWindow) {
+    const { blocks, candidates, simulations, bestNetUsd, caughtUp, missedSnapshots } = scanWindow;
+    const metrics = [
+      `${blocks.toLocaleString()} blocks`, `${candidates.toLocaleString()} candidates`, `${simulations.toLocaleString()} simulations`,
+    ];
+    if (Number.isFinite(bestNetUsd)) metrics.push(`best simulated net ${usd(bestNetUsd)}`);
+    if (caughtUp > 0) metrics.push(`${caughtUp.toLocaleString()} recovered snapshot${caughtUp === 1 ? '' : 's'} since restart`);
+    if (missedSnapshots > 0) metrics.push(`${missedSnapshots.toLocaleString()} unrecovered gap${missedSnapshots === 1 ? '' : 's'} since restart`);
+    scan.textContent = 'Last 30 minutes · ' + metrics.join(' · ');
+  }
+  const costs = $('mevDirectGas');
+  costs.hidden = !gas;
+  if (gas) costs.textContent = `Direct gas · ${usd(gas.spentGasUsd)} spent in 24 hours · limits ${usd(gas.maxGasUsd)} per attempt and ${usd(gas.dailyGasUsd)} per 24 hours`;
+}
+
+function submissionDetails(submission, openSubmissions) {
   if (!submission) return '';
-  const { target, leadMs, netUsd, gasEth, tipEth, builders } = submission;
+  const { kind, target, leadMs, netUsd, gasEth, tipEth, builders } = submission;
+  const key = `${kind === 'direct' ? 'direct' : 'bundle'}-${target}`;
+  const open = openSubmissions.has(key) ? ' open' : '';
+  if (kind === 'direct') {
+    return `<details class="sub" data-target="${esc(key)}"${open}><summary>Direct transaction · route deadline block ${esc(target)}</summary>
+      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd)}</div></details>`;
+  }
   const timing = `${(Math.abs(leadMs) / 1000).toFixed(2)}s ${leadMs >= 0 ? 'before' : 'after'} expected slot`;
-  const open = openBundles.has(String(target)) ? ' open' : '';
-  return `<details class="sub" data-target="${esc(target)}"${open}><summary>Bundle for block ${esc(target)}</summary>
+  return `<details class="sub" data-target="${esc(key)}"${open}><summary>Bundle for block ${esc(target)}</summary>
     <div>${timing} · quoted net ${usd(netUsd)}</div>
     <div>Gas budget ${gasEth.toFixed(6)} ETH · builder bid ${tipEth.toFixed(6)} ETH</div>
     ${builders.map((builder) => `<div title="${esc(builder.bundleHash || '')}">${esc(builder.builder)} · ${esc(builder.detail)} · ${esc(builder.elapsedMs)} ms${builder.traceStatus ? ` · trace ${esc(builder.traceStatus)}` : ''}</div>`).join('')}
@@ -338,6 +372,8 @@ function renderMevControls(X) {
   const isProxy = X?.contractVersion === 'proxy';
   const contractName = isProxy ? 'FlashArb proxy' : 'Legacy FlashArb';
   const off = X?.mode === 'off';
+  const direct = isDirectMev(X);
+  const needsDirectLimits = direct && X.settings.direct?.enabled !== true;
   const action = availableMevContractAction(X);
   let reason = '';
   if (!X) reason = 'Waiting for bot status.';
@@ -348,26 +384,31 @@ function renderMevControls(X) {
   else if (X.mode === 'deploying' || mevContractSubmitting) reason = 'Preparing the FlashArb deployment…';
   else if (X.mode === 'arming') reason = `Checking ${contractName} before arming…`;
   else if (!S.liveTradingAllowed) reason = 'Set ALLOW_LIVE_TRADING=on in .env and restart to enable contract changes and live MEV.';
+  else if (X.pending) reason = X.pending.kind === 'direct'
+    ? 'Waiting for the direct MEV transaction to settle.'
+    : 'Waiting for a submitted MEV bundle to settle.';
   else if (!S.health.ready) reason = S.health.reason || 'Waiting for the bot to be ready.';
-  else if (X.pending) reason = 'Waiting for a submitted MEV bundle to settle.';
 
   const actionButton = $('mevDeployBtn');
   actionButton.hidden = action === null;
   actionButton.disabled = Boolean(reason || action === null);
   if (action) actionButton.textContent = mevContractActions[action].label;
   $('mevArmBtn').hidden = Boolean(X?.armed || off);
-  $('mevArmBtn').disabled = Boolean(reason || !contract);
+  $('mevArmBtn').disabled = Boolean(reason || !contract || X?.armed || needsDirectLimits);
+  $('mevArmBtn').textContent = direct ? 'Arm direct MEV' : 'Arm MEV (live bundles)';
   $('mevDisarmBtn').hidden = !X?.armed;
   $('mevContract').hidden = !contract;
   $('mevContract').textContent = contract ? `${contractName} ${contract}${X.contract ? '' : ' (configured)'}` : '';
   const implementation = $('mevImplementation');
   implementation.hidden = !(isProxy && X.proxyImplementation);
   implementation.textContent = implementation.hidden ? '' : `Implementation ${X.proxyImplementation}`;
-  const status = reason || (action === 'deploy' && !contract ? 'Deploy upgradeable FlashArb to enable MEV arming.' : '');
+  const status = reason || (action === 'deploy' && !contract ? 'Deploy upgradeable FlashArb to enable MEV arming.'
+    : needsDirectLimits ? 'Set MEV_DIRECT_MAX_GAS_USD and MEV_DIRECT_DAILY_GAS_USD to enable direct MEV arming.' : '');
   const statusNode = $('mevDeploy');
   if (statusNode.textContent !== status) statusNode.textContent = status;
   statusNode.hidden = !status;
   updateMevContractConfirm();
+  updateMevArmConfirm();
 }
 
 function spark(svg, pts, base) {
@@ -506,20 +547,43 @@ $('mevDeployConfirm').onclick = async () => {
   }
 };
 const mevDlg = $('mevDlg');
+let reviewedMevArm = null;
+function mevArmSettings() {
+  const settings = S?.mev?.settings;
+  const gas = settings?.direct;
+  return isDirectMev(S?.mev) ? `direct/${gas?.maxGasUsd}/${gas?.dailyGasUsd}/${settings.activeProfitPolicy?.minNetUsd}` : 'bundle';
+}
+
+function updateMevArmConfirm() {
+  $('mevConfirm').disabled = $('mevArmBtn').disabled || reviewedMevArm !== mevArmSettings()
+    || $('mevInput').value.trim() !== 'MEV';
+}
+
 $('mevArmBtn').onclick = () => {
+  if ($('mevArmBtn').disabled) return;
+  const direct = isDirectMev(S.mev);
+  const gas = S.mev.settings?.direct;
+  reviewedMevArm = mevArmSettings();
+  $('mevArmTitle').textContent = direct ? 'Arm direct MEV?' : 'Arm MEV bundles?';
+  $('mevArmTransport').textContent = direct
+    ? 'The bot can publish qualifying flash-loan trades directly to Ethereum.'
+    : 'The bot can submit qualifying flash-loan trades privately to configured builders.';
+  $('mevArmGas').textContent = direct
+    ? `Wallet gas limits are ${usd(gas.maxGasUsd)} per attempt and ${usd(gas.dailyGasUsd)} per 24 hours. A confirmed revert still costs gas.`
+    : 'A bundle that lands can spend wallet gas and the configured builder bid.';
   $('mevInput').value = '';
-  $('mevConfirm').disabled = true;
+  updateMevArmConfirm();
   mevDlg.showModal();
 };
-$('mevInput').oninput = () => ($('mevConfirm').disabled = $('mevInput').value.trim() !== 'MEV');
+$('mevInput').oninput = updateMevArmConfirm;
 $('mevCancel').onclick = () => mevDlg.close();
 $('mevConfirm').onclick = async () => {
-  const typed = $('mevInput').value.trim();
-  if (typed !== 'MEV') return;
-  try { await api('/api/mev/arm', { confirm: typed }); mevDlg.close(); refresh(); } catch (e) { alert(e.message); }
+  updateMevArmConfirm();
+  if ($('mevConfirm').disabled) return;
+  try { await api('/api/mev/arm', { confirm: 'MEV' }); mevDlg.close(); refresh(); } catch (e) { alert(e.message); }
 };
 $('mevDisarmBtn').onclick = async () => {
-  if (!confirm('Disarm MEV? Paper scanning continues. A submitted bundle can still settle.')) return;
+  if (!confirm('Disarm MEV? Paper scanning continues. A submitted transaction can still settle.')) return;
   try { await api('/api/mev/disarm'); } catch (e) { alert(e.message); }
   refresh();
 };

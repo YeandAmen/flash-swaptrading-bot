@@ -2,15 +2,19 @@ import assert from 'node:assert/strict';
 import { createPublicClient, createTestClient, createWalletClient, encodeFunctionData, getAddress, http, keccak256, parseAbi, parseEther, parseEventLogs, type Address, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
-import { erc20Abi } from './chain.js';
-import { ADDR, CONFIG } from './config.js';
+import { erc20Abi, nextBaseFee } from './chain.js';
+import { ADDR, CONFIG, MEV } from './config.js';
+import { LiveExecutor } from './executor.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './mev/artifact-v2.js';
 import { FLASH_ARB_V3_ABI, FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from './mev/artifact-v3.js';
 import { FLASH_ARB_LOGIC_BYTECODE, FLASH_ARB_LOGIC_RUNTIME } from './mev/artifact-logic.js';
+import { FLASH_ARB_LOGIC_V2_BYTECODE, FLASH_ARB_LOGIC_V2_RUNTIME } from './mev/artifact-logic-v2.js';
 import { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_BYTECODE, FLASH_ARB_PROXY_RUNTIME } from './mev/artifact-proxy.js';
+import type { RouteFunding } from './mev/flash-arb.js';
 import { NextVenueKind } from './mev/next-pools.js';
 import { discoverArbPools, poolIdentity, toNextVenue, type ArbPool } from './mev/pools.js';
+import { MevSearcher, type MevOpp } from './mev/searcher.js';
 import { loadOrCreateWallet } from './wallet.js';
 
 // The harness supplies only a disposable account and the same loopback Anvil read and send RPCs.
@@ -52,7 +56,7 @@ async function confirmed(hash: Hex) {
 }
 
 const [market] = await discoverArbPools([{ address: ADDR.usdc, symbol: 'USDC', decimals: 6, core: true }], 2,
-  { includePancakeV3: true, includeUniswapV4: true, ...(useProxy && { includePancakeV2: true }) });
+  { includePancakeV3: true, includeUniswapV4: true, ...(useProxy && { includePancakeV2: true, includeCurve: true }) });
 assert.ok(market, 'fork has canonical USDC markets');
 function pick(kind: NextVenueKind, fee: number, nativeEth = false) {
   const pool = market.pools.find((p) => p.kind === kind && Math.round(p.fee * 1e6) === fee && Boolean(p.v4?.nativeEth) === nativeEth);
@@ -65,6 +69,8 @@ if (pancakeV2) assert.equal(pancakeV2.address.toLowerCase(), '0x2e8135be71230c6b
 const v4Native500 = pick(NextVenueKind.UniswapV4, 500, true);
 const v4Weth500 = pick(NextVenueKind.UniswapV4, 500);
 const sushiV2 = pick(NextVenueKind.SushiV2, 3000);
+const curve = useProxy ? pick(NextVenueKind.CurveTricrypto, 0) : null;
+if (curve) assert.equal(curve.address.toLowerCase(), '0x7f86bf177dd4f3494b841a37e810a34dd56c829b');
 assert.notEqual(poolIdentity(v4Native500), poolIdentity(v4Weth500), 'v4 liquidity pools have distinct IDs despite a shared manager');
 console.log('✓ canonical Pancake v3, native ETH Uniswap v4, and WETH Uniswap v4 pools discovered');
 
@@ -148,6 +154,35 @@ async function verifyUpgrade() {
   console.log('✓ upgrade preserved the proxy address and owner, and blocked old, arbitrary, and unauthorized execution');
 }
 
+async function verifyCurveUpgrade(curve: ArbPool) {
+  const previous = await slotAddress(implementationSlot);
+  assert.equal(await publicClient.getCode({ address: previous }), FLASH_ARB_LOGIC_RUNTIME);
+  const nextHash = keccak256(FLASH_ARB_LOGIC_V2_RUNTIME);
+  const receipt = await confirmed(await walletClient.writeContract({
+    address: contract, abi: FLASH_ARB_PROXY_ABI, functionName: 'upgradeRelease', account: owner,
+    args: [FLASH_ARB_LOGIC_V2_BYTECODE, implementationHash, nextHash],
+  }));
+  const current = await slotAddress(implementationSlot);
+  assert.notEqual(current, previous);
+  assert.equal(await publicClient.getCode({ address: current }), FLASH_ARB_LOGIC_V2_RUNTIME);
+  assert.equal(await publicClient.getCode({ address: contract }), FLASH_ARB_PROXY_RUNTIME);
+  assert.equal(await slotAddress(adminSlot), owner.address);
+  assert.equal((parseEventLogs({ abi: FLASH_ARB_PROXY_ABI, eventName: 'Upgraded', logs: receipt.logs }))[0]?.args.implementation, current);
+  assert.equal(await publicClient.readContract({ address: contract, abi: FLASH_ARB_V3_ABI, functionName: 'owner' }), owner.address);
+
+  const order = { funding: 0, token: ADDR.usdc, buy: toNextVenue(curve), sell: toNextVenue(sushiV2),
+    amountIn: parseEther('0.1'), minProfit: 1n, tip: 0n, maxBlock: (await publicClient.getBlockNumber({ cacheTime: 0 })) + 2n };
+  const execute = { address: contract, abi: FLASH_ARB_PROXY_ABI, functionName: 'executePinned', account: owner.address } as const;
+  await assert.rejects(publicClient.simulateContract({ ...execute, args: [implementationHash, encodeOrder(order)] }), /WrongImplementation/);
+  await assert.rejects(publicClient.simulateContract({ ...execute, args: [nextHash, encodeOrder(order)] }), /curve requires lender/);
+  await assert.rejects(publicClient.simulateContract({
+    ...execute, args: [nextHash, encodeOrder({ ...order, funding: 4, buy: { ...order.buy, pool: sushiV2.address } })],
+  }), /curve pool/);
+
+  implementationHash = nextHash;
+  console.log('✓ Curve upgrade preserved proxy address, owner, admin and blocked unapproved pools and self-funding');
+}
+
 function orderData(order: Parameters<typeof encodeOrder>[0]) {
   const data = encodeOrder(order);
   return useProxy ? encodeFunctionData({
@@ -183,7 +218,68 @@ async function sellFixtureTokensOnSushi() {
   }));
 }
 
-async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: number) {
+async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, profit: bigint, funding: RouteFunding) {
+  const saved = { submission: MEV.submission, directMinNetUsd: MEV.directMinNetUsd,
+    directMaxGasUsd: MEV.directMaxGasUsd, directDailyGasUsd: MEV.directDailyGasUsd };
+  Object.assign(MEV, { submission: 'direct', directMinNetUsd: 0.01, directMaxGasUsd: 100, directDailyGasUsd: 100 });
+  const ethUsd = 2_000;
+  const logs: string[] = [];
+  const searcher = new MevSearcher({
+    account: owner, exec: new LiveExecutor(owner), ethUsd: () => ethUsd, tradePending: () => false,
+    baseFeeGwei: () => null, tokens: () => [], log: (message) => { logs.push(message); },
+  });
+  try {
+    searcher.file.proxyContract = contract;
+    searcher.file.proxyImplementation = await slotAddress(implementationSlot);
+    searcher.file.proxyRelease = implementationHash;
+    searcher.arm();
+    const verifiedBy = Date.now() + 30_000;
+    while (searcher.view().mode === 'arming' && Date.now() < verifiedBy) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    }
+    const initial = searcher.view();
+    assert.equal(initial.mode, 'live', logs.join(' | '));
+    const { bundles, directAttempts = 0, directLanded = 0 } = initial.stats;
+    const initialGasUsd = initial.settings.direct.spentGasUsd;
+    const head = await searcher['head']();
+    const point = { blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head),
+      hash: head.hash, tokens: [market], at: [], results: [], readMs: 0, failedChunks: 0 };
+    const sizeEth = Number(amount) / 1e18;
+    const grossEth = Number(profit) / 1e18;
+    const opp: MevOpp = { t: Date.now(), block: Number(head.number), symbol: 'USDC', buy: buy.venue, sell: sell.venue,
+      sizeEth, grossEth, gasEth: 0, tipEth: 0, netEth: grossEth, netUsd: grossEth * ethUsd, status: 'would send' };
+    const offer = { candidate: { t: market, A: buy, B: sell, dx: sizeEth, est: grossEth, estimatedNet: grossEth, gasUnits: 0 },
+      amount, profit, funding, score: profit, opp };
+    const prepared = await searcher['prepareLive'](offer, point, searcher['profitPolicy'](Date.now()));
+    assert.ok(prepared, opp.note);
+    await searcher['sendLive'](prepared, point, searcher['armGeneration']);
+    const submitted = searcher.view();
+    assert.ok(submitted.pending?.hash, opp.note);
+    assert.equal(submitted.recent[0]?.submission?.kind, 'direct');
+    assert.deepEqual(submitted.recent[0]?.submission?.builders, []);
+    assert.equal(submitted.stats.bundles, bundles);
+    assert.equal(submitted.stats.directAttempts, directAttempts + 1);
+    assert.ok(logs.some((line) => line.includes('Direct transaction') && line.includes('submitted.')), logs.join(' | '));
+
+    const receipt = await confirmed(submitted.pending.hash);
+    await searcher.reconcileWallet(receipt.blockNumber);
+    const settled = searcher.view();
+    assert.equal(settled.pending, null);
+    assert.equal(settled.stats.directLanded, directLanded + 1);
+    assert.equal(settled.recent[0]?.status, 'landed');
+    assert.equal(settled.recent[0]?.hash, receipt.transactionHash);
+    assert.equal(settled.recent[0]?.tipEth, 0);
+    assert.ok((settled.recent[0]?.netUsd ?? 0) > 0, 'settled direct route covered actual gas');
+    const gasUsd = Number(receipt.gasUsed * receipt.effectiveGasPrice) / 1e18 * ethUsd;
+    assert.ok(Math.abs(settled.settings.direct.spentGasUsd - initialGasUsd - gasUsd) < 1e-9);
+    return receipt.transactionHash;
+  } finally {
+    searcher.stop();
+    Object.assign(MEV, saved);
+  }
+}
+
+async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: RouteFunding, direct = false) {
   const point = await fork.snapshot();
   try {
     const maxBlock = (await publicClient.getBlockNumber({ cacheTime: 0 })) + 3n;
@@ -214,7 +310,9 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: nu
     const custody = funding === 3 ? lenders[3] : funding === 4 ? sparkWeth : null;
     const custodyBalance = custody ? await balanceOf(ADDR.weth, custody) : 0n;
     let hash: Hex;
-    if (useV3) {
+    if (direct) {
+      hash = await sendWithSearcher(buy, sell, order.amountIn, profitable.profit, funding);
+    } else if (useV3) {
       const fees = await publicClient.estimateFeesPerGas();
       const nonce = await publicClient.getTransactionCount({ address: owner.address, blockTag: 'pending' });
       const signed = await owner.signTransaction({
@@ -237,6 +335,13 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: nu
       assert.equal(funded.args.premium > 0n, funding === 1, 'the tested reserve premiums match the protocol at this block');
       assert.equal(await publicClient.readContract({ address: ADDR.weth, abi: erc20Abi, functionName: 'allowance', args: [contract!, lenders[funding]] }), 0n, 'flash lender left no usable allowance');
       if (custody) assert.equal(await balanceOf(ADDR.weth, custody), custodyBalance, 'flash principal returned in full');
+    }
+    if (buy.curve || sell.curve) {
+      for (const [token, pool] of [[ADDR.weth, buy], [ADDR.usdc, sell]] as const) {
+        if (pool.curve) assert.equal(await publicClient.readContract({
+          address: token, abi: erc20Abi, functionName: 'allowance', args: [contract!, pool.address],
+        }), 0n, 'Curve exchange leaves no usable allowance');
+      }
     }
     const expected = payout.args.profit - payout.args.tip - receipt.gasUsed * receipt.effectiveGasPrice;
     const ethAfter = await publicClient.getBalance({ address: owner.address });
@@ -270,12 +375,20 @@ if (useProxy) {
   await testRoute('SparkLend funding after the proxy upgrade', v4Weth500, sushiV2, 4);
   if (pancakeV2) await testRoute('Pancake v2 buy-pool flash swap after upgrade', pancakeV2, sushiV2, 0);
   await fork.revert({ id: beforeSpark });
+  if (curve) {
+    await verifyCurveUpgrade(curve);
+    const beforeCurve = await fork.snapshot();
+    await buyFixtureTokens(sushiV2Router, parseEther('18'));
+    await testRoute('Curve Tricrypto buy with SparkLend through the direct searcher', curve, sushiV2, 4, true);
+    await fork.revert({ id: beforeCurve });
+  }
 }
 await buyFixtureTokens(uniswapV2Router, parseEther('30'));
 await sellFixtureTokensOnSushi();
 console.log('✓ fork-local Sushi v2 sell fixture prepared');
 await testRoute('Pancake v3 callback on the sell leg', sushiV2, pancake500, 0);
 if (pancakeV2) await testRoute('Pancake v2 settlement on the sell leg', sushiV2, pancakeV2, 0);
+if (curve) await testRoute('Curve Tricrypto sell with Sushi flash-swap funding', sushiV2, curve, 0);
 await testRoute('native ETH v4 settlement on the sell leg', sushiV2, v4Native500, 0);
 console.log(useProxy ? 'ALL FLASHARB PROXY FORK TESTS PASSED'
   : useV3 ? 'ALL FLASHARB V3 DIRECT RPC FORK TESTS PASSED' : 'ALL FLASHARB V2 FORK TESTS PASSED');

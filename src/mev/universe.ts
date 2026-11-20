@@ -4,7 +4,7 @@ import { getAddress, isAddress, zeroAddress } from 'viem';
 import { ADDR, CONFIG, DATA_DIR, MEV, type TokenCfg } from '../config.js';
 import { writeJson } from '../persistence.js';
 import { loadMevTokenCandidates } from '../tokens.js';
-import { discoverArbPools, type ArbPool, type ArbToken, type DiscoverArbOptions } from './pools.js';
+import { discoverArbPools, poolVenue, type ArbPool, type ArbToken, type DiscoverArbOptions } from './pools.js';
 
 const CACHE = path.join(DATA_DIR, 'mev-token-seeds.json');
 const SEED_LIMIT = 48;
@@ -29,7 +29,16 @@ function uniqueTokens(tokens: TokenCfg[]): TokenCfg[] {
   });
 }
 
-/** Reserve two pools per token, then spend the remaining read budget on the deepest extra routes. */
+/** Reserve two pools per token, including an alternative venue when it has comparable depth. */
+function rankPools(pools: ArbPool[]): ArbPool[] {
+  const ranked = pools.slice().sort((a, b) => poolDepth(b) - poolDepth(a));
+  const firstVenue = poolVenue(ranked[0]);
+  const alternative = ranked.findIndex((p, i) => i >= 1 && poolVenue(p) !== firstVenue && poolDepth(p) >= poolDepth(ranked[1]) * 0.5);
+  if (alternative > 1) ranked.splice(1, 0, ranked.splice(alternative, 1)[0]);
+  return ranked;
+}
+
+/** Fill the rest of the read budget with the deepest additional pools. */
 export function selectActiveTokens(eligible: ArbToken[], budget: number): ArbToken[] {
   const viable = eligible.filter((t) => t.pools.length >= 2);
   if (viable.reduce((count, token) => count + token.pools.length, 0) <= budget) return viable;
@@ -42,7 +51,7 @@ export function selectActiveTokens(eligible: ArbToken[], budget: number): ArbTok
 }
 
 function rankTokens(tokens: ArbToken[]): ArbToken[] {
-  return tokens.map((t) => ({ ...t, pools: t.pools.slice().sort((a, b) => poolDepth(b) - poolDepth(a)) }))
+  return tokens.map((t) => ({ ...t, pools: rankPools(t.pools) }))
     .sort((a, b) => Number(b.token.core) - Number(a.token.core)
       || poolDepth(b.pools[1]) - poolDepth(a.pools[1]) || a.token.address.localeCompare(b.token.address));
 }
@@ -67,7 +76,7 @@ export class MevUniverse {
   async warmup(priority: TokenCfg[]) {
     const prioritized = uniqueTokens(priority);
     const batch = this.broad
-      ? uniqueTokens([...prioritized.slice(0, 16), ...this.seeds, ...prioritized]).slice(0, SEED_LIMIT)
+      ? uniqueTokens([...prioritized.filter((t) => t.core), ...this.seeds, ...prioritized]).slice(0, SEED_LIMIT)
       : prioritized;
     await this.check(batch);
     if (!this.broad) {

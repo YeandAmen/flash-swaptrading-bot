@@ -17,6 +17,54 @@ export const enum NextVenueKind {
   PancakeV3 = 4,
   UniswapV4 = 5,
   PancakeV2 = 6,
+  CurveTricrypto = 7,
+}
+
+// Curve's Ethereum Tricrypto-NG deployment registry. The executor uses the same fixed pool list.
+export const CURVE_TRICRYPTO_FACTORY = getAddress('0x0c0e5f2ff0ff18a3be9b835635039256dc4b4963');
+const CURVE_USDC = getAddress('0x7f86bf177dd4f3494b841a37e810a34dd56c829b');
+const CURVE_USDT = getAddress('0xf5f5b97624542d72a9e06f04804bf81baa15e2b4');
+const USDT = getAddress('0xdac17f958d2ee523a2206206994597c13d831ec7');
+const WBTC = getAddress('0x2260fac5e5542a773aa44fbcfedf7c193bc2c599');
+
+export const curveTricryptoAbi = parseAbi([
+  'function factory() view returns (address)',
+  'function coins(uint256 index) view returns (address)',
+  'function balances(uint256 index) view returns (uint256)',
+  'function get_dy(uint256 from, uint256 to, uint256 amount) view returns (uint256)',
+]);
+
+export interface CurveTricryptoDescriptor {
+  address: Address;
+  token: Address;
+  tokenIndex: bigint;
+  sellProbes: readonly bigint[];
+}
+
+export const CURVE_WETH_INDEX = 2n;
+export const CURVE_BUY_PROBES = [50_000_000_000_000_000n, 500_000_000_000_000_000n, 2n * 10n ** 18n, 10n * 10n ** 18n] as const;
+const CURVE_STABLE_SELL_PROBES = [100_000_000n, 1_000_000_000n, 5_000_000_000n, 20_000_000_000n] as const;
+const CURVE_BTC_SELL_PROBES = [200_000n, 1_000_000n, 5_000_000n, 25_000_000n] as const;
+
+/** Each approved pool serves two WETH edges. Match registry entries by token address, never display symbol. */
+export function curveTricryptoCandidates(tokens: readonly TokenCfg[]): CurveTricryptoDescriptor[] {
+  const wanted = new Set<string>(tokens.map(({ address }) => address.toLowerCase()));
+  const out: CurveTricryptoDescriptor[] = [];
+  for (const { address, stable } of [{ address: CURVE_USDC, stable: ADDR.usdc }, { address: CURVE_USDT, stable: USDT }]) {
+    if (wanted.has(stable.toLowerCase())) out.push({ address, token: stable, tokenIndex: 0n, sellProbes: CURVE_STABLE_SELL_PROBES });
+    if (wanted.has(WBTC.toLowerCase())) out.push({ address, token: WBTC, tokenIndex: 1n, sellProbes: CURVE_BTC_SELL_PROBES });
+  }
+  return out;
+}
+
+export function curveStateReads(pool: CurveTricryptoDescriptor) {
+  const read = (from: bigint, to: bigint, amount: bigint) => ({
+    address: pool.address, abi: curveTricryptoAbi, functionName: 'get_dy', args: [from, to, amount],
+  });
+  return [
+    ...CURVE_BUY_PROBES.map((amount) => read(CURVE_WETH_INDEX, pool.tokenIndex, amount)),
+    ...pool.sellProbes.map((amount) => read(pool.tokenIndex, CURVE_WETH_INDEX, amount)),
+  ];
 }
 
 // Pancake's protocol-fee field is uint32, not the uint8 used by Uniswap v3.

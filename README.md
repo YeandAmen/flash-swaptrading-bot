@@ -90,7 +90,7 @@ On Windows PowerShell, use `curl.exe` for these commands.
 
 ## 4. Arbitrage venues and funding
 
-The FlashArb proxy supports Uniswap v2/v3, SushiSwap v2/v3, and PancakeSwap v2/v3 WETH pairs, plus hook-free, static-fee Uniswap v4 ETH or WETH pools. Funding can come from the buy pool, Aave V3, Morpho Blue, Balancer V3, or SparkLend. `MEV_FUNDING=auto` compares the available sources. Use `pool`, `aave`, `morpho`, `balancer`, or `spark` to select one source. The scanner uses the capabilities of the selected release and reads the actual repayment and gas costs in simulations.
+The FlashArb proxy supports Uniswap v2/v3, SushiSwap v2/v3, and PancakeSwap v2/v3 WETH pairs, plus hook-free, static-fee Uniswap v4 ETH or WETH pools and two approved Curve Tricrypto-NG pools. Curve supports WETH/USDC, WETH/USDT, and WETH/WBTC routes with an external flash lender on the buy leg. Funding can come from the buy pool, Aave V3, Morpho Blue, Balancer V3, or SparkLend. `MEV_FUNDING=auto` compares the available sources. Use `pool`, `aave`, `morpho`, `balancer`, or `spark` to select one source. The scanner uses the capabilities of the selected release and reads the actual repayment and gas costs in simulations.
 
 The searcher checks canonical factory or PoolManager state. It compares live pool depth, quotes candidate sizes at a consistent block, and rejects candidates that fail the profit floor after gas and any applicable flash-loan premium and builder tip. The V4 scanner restricts compatibility to pool types the contract can settle. Tokens from the public Ethereum token lists are indexed in paced batches. `MEV_UNIVERSE=spot` restricts the sweep to the spot and core universe, and `MEV_MAX_TRACKED_POOLS` limits active per-block reads.
 
@@ -105,6 +105,17 @@ Live MEV can use a different bid after 30 minutes without a confirmed landing. S
 `MEV_IDLE_GAS_PADDING_PCT` controls the extra gas above the estimate while idle. It defaults to 25%. A smaller buffer can free room for the builder bid and can also leave less margin for changes in gas usage. The bot simulates using the exact gas limit before sending and budgets the full limit in the profit floor.
 
 The bot's receipts record realized outcomes. A pool count or a profitable paper simulation alone does not establish realized returns. Inclusion depends on pool movement, gas, competing bids, RPC latency, and builder coverage. See [SushiSwap V3 core](https://github.com/sushiswap/v3-core), [PancakeSwap V3 addresses](https://developer.pancakeswap.finance/contracts/v3/addresses), [Uniswap v4 settlement](https://developers.uniswap.org/docs/protocols/v4/concepts/flash-accounting), [Aave V3 flash loans](https://aave.com/docs/aave-v3/smart-contracts/pool#flashloansimple), [Morpho Blue flash loans](https://docs.morpho.org/learn/concepts/flashloans/), and [Flashbots bundle troubleshooting](https://docs.flashbots.net/flashbots-auction/advanced/troubleshooting).
+
+### Direct Ethereum transactions
+
+Set `MEV_SUBMISSION=direct` to use ordinary signed Ethereum transactions through `RPC_URL`. Direct mode uses the transaction's EIP-1559 priority fee and skips the explicit builder payment. Use a mainnet endpoint that accepts raw public transactions.
+
+Direct mode scans in paper mode with the bundled implementation while the gas caps are zero. To enable live direct sends, set `MEV_DIRECT_MAX_GAS_USD` and `MEV_DIRECT_DAILY_GAS_USD`, restart the bot, and explicitly arm MEV. The daily cap includes confirmed direct gas spend from the most recent 24 hourly periods and the current hour. `MEV_DIRECT_MIN_NET_USD` is the minimum after the full gas budget and lender repayment. `MEV_DIRECT_MAX_PRIORITY_GWEI` caps the priority fee per gas.
+
+The route is simulated at the latest head and enforces the minimum profit through its two-block execution deadline. A public transaction can still be mined later and spend gas on a revert. The bot holds its wallet nonce until it sees a confirmed receipt or a confirmed replacement. [Ethereum transaction fees](https://ethereum.org/developers/docs/gas/) · [EIP-1559](https://eips.ethereum.org/EIPS/eip-1559)
+
+The dashboard reports the previous 30 minutes of observed blocks, candidate routes, simulations, and best simulated net result. The scanner can backfill a brief read gap after scanning the current head. Live sends use current-head data. The timing of on-chain trades depends on available price spreads, gas, and Ethereum inclusion.
+
 
 ## 5. Test with fake funds
 
@@ -151,7 +162,7 @@ Profitable trades repay the lender and forward proceeds and relevant route lefto
 For maintainers, keep the trading owner in persistent slot zero, the execution lock in transient slot zero, and the existing execution and settlement interfaces compatible. Keep previously supported implementation runtimes in the bot's release list so existing proxies can still operate after a software update. Rebuild with solc 0.8.26, then verify the upgrade on a pinned Ethereum fork using fake funds.
 
 ```sh
-npm run build:contract -- logic
+npm run build:contract -- logic-v2
 npm run build
 npm run wallet:local-test
 FORK_BLOCK_NUMBER=26451239 npm run mev-proxy-fork-test

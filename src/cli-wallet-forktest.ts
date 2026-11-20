@@ -5,14 +5,17 @@ import path from 'node:path';
 import { createTestClient, encodeDeployData, http, keccak256, parseEther, parseGwei, zeroAddress } from 'viem';
 import { mainnet } from 'viem/chains';
 import { publicClient } from './chain.js';
-import { CONFIG, DATA_DIR, MEV } from './config.js';
+import { ADDR, CONFIG, DATA_DIR, MEV } from './config.js';
 import { Engine } from './engine.js';
 import { DeploymentGasError, LiveExecutor, LiveSendBlocked } from './executor.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
 import { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_BYTECODE, FLASH_ARB_PROXY_RUNTIME } from './mev/artifact-proxy.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './mev/artifact-v2.js';
 import { FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from './mev/artifact-v3.js';
-import { proxyCreationData, proxyReleaseHash, verifyFlashProxy } from './mev/proxy.js';
+import { submitDirect } from './mev/direct.js';
+import { encodeArbitrage } from './mev/flash-arb.js';
+import { NextVenueKind } from './mev/next-pools.js';
+import { pinnedArbitrage, proxyCreationData, proxyReleaseHash, verifyFlashProxy } from './mev/proxy.js';
 import { MevSearcher } from './mev/searcher.js';
 import { loadOrCreateWallet } from './wallet.js';
 
@@ -140,6 +143,9 @@ fs.unlinkSync(walletJournal);
 const originalV2Address = MEV.v2ContractAddress;
 const originalV3Address = MEV.v3ContractAddress;
 const originalFundingMode = MEV.funding;
+const originalDirectSettings = {
+  submission: MEV.submission, directMaxGasUsd: MEV.directMaxGasUsd, directDailyGasUsd: MEV.directDailyGasUsd,
+};
 try {
   MEV.v2ContractAddress = null;
   MEV.v3ContractAddress = null;
@@ -430,9 +436,90 @@ try {
   assert.equal(afterUpgradeRecovery.view().mode, 'live', 'new release permits SparkLend funding after verification');
   afterUpgradeRecovery.disarm();
   console.log('✓ Dashboard installed and recovered a new implementation at the same address with one approved upgrade transaction');
+
+  // Direct signatures remain usable after an arbitrage deadline. After restart,
+  // keep the nonce reserved and charge the gas if the transaction mines late.
+  MEV.submission = 'direct';
+  MEV.directMaxGasUsd = 0;
+  MEV.directDailyGasUsd = 0;
+  const noDirectBudget = new MevSearcher(mevHost);
+  const directNonce = await nonce();
+  assert.equal(noDirectBudget.view().settings.direct.enabled, false);
+  assert.throws(() => noDirectBudget.arm(), /gas limits/i);
+  assert.equal(await nonce(), directNonce, 'direct arming without a gas budget does not consume a nonce');
+  MEV.directMaxGasUsd = 2;
+  MEV.directDailyGasUsd = 4;
+
+  const source = await publicClient.getBlockNumber({ cacheTime: 0 });
+  const target = source + 2n;
+  const data = pinnedArbitrage(encodeArbitrage(0, {
+    token: ADDR.usdc, amountIn: 1n, minProfit: 1n, tip: 0n, maxBlock: target,
+    buy: { kind: NextVenueKind.UniswapV2, address: otherExample.address, venue: 'Uniswap v2', v2: true, fee: 0.003 },
+    sell: { kind: NextVenueKind.SushiV2, address: example.address, venue: 'SushiSwap v2', v2: true, fee: 0.003 },
+  }), proxyReleaseHash);
+  const serialized = await account.signTransaction({
+    chainId: 1, type: 'eip1559', nonce: directNonce, to: oldProxy, data, gas: 200_000n,
+    maxFeePerGas: parseGwei('1'), maxPriorityFeePerGas: parseGwei('0.05'), value: 0n,
+  });
+  const directHash = keccak256(serialized);
+  const startedAt = Date.now();
+  const ethUsd = 2_000;
+  const pendingGasEth = 0.0002;
+  const directOpportunity = {
+    t: startedAt, block: Number(source), symbol: 'USDC', buy: 'Uniswap v2', sell: 'SushiSwap v2',
+    sizeEth: 0.1, grossEth: 0.001, gasEth: pendingGasEth, tipEth: 0, netEth: 0.0008, netUsd: 1.6,
+    status: 'sent', hash: directHash, submission: {
+      kind: 'direct', target: Number(target), startedAt, leadMs: 8_000, gasEth: pendingGasEth,
+      tipEth: 0, netUsd: 1.6, builders: [],
+    },
+  };
+  fs.writeFileSync(mevStateFile, JSON.stringify({
+    ...noDirectBudget.file, pending: {
+      kind: 'direct', nonce: directNonce, target: target.toString(), contract: oldProxy,
+      ethUsd, hash: directHash, opp: directOpportunity,
+    },
+  }));
+  await test.mine({ blocks: 5 });
+  const confirmedHead = await publicClient.getBlockNumber({ cacheTime: 0 });
+  assert.ok(confirmedHead > target);
+  assert.equal(await nonce(), directNonce, 'no competing wallet transaction has used the nonce');
+
+  const directExecutor = new LiveExecutor(account);
+  const recoveredDirect = new MevSearcher({ ...mevHost, exec: directExecutor, ethUsd: () => ethUsd });
+  assert.equal(recoveredDirect.view().mode, 'paper', 'direct restart starts disarmed');
+  assert.equal(recoveredDirect.view().pending?.hash, directHash);
+  await recoveredDirect.reconcileWallet(confirmedHead);
+  assert.equal(recoveredDirect.view().pending?.hash, directHash, 'a deadline cannot abandon a signed direct transaction');
+  assert.ok(recoveredDirect.walletPending());
+
+  await assert.rejects(publicClient.call({ account: account.address, to: oldProxy, data }), /expired/i);
+  const balanceBeforeLateSend = await balance();
+  assert.equal(await submitDirect(serialized), directHash, 'the fixture submits exclusively to the local Ethereum RPC');
+  const lateReceipt = await publicClient.waitForTransactionReceipt({ hash: directHash, pollingInterval: 100, timeout: 10_000 });
+  assert.equal(lateReceipt.status, 'reverted');
+  assert.ok(lateReceipt.blockNumber > target);
+  await recoveredDirect.reconcileWallet(lateReceipt.blockNumber);
+
+  const failure = recoveredDirect.view().recent.find((opportunity) => opportunity.hash === directHash);
+  const gasWei = lateReceipt.gasUsed * lateReceipt.effectiveGasPrice;
+  const gasEth = Number(gasWei) / 1e18;
+  assert.ok(gasWei > 0n);
+  assert.equal(await balance(), balanceBeforeLateSend - gasWei, 'expiration still costs wallet gas');
+  assert.equal(recoveredDirect.view().pending, null, 'the receipt releases the nonce');
+  assert.equal(recoveredDirect.walletPending(), false);
+  assert.equal(failure?.status, 'failed');
+  assert.equal(failure?.gasEth, gasEth);
+  assert.equal(failure?.netUsd, -gasEth * ethUsd);
+  assert.equal(recoveredDirect.view().settings.direct.spentGasUsd, gasEth * ethUsd);
+  const finalDirect = new MevSearcher(mevHost);
+  assert.equal(finalDirect.view().settings.direct.spentGasUsd, gasEth * ethUsd, 'a second restart retains confirmed revert gas');
+  assert.equal(await nonce(), directNonce + 1);
+  assert.equal(await directExecutor.bundleNonce(), directNonce + 1, 'the next wallet action uses the next nonce');
+  console.log('✓ Confirmed late direct MEV reverted after restart, accounted for wallet gas, and released the nonce');
 } finally {
   MEV.v2ContractAddress = originalV2Address;
   MEV.v3ContractAddress = originalV3Address;
   MEV.funding = originalFundingMode;
+  Object.assign(MEV, originalDirectSettings);
 }
 console.log('ALL WALLET TESTS PASSED');

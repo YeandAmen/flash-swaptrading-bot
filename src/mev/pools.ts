@@ -3,9 +3,10 @@ import { ADDR, type TokenCfg } from '../config.js';
 import { erc20Abi, factoryAbi, multicall3Abi, poolAbi, v2FactoryAbi, v2PairAbi } from '../chain.js';
 import { bigMulticall, type McResult } from '../market.js';
 import {
+  CURVE_BUY_PROBES, CURVE_TRICRYPTO_FACTORY, CURVE_WETH_INDEX, curveStateReads, curveTricryptoAbi, curveTricryptoCandidates,
   NextVenueKind, PANCAKE_V2_FACTORY, PANCAKE_V3_FACTORY, PANCAKE_V3_FEES, UNISWAP_V4_MANAGER, pancakeV3PoolAbi,
   v4Candidates, v4FeeFraction, v4LiquidityRead, v4SlotRead, v4StateReads,
-  type V4PoolDescriptor, type V4PoolSeed, type V4Slot0,
+  type CurveTricryptoDescriptor, type V4PoolDescriptor, type V4PoolSeed, type V4Slot0,
 } from './next-pools.js';
 
 const a = (x: string): Address => getAddress(x.toLowerCase());
@@ -34,6 +35,15 @@ export const MEV_EXTRA_TOKENS: TokenCfg[] = [
   { symbol: 'weETH', address: a('0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee'), decimals: 18, core: true },
   { symbol: 'cbETH', address: a('0xBe9895146f7AF43049ca1c1AE358B0541Ea49704'), decimals: 18, core: true },
   { symbol: 'cbBTC', address: a('0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf'), decimals: 8, core: true },
+  { symbol: 'PENDLE', address: a('0x808507121b80c02388fad14726482e061b8da827'), decimals: 18, core: true },
+  { symbol: 'ENA', address: a('0x57e114b691db790c35207b2e685d4a43181e6061'), decimals: 18, core: true },
+  { symbol: 'CRV', address: a('0xd533a949740bb3306d119cc777fa900ba034cd52'), decimals: 18, core: true },
+  { symbol: 'COMP', address: a('0xc00e94cb662c3520282e6f5717214004a7f26888'), decimals: 18, core: true },
+  { symbol: 'WLD', address: a('0x163f8c2467924be0ae7b5347228cabf260318753'), decimals: 18, core: true },
+  { symbol: '1INCH', address: a('0x111111111117dc0aa78b770fa6a738034120c302'), decimals: 18, core: true },
+  { symbol: 'RPL', address: a('0xd33526068d116ce69f19a9ee46f0bd304f21a51f'), decimals: 18, core: true },
+  { symbol: 'SUSHI', address: a('0x6b3595068778dd592e39a122f4f5a5cf09c90fe2'), decimals: 18, core: true },
+  { symbol: 'WTRX', address: a('0x50327c6c5a14dcade707abad2e27eb517df87ab5'), decimals: 6, core: true },
 ];
 
 export interface ArbPool {
@@ -43,6 +53,7 @@ export interface ArbPool {
   fee: number; // fraction per swap, e.g. 0.003
   kind?: NextVenueKind;
   v4?: V4PoolDescriptor;
+  curve?: CurveTricryptoDescriptor;
   depthWeth?: number; // V4 uses virtual quote liquidity since PoolManager custody is shared.
 }
 
@@ -66,6 +77,7 @@ export interface DiscoverArbOptions {
   includePancakeV2?: boolean;
   includePancakeV3?: boolean;
   includeUniswapV4?: boolean;
+  includeCurve?: boolean;
   v4PoolKeys?: readonly V4PoolSeed[];
 }
 
@@ -76,12 +88,23 @@ export interface ArbToken {
 }
 
 /** Reserves around the current price in whole units: exact for v2, virtual (inside the current tick range) for v3. */
-export interface Reserves {
+interface ConstantProductReserves {
   w: number; // WETH
   t: number; // TOKEN
   buyFee?: number; // directional swap fee where it differs from the advertised LP tier
   sellFee?: number;
+  curve?: never;
 }
+
+interface CurveReserves {
+  curve: { buy: QuotePoint[]; sell: QuotePoint[] };
+  buyFee?: never;
+  sellFee?: never;
+}
+
+export type Reserves = ConstantProductReserves | CurveReserves;
+
+interface QuotePoint { input: number; output: number }
 
 /**
  * Gas used by one arbitrage transaction, by route (pool A kind -> pool B kind), for the quick filter and paper mode.
@@ -91,7 +114,7 @@ export const ARB_GAS = { v3v3: 230_000, v3v2: 200_000, v2v3: 210_000, v2v2: 170_
 export function arbGas(A: ArbPool, B: ArbPool): number {
   const base = A.v2 ? (B.v2 ? ARB_GAS.v2v2 : ARB_GAS.v2v3) : B.v2 ? ARB_GAS.v3v2 : ARB_GAS.v3v3;
   // Provisional search estimate. Every live candidate still has to pass exact gas estimation and simulation.
-  return base + [A, B].reduce((extra, pool) => extra + (pool.v4 ? (pool.v4.nativeEth ? 70_000 : 50_000) : 0), 0);
+  return base + [A, B].reduce((extra, pool) => extra + (pool.v4 ? (pool.v4.nativeEth ? 70_000 : 50_000) : pool.curve ? 100_000 : 0), 0);
 }
 
 /**
@@ -151,6 +174,7 @@ export async function discoverArbPools(tokens: TokenCfg[], minWeth: number, opti
     byToken.set(p.ti, arr);
   });
   if (options.includeUniswapV4) await addV4Pools(list, minWeth, byToken, options.v4PoolKeys);
+  if (options.includeCurve) await addCurvePools(list, minWeth, byToken);
   const out: ArbToken[] = [];
   for (const [ti, ps] of byToken) {
     if (ps.length < 2) continue;
@@ -185,6 +209,30 @@ async function addV4Pools(tokens: TokenCfg[], minWeth: number, byToken: Map<numb
   }
 }
 
+/** Verify the fixed allowlist's on-chain coin ordering and available WETH before scanning per-block quotes. */
+async function addCurvePools(tokens: TokenCfg[], minWeth: number, byToken: Map<number, ArbPool[]>) {
+  const candidates = curveTricryptoCandidates(tokens);
+  const reads = await bigMulticall(candidates.flatMap((pool) => [
+    { address: pool.address, abi: curveTricryptoAbi, functionName: 'coins', args: [CURVE_WETH_INDEX] },
+    { address: pool.address, abi: curveTricryptoAbi, functionName: 'coins', args: [pool.tokenIndex] },
+    { address: pool.address, abi: curveTricryptoAbi, functionName: 'balances', args: [CURVE_WETH_INDEX] },
+    { address: pool.address, abi: curveTricryptoAbi, functionName: 'factory' },
+  ]));
+  for (const [i, pool] of candidates.entries()) {
+    const [weth, token, balance, factory] = reads.slice(4 * i, 4 * i + 4);
+    if (weth?.status !== 'success' || token?.status !== 'success' || balance?.status !== 'success'
+      || factory?.status !== 'success' || String(factory.result).toLowerCase() !== CURVE_TRICRYPTO_FACTORY.toLowerCase()
+      || String(weth.result).toLowerCase() !== ADDR.weth.toLowerCase()
+      || String(token.result).toLowerCase() !== pool.token.toLowerCase()) continue;
+    const depthWeth = Number(balance.result) / 1e18;
+    const ti = tokens.findIndex((t) => t.address.toLowerCase() === pool.token.toLowerCase());
+    if (ti < 0 || !Number.isFinite(depthWeth) || depthWeth < minWeth) continue;
+    const arr = byToken.get(ti) ?? [];
+    arr.push({ address: pool.address, venue: 'Curve Tricrypto-NG', v2: false, fee: 0, kind: NextVenueKind.CurveTricrypto, curve: pool, depthWeth });
+    byToken.set(ti, arr);
+  }
+}
+
 /**
  * One multicall per block: block number, timestamp and the state of every watched pool.
  * (Not the base fee: RPC nodes run eth_call with BASEFEE = 0, so it comes from the block header instead.)
@@ -198,6 +246,7 @@ export function buildStateReads(tokens: ArbToken[]) {
     const i = contracts.length;
     if (p.v2) contracts.push({ address: p.address, abi: v2PairAbi, functionName: 'getReserves' });
     else if (p.v4) contracts.push(...v4StateReads(p.v4));
+    else if (p.curve) contracts.push(...curveStateReads(p.curve));
     else {
       const abi = p.kind === NextVenueKind.PancakeV3 ? pancakeV3PoolAbi : poolAbi;
       contracts.push({ address: p.address, abi, functionName: 'slot0' }, { address: p.address, abi, functionName: 'liquidity' });
@@ -207,7 +256,25 @@ export function buildStateReads(tokens: ArbToken[]) {
   return { contracts, at };
 }
 
+function measuredQuotes(probes: readonly bigint[], reads: McResult[], offset: number, inputScale: number, outputScale: number) {
+  const points: QuotePoint[] = [];
+  for (const [index, amount] of probes.entries()) {
+    const quote = reads[offset + index];
+    if (quote?.status !== 'success') continue;
+    const output = Number(quote.result) / outputScale;
+    if (!(output > (points.at(-1)?.output ?? 0) && Number.isFinite(output))) continue;
+    points.push({ input: Number(amount) / inputScale, output });
+  }
+  return points;
+}
+
 export function reservesOf(t: ArbToken, p: ArbPool, r: McResult[], i: number): Reserves | null {
+  if (p.curve) {
+    const tokenScale = 10 ** t.token.decimals;
+    const buy = measuredQuotes(CURVE_BUY_PROBES, r, i, 1e18, tokenScale);
+    const sell = measuredQuotes(p.curve.sellProbes, r, i + CURVE_BUY_PROBES.length, tokenScale, 1e18);
+    return buy.length && sell.length ? { curve: { buy, sell } } : null;
+  }
   if (p.v2) {
     if (r[i]?.status !== 'success') return null;
     const [r0, r1] = r[i].result as readonly [bigint, bigint, number];
@@ -226,7 +293,7 @@ export function reservesOf(t: ArbToken, p: ArbPool, r: McResult[], i: number): R
   return { ...reserves, buyFee: v4FeeFraction(protocolFee, lpFee, p.v4.quoteIs0), sellFee: v4FeeFraction(protocolFee, lpFee, !p.v4.quoteIs0) };
 }
 
-function virtualReserves(sqrtPriceX96: bigint, liquidity: bigint, quoteIs0: boolean, tokenDecimals: number): Reserves | null {
+function virtualReserves(sqrtPriceX96: bigint, liquidity: bigint, quoteIs0: boolean, tokenDecimals: number): ConstantProductReserves | null {
   const s = Number(sqrtPriceX96) / 2 ** 96; // sqrt(token1 per token0), raw units
   const L = Number(liquidity);
   if (!(s > 0) || !(L > 0)) return null;
@@ -244,6 +311,50 @@ export interface Cycle {
   gap: number; // marginal price gap after both pool fees (>0 = arbitrage exists)
 }
 
+/** Estimate only inside the measured range. Reverse interpolation maps sell knots back to WETH input. */
+function interpolate(points: readonly QuotePoint[], amount: number, reverse = false): number {
+  let priorIn = 0;
+  let priorOut = 0;
+  for (const point of points) {
+    const [input, output] = reverse ? [point.output, point.input] : [point.input, point.output];
+    if (amount <= input * (1 + 1e-12)) return priorOut + (Math.min(amount, input) - priorIn) * (output - priorOut) / (input - priorIn);
+    priorIn = input;
+    priorOut = output;
+  }
+  return 0;
+}
+
+function getMeasuredCycle(pools: ArbPool[], a: Reserves, b: Reserves, buy: number, sell: number): { gapBest: number; cycle: Cycle | null } {
+  const ga = 1 - (a.buyFee ?? pools[buy].fee);
+  const gb = 1 - (b.sellFee ?? pools[sell].fee);
+  const knots = a.curve?.buy.map((point) => point.input) ?? [];
+  for (const { input } of b.curve?.sell ?? []) {
+    const dx = a.curve ? interpolate(a.curve.buy, input, true) : a.w * input / (ga * (a.t - input));
+    if (dx > 0 && Number.isFinite(dx)) knots.push(dx);
+  }
+  knots.sort((x, y) => x - y);
+  let previous = 0;
+  let gapBest = -Infinity;
+  let cycle: Cycle | null = null;
+  function quote(dx: number) {
+    const tokens = a.curve ? interpolate(a.curve.buy, dx) : a.t * ga * dx / (a.w + ga * dx);
+    if (!(tokens > 0)) return;
+    const weth = b.curve ? interpolate(b.curve.sell, tokens) : b.w * gb * tokens / (b.t + gb * tokens);
+    if (!(weth > 0)) return;
+    const profit = weth - dx;
+    const gap = profit / dx;
+    gapBest = Math.max(gapBest, gap);
+    if (profit > 0 && (!cycle || profit > cycle.profit)) cycle = { buy, sell, dx, profit, gap };
+  }
+  for (const input of knots) {
+    if (input <= previous) continue;
+    quote((previous + input) / 2);
+    quote(input);
+    previous = input;
+  }
+  return { gapBest, cycle };
+}
+
 /**
  * Best WETH -> TOKEN (pool `buy`) -> WETH (pool `sell`) cycle on constant-product reserves.
  * Two x*y=k swaps compose into out = K·dx / (C + D·dx); profit is maximal at dx* = (√(K·C) − C) / D.
@@ -258,6 +369,15 @@ export function bestCycle(pools: ArbPool[], res: (Reserves | null)[]): { gap: nu
       const A = res[i];
       const B = res[j];
       if (i === j || !A || !B || poolIdentity(pools[i]) === poolIdentity(pools[j])) continue;
+      if (A.curve || B.curve) {
+        const measured = getMeasuredCycle(pools, A, B, i, j);
+        gapBest = Math.max(gapBest, measured.gapBest);
+        if (measured.cycle) {
+          cycles.push(measured.cycle);
+          if (!cycle || measured.cycle.profit > cycle.profit) cycle = measured.cycle;
+        }
+        continue;
+      }
       const ga = 1 - (A.buyFee ?? pools[i].fee);
       const gb = 1 - (B.sellFee ?? pools[j].fee);
       const gap = (gb * (B.w / B.t)) / (A.w / A.t / ga) - 1;

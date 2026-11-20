@@ -180,23 +180,25 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
   </section>
 
   <section class="card">
-    <h2>MEV arbitrage · flash loans + private bundles <span id="mevMode"></span></h2>
+    <h2>MEV arbitrage · flash loans <span id="mevMode"></span></h2>
     <div class="sub" id="mevStatus" style="margin:-4px 0 10px">Starting…</div>
     <div class="stats">
       <div class="stat"><div class="l">Blocks scanned</div><div class="v" id="mevBlocks">–</div></div>
-      <div class="stat"><div class="l" title="Best successful on-chain simulation this hour, shown before estimated gas and the builder bid">Best simulation this hour</div><div class="v" id="mevGap">–</div></div>
+      <div class="stat"><div class="l" title="Best successful on-chain simulation this hour, before transaction costs">Best simulation this hour</div><div class="v" id="mevGap">–</div></div>
       <div class="stat"><div class="l">Simulated / profitable</div><div class="v" id="mevSims">–</div></div>
-      <div class="stat"><div class="l">Bundles sent / landed</div><div class="v" id="mevBundles">–</div></div>
+      <div class="stat"><div class="l" id="mevSubmissionLabel">Submissions / landed</div><div class="v" id="mevBundles">–</div></div>
       <div class="stat"><div class="l">MEV profit (after gas)</div><div class="v" id="mevProfit">–</div></div>
       <div class="stat"><div class="l">RPC calls used</div><div class="v" id="mevRpc">–</div></div>
     </div>
+    <p class="note" id="mevScanWindow" hidden></p>
+    <p class="note" id="mevDirectGas" hidden></p>
     <div class="scroll" style="margin-top:12px"><table>
       <thead><tr><th>Time</th><th>Token</th><th>Buy on → sell on</th><th class="r">Size</th><th class="r">Gross</th><th class="r">Gas</th><th class="r">Net (ETH)</th><th>Result</th></tr></thead>
       <tbody id="mevBody"></tbody>
     </table></div>
     <div class="row">
       <button id="mevDeployBtn" aria-describedby="mevDeploy" hidden disabled>Deploy upgradeable FlashArb</button>
-      <button id="mevArmBtn" class="primary" aria-describedby="mevDeploy" disabled>Arm MEV (live bundles)</button>
+      <button id="mevArmBtn" class="primary" aria-describedby="mevDeploy" disabled>Arm MEV</button>
       <button id="mevDisarmBtn" class="danger" hidden>Disarm MEV</button>
     </div>
     <p class="note" id="mevContract" style="overflow-wrap:anywhere" hidden></p>
@@ -286,16 +288,14 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
   </div>
 </dialog>
 
-<dialog id="mevDlg">
-  <h3>Arm MEV arbitrage?</h3>
+<dialog id="mevDlg" aria-labelledby="mevArmTitle">
+  <h3 id="mevArmTitle">Arm MEV arbitrage?</h3>
   <ul>
-    <li>Arming checks the selected FlashArb bytecode and confirms that the bot wallet owns the contract.</li>
-    <li>When a qualifying gap appears, the bot submits a bundle to configured builders. Flash funding supplies the principal, and the bot wallet receives any realized contract profit in <b>ETH</b>.</li>
-    <li>The contract enforces a profit floor. Gas is still at risk if a builder includes a transaction that reverts.</li>
-    <li>The builder tip is set by MEV_BUILDER_TIP_PCT in .env.</li>
-    <li>Expect few or no wins: professional searchers with faster infrastructure take most gaps first.</li>
+    <li id="mevArmTransport"></li>
+    <li id="mevArmGas"></li>
+    <li>The bot checks contract bytecode and wallet ownership. Profitable trades repay the lender and send their proceeds to the bot wallet.</li>
   </ul>
-  <label class="sub">Type <b>MEV</b> to confirm</label>
+  <label class="sub" for="mevInput">Type <b>MEV</b> to confirm</label>
   <input id="mevInput" autocomplete="off" spellcheck="false">
   <div class="row" style="justify-content:flex-end">
     <button id="mevCancel" class="ghost">Cancel</button>

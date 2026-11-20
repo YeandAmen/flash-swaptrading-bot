@@ -13,8 +13,10 @@ import { FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
 import { bundleTraceRequests, requestBuilderTrace } from './builder-trace.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
 import { sendBundle, type BuilderResult } from './bundles.js';
-import { pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
+import { directFees, directPriorityFee, findNonceConsumer, submitDirect } from './direct.js';
+import { pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
 import { routeInputSizes } from './sizing.js';
+import { NextVenueKind } from './next-pools.js';
 import { arbGas, bestCycle, buildStateReads, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
 import { MevUniverse } from './universe.js';
 
@@ -34,6 +36,13 @@ const RECENT_BUNDLE_LIMIT = 10;
 const DASHBOARD_RECENT_LIMIT = 15;
 const DASHBOARD_BUNDLE_LIMIT = 5;
 const MAX_STARTUP_TRACE_BUNDLES = 6;
+const DIRECT_WINDOW = 2;
+const MAX_CATCHUP = 3;
+const WINDOW_MS = 30 * 60_000;
+const GAS_LEDGER_HOURS = 24;
+const hourOf = (time: number) => Math.floor(time / HOUR);
+const directBudgetConfigured = () => MEV.directMaxGasUsd > 0;
+const directPriorityCap = () => BigInt(Math.floor(MEV.directMaxPriorityGwei * 1e9));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String(e)).split('\n')[0]).slice(0, 200);
 const eth = (wei: bigint) => Number(wei) / 1e18;
@@ -84,6 +93,7 @@ function retainRecent(rows: MevOpp[], limit: number, bundleLimit: number): MevOp
 }
 
 interface BundleSubmission {
+  kind?: 'direct';
   target: number;
   startedAt: number;
   leadMs: number;
@@ -100,6 +110,8 @@ interface MevStats {
   simulated: number; // checked exactly on-chain (eth_call)
   profitable: number; // still profitable after gas
   bundles: number;
+  directAttempts?: number;
+  directLanded?: number;
   landed: number;
   lastLandedAt?: number;
   netEth: number;
@@ -136,9 +148,11 @@ interface MevFile {
   recent: MevOpp[];
   best: HourBest[];
   pending: PendingBundle | null;
+  directGas?: { hour: number; usd: number }[];
 }
 
 interface PendingBundle {
+  kind?: 'direct';
   hash: Hex;
   nonce: number;
   target: string;
@@ -210,6 +224,8 @@ interface PreparedOffer {
   gas: bigint;
   gasBudget: bigint;
   tip: bigint;
+  fees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
+  target: bigint;
   minimumProfit: bigint;
   net: bigint;
 }
@@ -271,6 +287,9 @@ export class MevSearcher {
   private cooldown = new Map<string, RouteCooldown>();
   private previousSizes = new Map<string, { amount: bigint; at: number }>();
   private stopping = false;
+  private scanWindow: { at: number; candidates: number; simulated: number; bestNetUsd: number | null }[] = [];
+  private caughtUp = 0;
+  private missedPoolSnapshots = 0;
 
   constructor(private host: MevHost, private persist = true) {
     this.file = this.load();
@@ -278,15 +297,19 @@ export class MevSearcher {
     this.universe = new MevUniverse(persist, (message, level) => this.host.log(`[mev] ${message}`, level), {
       includePancakeV3: true, includeUniswapV4: true,
       get includePancakeV2() { return searcher.supportsPancakeV2; },
+      get includeCurve() { return searcher.supportsCurve; },
     });
   }
 
   private get v3Address() { return this.file.v3Contract ?? MEV.v3ContractAddress; }
   private get isV3() { return Boolean(this.file.proxyContract || this.v3Address); }
-  private get supportsSpark() { return Boolean(this.file.proxyRelease && releaseSupportsSpark(this.file.proxyRelease)); }
-  private get supportsPancakeV2() { return Boolean(this.file.proxyRelease && releaseSupportsPancakeV2(this.file.proxyRelease)); }
+  private get previewLatest() { return MEV.submission === 'direct' && !directBudgetConfigured(); }
+  private get supportsSpark() { return this.previewLatest || Boolean(this.file.proxyRelease && releaseSupportsSpark(this.file.proxyRelease)); }
+  private get supportsPancakeV2() { return this.previewLatest || Boolean(this.file.proxyRelease && releaseSupportsPancakeV2(this.file.proxyRelease)); }
+  private get supportsCurve() { return this.previewLatest || Boolean(this.file.proxyRelease && releaseSupportsCurve(this.file.proxyRelease)); }
   private get contractLabel() { return this.file.proxyContract ? 'FlashArb Proxy' : this.isV3 ? 'FlashArbV3' : 'FlashArbV2'; }
   private get contractRuntime(): Hex {
+    if (this.previewLatest) return proxyReleaseRuntime;
     if (this.file.proxyRelease) return releaseRuntime(this.file.proxyRelease) ?? proxyReleaseRuntime;
     return this.isV3 ? FLASH_ARB_V3_RUNTIME : FLASH_ARB_V2_RUNTIME;
   }
@@ -330,10 +353,15 @@ export class MevSearcher {
       f.deployStartedAt ??= null;
       f.deployNonce ??= null;
       f.pending ??= null;
+      if (f.directGas !== undefined && (!Array.isArray(f.directGas)
+        || f.directGas.some((entry) => !entry || !Number.isSafeInteger(entry.hour)
+          || !Number.isFinite(entry.usd) || entry.usd < 0))) throw new Error('invalid direct gas ledger');
       const pending = f.pending;
       if (pending !== null) {
         if (!/^0x[0-9a-f]{64}$/i.test(pending.hash) || !/^0x[0-9a-f]{40}$/i.test(pending.contract)
           || !/^\d+$/.test(pending.target) || !Number.isSafeInteger(pending.nonce) || pending.nonce < 0
+          || (pending.kind !== undefined && pending.kind !== 'direct')
+          || (pending.kind === 'direct' && (!Number.isSafeInteger(pending.opp?.block) || pending.opp.block < 0))
           || !validPrice(pending.ethUsd) || !pending.opp || pending.opp.hash !== pending.hash) throw new Error('invalid bundle journal');
         const recorded = f.recent.find((o) => o?.hash === pending.hash);
         if (recorded) pending.opp = recorded;
@@ -381,7 +409,10 @@ export class MevSearcher {
     if (this.deploying) return 'Preparing the FlashArb proxy transaction…';
     if (this.file.deployTx) return 'Waiting for the deployment transaction to settle';
     if (this.file.armed && !this.contractReady) return `Verifying the ${this.contractLabel} contract…`;
-    if (this.file.armed) return 'Live mode: eligible bundles go to the configured builders';
+    if (this.file.armed) return MEV.submission === 'direct'
+      ? 'Live mode: eligible trades go directly to the Ethereum RPC'
+      : 'Live mode: eligible bundles go to the configured builders';
+    if (MEV.submission === 'direct' && !directBudgetConfigured()) return 'Direct paper mode. Set gas limits before arming direct execution.';
     if (MEV.funding === 'spark' && !this.supportsSpark) return 'Deploy or upgrade FlashArb Proxy to simulate routes funded by SparkLend';
     if (MEV.funding === 'balancer' && !this.isV3) return 'Deploy FlashArb Proxy to simulate routes funded by Balancer V3';
     return 'Paper mode: every block is scanned and simulated, nothing is sent';
@@ -459,13 +490,13 @@ export class MevSearcher {
   }
 
   private async loop() {
-    let lastHash: Hex | null = null;
+    let last: { hash: Hex; number: bigint } | null = null;
     let backoff = 0;
     while (!this.stopping) {
       try {
         if (!this.universe.broad && Date.now() - this.poolsAt > 24 * HOUR) await this.refreshPools();
         const head = await this.head();
-        if (head.hash === lastHash) {
+        if (head.hash === last?.hash || (last && head.number < last.number)) {
           const ageMs = Date.now() - Number(head.timestamp) * 1000;
           await sleep(ageMs < SLOT_MS + 3000 ? HEAD_RETRY_MS : 1000);
           continue;
@@ -473,7 +504,9 @@ export class MevSearcher {
         const r = await this.read(head);
         this.lastError = null;
         await this.onBlock(r);
-        lastHash = r.hash;
+        const previous = last;
+        last = { hash: r.hash, number: r.blockNumber };
+        if (previous) await this.catchUp(previous.number, head);
         backoff = 0;
         // Start checking for the next execution head at the expected slot boundary.
         await sleep(Math.min(SLOT_MS, Math.max(HEAD_RETRY_MS, r.timestamp * 1000 + SLOT_MS - Date.now())));
@@ -481,6 +514,32 @@ export class MevSearcher {
         this.lastError = errMsg(e);
         backoff = Math.min(backoff * 2 + 750, 6_000);
         await sleep(backoff);
+      }
+    }
+  }
+
+  /** Backfill recent skipped heights after scanning the new head. Historical work cannot send. */
+  private async catchUp(previous: bigint, head: Awaited<ReturnType<MevSearcher['head']>>) {
+    const gap = head.number - previous - 1n;
+    if (gap <= 0n) return;
+    const count = gap < BigInt(MAX_CATCHUP) ? Number(gap) : MAX_CATCHUP;
+    this.missedPoolSnapshots += Number(gap) - count;
+    let parentHash = head.parentHash;
+    for (let i = 0; i < count; i++) {
+      if (this.stopping || !this.beforeNextSlot({ timestamp: Number(head.timestamp) })) {
+        this.missedPoolSnapshots += count - i;
+        break;
+      }
+      try {
+        this.file.stats.rpcCalls++;
+        const parent = await mevReadClient.getBlock({ blockHash: parentHash });
+        parentHash = parent.parentHash;
+        if (parent.number !== head.number - BigInt(i + 1)) throw new Error('historical block did not match the expected height');
+        await this.onBlock(await this.read(parent), true);
+        this.caughtUp++;
+      } catch {
+        this.missedPoolSnapshots += count - i;
+        break;
       }
     }
   }
@@ -525,13 +584,20 @@ export class MevSearcher {
     };
   }
 
-  private async onBlock(r: BlockRead) {
+  private async onBlock(r: BlockRead, historical = false) {
     const started = performance.now();
     const generation = this.armGeneration;
     this.file.stats.blocks++;
-    const recovery = this.reconcileWallet(r.blockNumber);
-    if (CONFIG.forkMode) await recovery;
-    const nextMaxBase = r.nextBaseFee;
+    if (!historical) {
+      const recovery = this.reconcileWallet(r.blockNumber);
+      if (CONFIG.forkMode) await recovery;
+    }
+    let nextMaxBase = r.nextBaseFee;
+    if (!historical && MEV.submission === 'direct') {
+      const cap = directPriorityCap();
+      const priority = await directPriorityFee(cap).catch(() => cap);
+      nextMaxBase = directFees(r.nextBaseFee, priority, DIRECT_WINDOW).maxFeePerGas;
+    }
     const gasPriceEth = Number(nextMaxBase) / 1e18;
     const cands: Candidate[] = [];
     const now = Date.now();
@@ -557,6 +623,10 @@ export class MevSearcher {
         cands.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet, gasUnits });
       }
     }
+    if (historical) {
+      this.recordScan(r.timestamp * 1000, cands.length, 0, null);
+      return;
+    }
     const block = { number: Number(r.blockNumber), at: now, candidates: cands.length, readMs: r.readMs, decisionMs: null as number | null, failedChunks: r.failedChunks };
     this.lastBlock = block;
     if (est) {
@@ -575,7 +645,11 @@ export class MevSearcher {
     const canTryFallback = () => canTryLive() && !this.host.tradePending()
       && (CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS);
     const allowFallback = canTryFallback();
-    const shortlisted = await Promise.all(selected.map((c) => this.evaluate(c, r, nextMaxBase, policy, allowFallback)));
+    const simulatedBefore = this.file.stats.simulated;
+    const shortlistNet: number[] = [];
+    const shortlisted = await Promise.all(selected.map((c) =>
+      this.evaluate(c, r, nextMaxBase, policy, allowFallback, (netUsd) => shortlistNet.push(netUsd))));
+    this.recordScan(now, cands.length, this.file.stats.simulated - simulatedBefore, shortlistNet.length ? Math.max(...shortlistNet) : null);
     const offers = shortlisted.flatMap((route) => route?.primary ? [route.primary] : [])
       .sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
     block.decisionMs = Math.round(performance.now() - started);
@@ -610,6 +684,11 @@ export class MevSearcher {
       for (const offer of offers.reverse()) this.record(offer.opp);
     }
     if (this.file.stats.blocks % 20 === 0) this.save();
+  }
+
+  private recordScan(at: number, candidates: number, simulated: number, bestNetUsd: number | null) {
+    this.scanWindow = this.scanWindow.filter((row) => row.at >= Date.now() - WINDOW_MS);
+    this.scanWindow.push({ at, candidates, simulated, bestNetUsd });
   }
 
   /** This hour's record of how close we got (created on first use; the last 72 hours are kept). */
@@ -657,14 +736,16 @@ export class MevSearcher {
     }
   }
 
-  private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy, allowFallback: boolean): Promise<EvaluatedRoute | null> {
+  private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy, allowFallback: boolean, observedNet?: (usd: number) => void): Promise<EvaluatedRoute | null> {
     const st = this.file.stats;
     st.candidates++;
     const key = `${poolIdentity(c.A)}|${poolIdentity(c.B)}`;
     const previous = this.previousSizes.get(key);
     const sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previous && Date.now() - previous.at < 10 * 60_000 ? previous.amount : undefined);
     if (!sizes.length) return null;
-    const trials = fundingTrials(MEV.funding, sizes, this.isV3, this.supportsSpark);
+    const trials = fundingTrials(MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark)
+      .filter(({ funding }) => c.A.kind !== NextVenueKind.CurveTricrypto || funding !== 0);
+    if (!trials.length) return null;
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));
     st.rpcCalls += sims.length;
     st.simulated++;
@@ -723,6 +804,7 @@ export class MevSearcher {
       };
     };
     const primary = makeOffer(b);
+    if (validPrice(ethUsd)) observedNet?.(primary.opp.netUsd);
     if (net < minNetWei) {
       // estimate far above reality = an illusion of the quick math: back off for longer
       const illusion = Number(b.profit) / 1e18 < c.est * 0.1;
@@ -753,6 +835,7 @@ export class MevSearcher {
   }
 
   private profitPolicy(now: number): ProfitPolicy {
+    if (MEV.submission === 'direct') return { idle: false, minNetUsd: MEV.directMinNetUsd, builderTipPct: 0, gasPaddingPct: NORMAL_GAS_PADDING_PCT };
     const { stats, armedAt } = this.file;
     // Old journals with no landed bundles already record how long the scanner has been running.
     const since = stats.lastLandedAt ?? (stats.landed === 0 ? stats.since : armedAt);
@@ -778,7 +861,7 @@ export class MevSearcher {
     return proposed < room ? proposed : room;
   }
 
-  private beforeNextSlot(r: BlockRead): boolean {
+  private beforeNextSlot(r: Pick<BlockRead, 'timestamp'>): boolean {
     return CONFIG.forkMode || Date.now() < r.timestamp * 1000 + SLOT_MS;
   }
 
@@ -789,6 +872,15 @@ export class MevSearcher {
     return null;
   }
 
+  private directGasSpent(now: number): number {
+    const start = hourOf(now) - GAS_LEDGER_HOURS;
+    return (this.file.directGas ?? []).filter((entry) => entry.hour >= start).reduce((total, entry) => total + entry.usd, 0);
+  }
+
+  private withinDirectGasBudget(gasUsd: number, now: number): boolean {
+    return gasUsd > 0 && gasUsd <= MEV.directMaxGasUsd && gasUsd + this.directGasSpent(now) <= MEV.directDailyGasUsd;
+  }
+
   private async prepareLive(offer: Offer, r: BlockRead, policy: ProfitPolicy): Promise<PreparedOffer | null> {
     const contract = this.selectedContract;
     const { candidate: c, opp } = offer;
@@ -797,23 +889,31 @@ export class MevSearcher {
     const ethUsd = this.host.ethUsd();
     if (!validPrice(ethUsd)) return this.skipOpportunity(opp, 'ETH/USD price unavailable');
     const minimumNet = this.minimumNet(ethUsd, policy);
-    const target = r.blockNumber + 1n;
+    const direct = MEV.submission === 'direct';
+    const target = r.blockNumber + BigInt(direct ? DIRECT_WINDOW : 1);
     const encode = (tip: bigint, minProfit: bigint) => this.liveData(encodeArbitrage(offer.funding, {
       buy: c.A, sell: c.B, token: c.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
     }));
     try {
       // Estimate with the builder payment path enabled, then simulate the exact calldata and gas limit.
       this.file.stats.rpcCalls++;
-      const estimate = await mevReadClient.estimateGas({ account: this.host.account, to: contract, data: encode(1n, 1n), blockNumber: r.blockNumber });
+      const [estimate, fees] = await Promise.all([
+        mevReadClient.estimateGas({ account: this.host.account, to: contract, data: encode(direct ? 0n : 1n, 1n), blockNumber: r.blockNumber }),
+        direct ? directPriorityFee(directPriorityCap()).then((priority) => directFees(r.nextBaseFee, priority, DIRECT_WINDOW))
+          : { maxFeePerGas: r.nextBaseFee, maxPriorityFeePerGas: 0n },
+      ]);
       const paddedBps = 10_000n + BigInt(Math.round(policy.gasPaddingPct * 10_000));
       const gas = (estimate * paddedBps + 9_999n) / 10_000n;
-      const gasBudget = gas * r.nextBaseFee;
+      const gasBudget = gas * fees.maxFeePerGas;
+      if (direct && !this.withinDirectGasBudget(eth(gasBudget) * ethUsd, Date.now())) {
+        return this.skipOpportunity(opp, 'direct route exceeds an approved gas limit');
+      }
       const afterGas = offer.profit - gasBudget;
       if (afterGas < minimumNet) return this.skipOpportunity(opp, 'below configured profit floor with padded gas');
-      const tip = this.builderTip(afterGas, minimumNet, policy);
-      if (tip === 0n) return this.skipOpportunity(opp, 'profit does not cover a builder payment above the configured floor');
+      const tip = direct ? 0n : this.builderTip(afterGas, minimumNet, policy);
+      if (!direct && tip === 0n) return this.skipOpportunity(opp, 'profit does not cover a builder payment above the configured floor');
       const minimumProfit = tip + gasBudget + minimumNet;
-      return { offer, contract, ethUsd, gas, gasBudget, tip, minimumProfit, data: encode(tip, minimumProfit), net: afterGas - tip };
+      return { offer, contract, ethUsd, gas, gasBudget, tip, fees, target, minimumProfit, data: encode(tip, minimumProfit), net: afterGas - tip };
     } catch (e) {
       opp.status = 'failed';
       opp.note = `gas estimate: ${reasonOf(e)}`;
@@ -825,14 +925,14 @@ export class MevSearcher {
   private async sendLive(prepared: PreparedOffer, r: BlockRead, generation: number) {
     const exec = this.host.exec;
     const account = this.host.account;
-    const { offer, contract, ethUsd, data, gas, gasBudget, tip, minimumProfit, net } = prepared;
+    const { offer, contract, ethUsd, data, gas, gasBudget, tip, fees, target, minimumProfit, net } = prepared;
+    const direct = MEV.submission === 'direct';
     const { opp } = offer;
     const skip = (note: string) => { this.skipOpportunity(opp, note); };
     const canSend = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
       && !this.deploying && !this.host.tradePending() && this.beforeNextSlot(r);
     if (!canSend()) return skip('target slot passed or MEV became unavailable before signing');
     if (this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
-    const target = r.blockNumber + 1n;
     try {
       this.file.stats.rpcCalls++;
       const [result, nonce, balance] = await Promise.all([
@@ -844,35 +944,43 @@ export class MevSearcher {
         return skip('final simulation returned insufficient profit');
       }
       if (balance < gasBudget) return skip('wallet ETH does not cover the padded gas budget');
+      if (direct && !this.withinDirectGasBudget(eth(gasBudget) * ethUsd, Date.now())) return skip('direct gas limit reached');
       const head = await this.head();
       if (head.hash !== r.hash || !canSend()) return skip('block changed or MEV was disarmed before signing');
       const signed = await account.signTransaction({
         chainId: publicClient.chain.id, type: 'eip1559', to: contract, data, nonce, gas,
-        maxFeePerGas: r.nextBaseFee, maxPriorityFeePerGas: 0n, value: 0n,
+        ...fees, value: 0n,
       });
       if (!canSend()) return skip('MEV was disarmed before sending');
       const hash = keccak256(signed);
       const startedAt = Date.now();
+      const kind = direct ? 'direct' as const : undefined;
       const submission: BundleSubmission = {
+        kind,
         target: Number(target), startedAt, leadMs: r.timestamp * 1000 + SLOT_MS - startedAt,
         gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(net) * ethUsd, builders: [],
       };
       Object.assign(opp, {
         hash, status: 'sent', gasEth: submission.gasEth, tipEth: submission.tipEth,
-        netEth: eth(net), netUsd: submission.netUsd, note: 'awaiting builder replies', submission,
+        netEth: eth(net), netUsd: submission.netUsd, note: direct ? 'awaiting direct RPC submission' : 'awaiting builder replies', submission,
       });
-      const pending = { hash, nonce, target: target.toString(), contract, ethUsd, opp };
+      const pending = { kind, hash, nonce, target: target.toString(), contract, ethUsd, opp };
       const recent = this.file.recent.slice();
+      const attempts = this.file.stats.directAttempts;
       this.file.pending = pending;
+      if (direct) this.file.stats.directAttempts = (attempts ?? 0) + 1;
       this.record(opp, false);
       try {
         this.writeState();
       } catch (error) {
         this.file.pending = null;
         this.file.recent = recent;
+        this.file.stats.directAttempts = attempts;
         throw error;
       }
-      const flight = this.submitSignedBundle(pending, submission, signed, () => canSend() && this.pending === pending);
+      const canSubmit = () => canSend() && this.pending === pending;
+      const flight = direct ? this.submitSignedDirect(pending, signed, canSubmit)
+        : this.submitSignedBundle(pending, submission, signed, canSubmit);
       // The journal continues to reserve the nonce while replies arrive. The scanner can follow the next head.
       if (CONFIG.forkMode) await flight;
     } catch (e) {
@@ -883,6 +991,24 @@ export class MevSearcher {
     } finally {
       if (!this.pending) this.releaseBundle();
     }
+  }
+
+  private async submitSignedDirect(pending: PendingBundle, signed: Hex, canSubmit: () => boolean) {
+    if (!canSubmit()) {
+      if (this.pending === pending) this.finishBundle({
+        ...pending.opp, status: 'skipped', note: 'direct send canceled before contacting the RPC', gasEth: 0, tipEth: 0, netEth: 0, netUsd: 0,
+      });
+      return;
+    }
+    try {
+      await submitDirect(signed);
+      if (this.pending === pending) pending.opp.note = 'direct Ethereum RPC accepted; awaiting receipt';
+      this.host.log(`[mev] Direct transaction ${pending.hash} submitted. Route deadline is block ${pending.target}.`);
+    } catch (e) {
+      if (this.pending === pending) pending.opp.note = 'direct send outcome unknown; waiting for confirmed nonce settlement';
+      this.host.log(`[mev] Direct send ${pending.hash} awaiting reconciliation: ${errMsg(e)}`, 'warn');
+    }
+    this.save();
   }
 
   private async submitSignedBundle(pending: PendingBundle, submission: BundleSubmission, signed: Hex, canSend: () => boolean) {
@@ -954,10 +1080,12 @@ export class MevSearcher {
     if (!p) return;
     const target = BigInt(p.target);
     const confirmations = CONFIG.forkMode ? 0n : RECEIPT_CONFIRMATIONS;
-    if (current < target + confirmations) return;
+    if (p.kind !== 'direct' && current < target + confirmations) return;
     const receipt = await this.receipt(p.hash);
     if (receipt) {
       if (current < receipt.blockNumber + confirmations) return;
+      if (p.kind === 'direct' && (receipt.from.toLowerCase() !== this.host.account.address.toLowerCase()
+        || receipt.to?.toLowerCase() !== p.contract.toLowerCase())) throw new Error('unexpected direct transaction receipt');
       if (!CONFIG.forkMode) {
         const canonical = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
         this.file.stats.rpcCalls++;
@@ -994,7 +1122,22 @@ export class MevSearcher {
       }
       outcome.netUsd = outcome.netEth * p.ethUsd;
       this.finishBundle(outcome, true);
-      this.host.log(`[mev] Bundle ${p.hash} ${outcome.status}: ${outcome.note}`, outcome.status === 'landed' ? 'trade' : 'warn');
+      this.host.log(`[mev] ${p.kind === 'direct' ? 'Direct transaction' : 'Bundle'} ${p.hash} ${outcome.status}: ${outcome.note}`, outcome.status === 'landed' ? 'trade' : 'warn');
+      return;
+    }
+    if (p.kind === 'direct') {
+      const confirmedBlock = current - confirmations;
+      const first = BigInt(p.opp.block) + 1n;
+      if (confirmedBlock < first) return;
+      const includedHash = await findNonceConsumer(this.host.account.address, p.nonce, confirmedBlock, first);
+      if (includedHash && includedHash.toLowerCase() !== p.hash.toLowerCase()) {
+        this.host.exec.noteNonceUsed(p.nonce);
+        this.finishBundle({ ...p.opp, status: 'not included', note: 'a different confirmed transaction used the nonce',
+          netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
+        this.host.log(`[mev] Direct transaction ${p.hash} was replaced at nonce ${p.nonce}.`);
+      } else if (current > target && this.pending === p) {
+        p.opp.note = includedHash ? 'nonce confirmed; waiting for verified receipt' : 'route expired; wallet reserved until the public nonce settles';
+      }
       return;
     }
     const nonceAtTarget = await publicClient.getTransactionCount({ address: this.host.account.address, blockNumber: target });
@@ -1020,13 +1163,22 @@ export class MevSearcher {
 
   private finishBundle(outcome: MevOpp, included = false) {
     const f = this.file;
-    const previous = { pending: f.pending, recent: f.recent, stats: f.stats };
+    const previous = { pending: f.pending, recent: f.recent, stats: f.stats, directGas: f.directGas };
     f.pending = null;
     f.recent = retainRecent([outcome, ...f.recent.filter((item) => item.hash !== outcome.hash)], RECENT_LIMIT, RECENT_BUNDLE_LIMIT);
     if (included) {
       const landed = outcome.status === 'landed';
+      const direct = previous.pending?.kind === 'direct';
+      if (direct && previous.pending) {
+        const hour = hourOf(Date.now());
+        const ledger = (f.directGas ?? []).filter((entry) => entry.hour >= hour - GAS_LEDGER_HOURS && entry.hour < hour);
+        const current = (f.directGas ?? []).find((entry) => entry.hour === hour);
+        const spent = outcome.gasEth * previous.pending.ethUsd;
+        f.directGas = [...ledger, { hour, usd: (current?.usd ?? 0) + spent }];
+      }
       f.stats = {
         ...f.stats, landed: f.stats.landed + (landed ? 1 : 0),
+        directLanded: (f.stats.directLanded ?? 0) + (direct && landed ? 1 : 0),
         lastLandedAt: landed ? Date.now() : f.stats.lastLandedAt,
         netEth: f.stats.netEth + outcome.netEth, netUsd: f.stats.netUsd + outcome.netUsd,
       };
@@ -1044,7 +1196,8 @@ export class MevSearcher {
   /** Collect builder diagnostics after chain settlement without delaying scans or nonce release. */
   private traceMissedBundle(outcome: MevOpp) {
     const submission = outcome.submission;
-    if (CONFIG.forkMode || this.stopping || !submission || !Array.isArray(submission.builders)) return false;
+    if (CONFIG.forkMode || this.stopping || MEV.submission === 'direct' || !submission
+      || submission.kind === 'direct' || !Array.isArray(submission.builders)) return false;
     let scheduled = false;
     for (const request of bundleTraceRequests(submission.builders, MEV.builders, submission.startedAt)) {
       if (this.scheduledTraces.has(request.builder)) continue;
@@ -1081,7 +1234,10 @@ export class MevSearcher {
   arm() {
     if (!MEV.enabled) throw new Error('MEV is turned off in .env (MEV=off)');
     if (!CONFIG.allowLiveTrading && !CONFIG.forkMode) throw new Error('Live execution is disabled (ALLOW_LIVE_TRADING=off).');
-    if (!CONFIG.forkMode && MEV.builders.length === 0) throw new Error('MEV requires at least one configured builder.');
+    if (MEV.submission === 'bundle' && !CONFIG.forkMode && MEV.builders.length === 0) throw new Error('MEV requires at least one configured builder.');
+    if (MEV.submission === 'direct' && !directBudgetConfigured()) {
+      throw new Error('Set the direct transaction and daily gas limits before arming direct execution.');
+    }
     if (this.stateReadError) throw new Error(this.stateReadError);
     if (!this.persist || this.stopping || this.walletPending()) throw new Error('MEV cannot arm while wallet recovery or contract preparation is in progress.');
     if (MEV.funding === 'spark' && !this.supportsSpark) throw new Error('SparkLend funding requires a compatible FlashArb Proxy release.');
@@ -1339,7 +1495,10 @@ export class MevSearcher {
       venues[name] = (venues[name] ?? 0) + 1;
     }
     const ethUsd = this.host.ethUsd();
-    const hour = Math.floor(Date.now() / HOUR) * HOUR;
+    const now = Date.now();
+    const hour = Math.floor(now / HOUR) * HOUR;
+    const window = this.scanWindow.filter((row) => row.at >= now - WINDOW_MS);
+    const nets = window.flatMap((row) => row.bestNetUsd === null ? [] : [row.bestNetUsd]);
     return {
       enabled: MEV.enabled,
       mode: !MEV.enabled ? 'off' : this.deploying ? 'deploying' : f.armed ? (this.contractReady ? 'live' : 'arming') : 'paper',
@@ -1354,6 +1513,7 @@ export class MevSearcher {
       proxyRelease: f.proxyRelease ?? null,
       contractVersion: f.proxyContract ? 'proxy' : this.isV3 ? 'v3' : 'v2',
       fundingMode: MEV.funding,
+      paperRelease: this.previewLatest ? proxyReleaseHash : null,
       deployedAt: (f.proxyContract ? f.proxyDeployedAt : this.isV3 ? f.v3DeployedAt : f.v2DeployedAt) ?? null,
       deployGasUsd: (f.proxyContract ? f.proxyDeployGasUsd : this.isV3 ? f.v3DeployGasUsd : f.v2DeployGasUsd) ?? 0,
       tokens: this.tokens.length,
@@ -1361,6 +1521,13 @@ export class MevSearcher {
       venues,
       coverage: this.universe.view(),
       lastBlock: this.lastBlock,
+      scanWindow: {
+        blocks: window.length,
+        candidates: window.reduce((sum, row) => sum + row.candidates, 0),
+        simulations: window.reduce((sum, row) => sum + row.simulated, 0),
+        bestNetUsd: nets.length ? Math.max(...nets) : null,
+        caughtUp: this.caughtUp, missedSnapshots: this.missedPoolSnapshots,
+      },
       bestThisHour: (() => {
         const b = f.best.find((x) => x.h === hour);
         if (!b) return null;
@@ -1373,11 +1540,13 @@ export class MevSearcher {
       })(),
       best: f.best.slice(-24),
       stats: f.stats,
-      pending: this.pending ? { hash: this.pending.hash, target: Number(this.pending.target) } : null,
+      pending: this.pending ? { hash: this.pending.hash, target: Number(this.pending.target), kind: this.pending.kind } : null,
       deploymentPending: f.deployVersion === 'proxy-upgrade' ? null : f.deployTx,
       upgradePending: f.deployVersion === 'proxy-upgrade' ? f.deployTx : null,
       recent: retainRecent(f.recent, DASHBOARD_RECENT_LIMIT, DASHBOARD_BUNDLE_LIMIT),
       settings: {
+        submission: MEV.submission,
+        direct: { maxGasUsd: MEV.directMaxGasUsd, dailyGasUsd: MEV.directDailyGasUsd, spentGasUsd: this.directGasSpent(now), enabled: directBudgetConfigured() },
         tipPct: MEV.builderTipPct, minNetUsd: MEV.minNetUsd, minPoolWeth: MEV.minPoolWeth,
         activeProfitPolicy: this.profitPolicy(Date.now()),
         builders: MEV.builders.map((u) => new URL(u).hostname),
