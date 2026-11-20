@@ -245,6 +245,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     account: owner, exec: new LiveExecutor(owner), ethUsd: () => ethUsd, tradePending: () => false,
     baseFeeGwei: () => null, tokens: () => [], log: (message) => { logs.push(message); },
   });
+  const previousDirectGas = searcher.file.directGas;
   try {
     searcher.file.proxyContract = contract;
     searcher.file.proxyImplementation = await slotAddress(implementationSlot);
@@ -301,7 +302,9 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     if (privateProfit) {
       assert.equal(await searcher['prepareLive'](offer, point, policy), null, 'ordinary trades retain their $1.50 gas ceiling');
       assert.throws(() => searcher.queueGasOnlyTest(testId, 10.01, true, true, false, minimumNetUsd), /gas cap/);
+      assert.throws(() => searcher.queueGasOnlyTest(testId, 10, false, true, false, minimumNetUsd), /minimum net profit/i);
       searcher.queueGasOnlyTest(testId, 10, true, true, false, minimumNetUsd);
+      assert.equal(searcher['queuedTest']?.minimumNetUsd, 0.05);
     }
     const prepared = await searcher['prepareLive'](offer, point, policy, oneShot ? searcher['queuedTest'] ?? undefined : undefined);
     assert.ok(prepared, opp.note);
@@ -392,6 +395,8 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     }
     return receipt.transactionHash;
   } finally {
+    // The enclosing fixture will revert the local transaction and its gas charge.
+    if (privateProfit) searcher.file.directGas = previousDirectGas;
     searcher.stop();
     Object.assign(MEV, saved);
   }
