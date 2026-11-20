@@ -218,17 +218,18 @@ async function sellFixtureTokensOnSushi() {
   }));
 }
 
-type DirectTestMode = 'gas-only' | 'private-gas-only' | 'break-even' | 'premium';
+type DirectTestMode = 'gas-only' | 'private-gas-only' | 'public-functional' | 'break-even' | 'premium';
 
 async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, profit: bigint, funding: RouteFunding, mode?: DirectTestMode) {
   const privateGasOnly = mode === 'private-gas-only';
-  const gasOnly = mode === 'gas-only' || privateGasOnly;
+  const publicFunctional = mode === 'public-functional';
+  const gasOnly = mode === 'gas-only' || privateGasOnly || publicFunctional;
   const breakEven = mode === 'break-even';
   const oneShot = gasOnly || breakEven;
   const premium = mode === 'premium';
   const saved = { submission: MEV.submission, directMinNetUsd: MEV.directMinNetUsd,
     directMaxGasUsd: MEV.directMaxGasUsd, directDailyGasUsd: MEV.directDailyGasUsd, directPremiumMaxGasUsd: MEV.directPremiumMaxGasUsd };
-  const maximumTestGasUsd = 1.5;
+  const maximumTestGasUsd = publicFunctional ? 5 : 1.5;
   Object.assign(MEV, {
     submission: 'direct', directMinNetUsd: breakEven ? 2_000 : 0.01,
     directMaxGasUsd: gasOnly || premium ? 1.5 : 100,
@@ -263,26 +264,26 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     const offer = { candidate: { t: market, A: buy, B: sell, dx: sizeEth, est: grossEth, estimatedNet: grossEth, gasUnits: 0 },
       amount, profit, funding, score: profit, opp };
     const policy = searcher['profitPolicy'](Date.now());
-    const testId = breakEven ? 'break-even-fixture' : privateGasOnly ? 'private-gas-only-fixture' : 'a71aa610-43f9-457f-88b7-5cbaf6531764';
+    const testId = mode ? `${mode}-fixture` : 'regular-fixture';
     if (gasOnly) {
       assert.equal(await searcher['prepareLive'](offer, point, policy), null,
         'the ordinary trading policy must reject the gas-only fixture');
-      assert.throws(() => searcher.queueGasOnlyTest(testId, maximumTestGasUsd + 0.01, false, privateGasOnly), /gas cap/);
-      searcher.queueGasOnlyTest('uncovered-gas-test', maximumTestGasUsd, true);
+      assert.throws(() => searcher.queueGasOnlyTest(testId, maximumTestGasUsd + 0.01, false, privateGasOnly, publicFunctional), /gas cap/);
+      searcher.queueGasOnlyTest('uncovered-gas-test', Math.min(maximumTestGasUsd, 1.5), true);
       const uncovered = searcher['queuedTest'];
       assert.ok(uncovered);
       assert.equal(await searcher['prepareLive'](offer, point, policy, uncovered), null);
       assert.equal(opp.note, 'test payout does not cover padded gas');
       assert.equal(searcher.view().stats.directAttempts, directAttempts);
       uncovered.expiresAt = Date.now() - 1;
-      searcher.queueGasOnlyTest('low-budget-test', 0.001);
+      searcher.queueGasOnlyTest('low-budget-test', 0.001, false, privateGasOnly, publicFunctional);
       const lowBudget = searcher['queuedTest'];
       assert.ok(lowBudget);
       assert.equal(await searcher['prepareLive'](offer, point, policy, lowBudget), null,
         'a test must reject even a valid route when its padded gas quote exceeds the one-shot budget');
       lowBudget.expiresAt = Date.now() - 1;
       assert.equal(searcher.view().gasOnlyTest?.status, 'expired');
-      searcher.queueGasOnlyTest(testId, maximumTestGasUsd, false, privateGasOnly);
+      searcher.queueGasOnlyTest(testId, maximumTestGasUsd, false, privateGasOnly, publicFunctional);
       assert.equal(searcher.view().gasOnlyTest?.id, testId);
       assert.equal(searcher.view().gasOnlyTest?.status, 'queued');
     }
@@ -310,7 +311,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
         'the break-even order must enforce full padded gas coverage in the contract');
       assert.equal(execution.args[0].tip, 0n);
       assert.equal(execution.args[0].funding, funding);
-      assert.equal(execution.args[0].maxBlock, head.number + (privateGasOnly ? 5n : breakEven ? 2n : 1n));
+      assert.equal(execution.args[0].maxBlock, head.number + (publicFunctional ? 8n : privateGasOnly ? 5n : breakEven ? 2n : 1n));
       if (breakEven) {
         assert.equal(prepared.privateSubmission, true);
         assert.ok(profit - prepared.minimumProfit >= (profit + 9n) / 10n);
@@ -365,7 +366,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
       assert.equal(searcher.view().stats.directAttempts, directAttempts + 1,
         'a consumed test cannot submit on the next head');
       const restarted = new MevSearcher(searcher['host']);
-      restarted.queueGasOnlyTest(testId, maximumTestGasUsd, breakEven, breakEven || privateGasOnly);
+      restarted.queueGasOnlyTest(testId, maximumTestGasUsd, breakEven, breakEven || privateGasOnly, publicFunctional);
       assert.equal(restarted.view().gasOnlyTest?.status, 'landed');
       assert.equal(restarted.view().gasOnlyTest?.hash, receipt.transactionHash,
         'replaying the same test ID after restart must leave the settled receipt in place');
@@ -380,11 +381,12 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
 async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: RouteFunding, direct: boolean | DirectTestMode = false) {
   const point = await fork.snapshot();
   try {
+    if (direct === 'public-functional') await fork.mine({ blocks: 2 });
     const maxBlock = (await publicClient.getBlockNumber({ cacheTime: 0 })) + 3n;
     const prepare = { funding, token: ADDR.usdc, buy: toNextVenue(buy), sell: toNextVenue(sell), minProfit: 1n, tip: useV3 ? 0n : 1n, maxBlock };
     let profitable: { args: typeof prepare & { amountIn: bigint }; profit: bigint } | undefined;
     const errors: string[] = [];
-    const gasOnly = direct === 'gas-only' || direct === 'private-gas-only';
+    const gasOnly = direct === 'gas-only' || direct === 'private-gas-only' || direct === 'public-functional';
     const sizes = gasOnly ? ['0.0000001', '0.000001', '0.00001'] : ['0.5', '0.15', '0.05', '1'];
     for (const size of sizes) {
       const amountIn = parseEther(size);
@@ -467,7 +469,10 @@ await buyFixtureTokens(sushiV2Router, parseEther('18'));
 console.log('✓ fork-local Sushi v2 buy fixture prepared');
 await testRoute('Pancake v3 buy-pool flash swap', pancake500, sushiV2, 0);
 await testRoute('native ETH v4 flash settlement', v4Native500, sushiV2, 0, useProxy ? 'break-even' : false);
-if (useProxy) await testRoute('Private pool flash swap under the approved gas cap', v4Native500, sushiV2, 0, 'private-gas-only');
+if (useProxy) {
+  await testRoute('Private pool flash swap under the approved gas cap', v4Native500, sushiV2, 0, 'private-gas-only');
+  await testRoute('Public functional flash swap with stable prices and a $5 gas cap', v4Native500, sushiV2, 0, 'public-functional');
+}
 await testRoute('WETH v4 flash settlement', v4Weth500, sushiV2, 0);
 await testRoute('Aave v3 funding with native ETH v4', v4Native500, sushiV2, 1);
 await testRoute('Morpho Blue funding with WETH v4', v4Weth500, sushiV2, 2);
