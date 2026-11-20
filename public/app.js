@@ -223,8 +223,9 @@ function render() {
       ? ` · discovery ${C.phase}: ${C.checked.toLocaleString()}/${C.candidates.toLocaleString()} addresses checked, ${C.eligible.toLocaleString()} eligible, ${C.maxPools} pool limit`
       : '';
     const timing = lb?.decisionMs == null ? '' : ` · ${lb.readMs} ms pool reads, ${lb.decisionMs} ms decisions`;
+    const missingReads = lb?.failedChunks > 0 ? ` · ${lb.failedChunks} pool batches unavailable` : '';
     $('mevStatus').textContent = `${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
-      coverage + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + (X.lastError ? ` · last error: ${X.lastError}` : '');
+      coverage + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
     const st = X.stats;
     $('mevBlocks').textContent = st.blocks.toLocaleString();
     const B = X.bestThisHour;

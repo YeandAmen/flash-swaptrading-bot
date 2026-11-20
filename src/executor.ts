@@ -7,7 +7,7 @@ import {
 import { sendRawTransaction } from 'viem/actions';
 import type { PrivateKeyAccount } from 'viem/accounts';
 import { ADDR, CONFIG, DATA_DIR, RISK } from './config.js';
-import { erc20Abi, MIN_PRIORITY_FEE_WEI, nextBaseFee, publicClient, sendClient, suggestTipWei, swapRouter02Abi } from './chain.js';
+import { erc20Abi, mevReadClient, MIN_PRIORITY_FEE_WEI, nextBaseFee, publicClient, sendClient, suggestTipWei, swapRouter02Abi } from './chain.js';
 import { quoteExactIn } from './market.js';
 import { syncDirectory, writeJson } from './persistence.js';
 
@@ -233,7 +233,7 @@ export class LiveExecutor implements Executor {
 
   /** Next nonce for a bundle (a lagging RPC node may not know our last mined transaction yet). */
   async bundleNonce(): Promise<number> {
-    const chainNonce = await this.chainNonce();
+    const chainNonce = await this.chainNonce(mevReadClient);
     return Math.max(chainNonce, this.nextNonce);
   }
 
@@ -241,10 +241,10 @@ export class LiveExecutor implements Executor {
     this.nextNonce = Math.max(this.nextNonce, nonce + 1);
   }
 
-  private async chainNonce() {
+  private async chainNonce(client = publicClient) {
     const [latest, pending] = await Promise.all([
-      publicClient.getTransactionCount({ address: this.address, blockTag: 'latest' }),
-      publicClient.getTransactionCount({ address: this.address, blockTag: 'pending' }),
+      client.getTransactionCount({ address: this.address, blockTag: 'latest' }),
+      client.getTransactionCount({ address: this.address, blockTag: 'pending' }),
     ]);
     if (pending > latest) throw new Error('Wallet has an external pending transaction');
     return latest;

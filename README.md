@@ -96,6 +96,8 @@ The searcher checks canonical factory or PoolManager state. It compares live poo
 
 For a live bundle, expand the target block in the MEV activity table to see the submission lead time, quoted gas budget and builder payment, and each relay's result and round-trip time. Relay acknowledgements confirm receipt. A bundle is marked landed after the bot verifies its on-chain receipt.
 
+MEV pool reads use bounded batches pinned to the same block. If a batch fails validation, the scanner can rank routes from the batches that pass. The bot checks gas for shortlisted live routes before ranking them, and keeps the configured minimum net profit on the signed transaction. Default bundle destinations are Flashbots, Titan, Beaverbuild, and Quasar. Use `MEV_BUILDERS` to choose destinations.
+
 The bot's receipts record realized outcomes. A pool count or a profitable paper simulation alone does not establish realized returns. Inclusion depends on pool movement, gas, competing bids, RPC latency, and builder coverage. See [SushiSwap V3 core](https://github.com/sushiswap/v3-core), [PancakeSwap V3 addresses](https://developer.pancakeswap.finance/contracts/v3/addresses), [Uniswap v4 settlement](https://developers.uniswap.org/docs/protocols/v4/concepts/flash-accounting), [Aave V3 flash loans](https://aave.com/docs/aave-v3/smart-contracts/pool#flashloansimple), [Morpho Blue flash loans](https://docs.morpho.org/learn/concepts/flashloans/), and [Flashbots bundle troubleshooting](https://docs.flashbots.net/flashbots-auction/advanced/troubleshooting).
 
 ## 5. Test with fake funds

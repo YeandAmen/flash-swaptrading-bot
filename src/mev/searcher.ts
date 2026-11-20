@@ -3,10 +3,10 @@ import path from 'node:path';
 import { BaseError, ExecutionRevertedError, keccak256, pad, parseEventLogs, TransactionReceiptNotFoundError, type Address, type Hex } from 'viem';
 import type { PrivateKeyAccount } from 'viem/accounts';
 import { CONFIG, CORE_TOKENS, DATA_DIR, MEV, type TokenCfg } from '../config.js';
-import { nextBaseFee, publicClient } from '../chain.js';
+import { mevPoolClient, mevReadClient, nextBaseFee, publicClient } from '../chain.js';
 import { redactDiagnostic } from '../diagnostics.js';
 import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../executor.js';
-import { BIG_BATCH, type McResult } from '../market.js';
+import type { McResult } from '../market.js';
 import { writeJson } from '../persistence.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
@@ -19,9 +19,9 @@ const STATE_FILE = path.join(DATA_DIR, 'mev.json');
 /** Address where paper-mode simulations place the contract code (eth_call state override; nothing is deployed). */
 const SIM_ADDR: Address = '0x00000000000000000000000000000000000ab1e5';
 const HOUR = 3_600_000;
-const MAX_BLOCK_AGE_SECONDS = 45;
 const SLOT_MS = 12_000;
 const HEAD_RETRY_MS = 400;
+const POOL_READS_PER_CHUNK = 160;
 const RECEIPT_CONFIRMATIONS = 2n;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String(e)).split('\n')[0]).slice(0, 200);
@@ -137,6 +137,7 @@ interface BlockRead {
   at: number[][];
   results: McResult[];
   readMs: number;
+  failedChunks: number;
 }
 
 interface Candidate {
@@ -158,6 +159,27 @@ interface Offer {
   opp: MevOpp;
 }
 
+interface PreparedOffer {
+  offer: Offer;
+  contract: Address;
+  ethUsd: number;
+  data: Hex;
+  gas: bigint;
+  gasBudget: bigint;
+  tip: bigint;
+  minimumProfit: bigint;
+  net: bigint;
+}
+
+interface RouteCooldown {
+  until: number;
+  est: number;
+  grow: number;
+  gasRetry?: { profit: bigint; gasUnits: number };
+}
+
+const STRUCTURAL_REVERTS = new Set(['v2 factory', 'v3 factory', 'v4 key', 'pool parameters', 'same pool']);
+
 /** Short revert reason from a viem error ("unprofitable", "transfer", ...). */
 function reasonOf(e: unknown): string {
   const x = e as { shortMessage?: string; details?: string; message?: string };
@@ -175,7 +197,7 @@ export class MevSearcher {
   tokens: ArbToken[] = [];
   status = 'starting';
   lastError: string | null = null;
-  lastBlock: { number: number; at: number; candidates: number; readMs: number; decisionMs: number | null } | null = null;
+  lastBlock: { number: number; at: number; candidates: number; readMs: number; decisionMs: number | null; failedChunks: number } | null = null;
   private deploying = false;
   private reads: ReturnType<typeof buildStateReads> | null = null;
   private poolsAt = 0;
@@ -186,7 +208,7 @@ export class MevSearcher {
   private bundleReserved = false;
   private contractReady = false;
   private armGeneration = 0;
-  private cooldown = new Map<string, { until: number; est: number; grow: number }>();
+  private cooldown = new Map<string, RouteCooldown>();
   private previousSizes = new Map<string, { amount: bigint; at: number }>();
   private stopping = false;
 
@@ -359,7 +381,7 @@ export class MevSearcher {
         await sleep(Math.min(SLOT_MS, Math.max(HEAD_RETRY_MS, r.timestamp * 1000 + SLOT_MS - Date.now())));
       } catch (e) {
         this.lastError = errMsg(e);
-        backoff = Math.min(backoff * 2 + 5_000, 60_000);
+        backoff = Math.min(backoff * 2 + 750, 6_000);
         await sleep(backoff);
       }
     }
@@ -374,7 +396,7 @@ export class MevSearcher {
 
   // ------------------------------------------------------------------ per block
   private async head() {
-    const head = await publicClient.getBlock({ blockTag: 'latest' });
+    const head = await mevReadClient.getBlock({ blockTag: 'latest' });
     this.file.stats.rpcCalls++;
     return head;
   }
@@ -384,23 +406,39 @@ export class MevSearcher {
     const tokens = this.tokens;
     if (!reads) throw new Error('pools not loaded');
     const start = performance.now();
-    const results = (await publicClient.multicall({ contracts: reads.contracts as any, allowFailure: true, blockNumber: head.number, batchSize: BIG_BATCH })) as McResult[];
-    this.file.stats.rpcCalls++;
-    if (results[0]?.status !== 'success' || results[0].result !== head.number || results[1]?.status !== 'success' || results[1].result !== head.timestamp) {
+    const headers = reads.contracts.slice(0, 2);
+    const chunks = Array.from({ length: Math.max(1, Math.ceil((reads.contracts.length - 2) / POOL_READS_PER_CHUNK)) }, (_, i) =>
+      reads.contracts.slice(2 + i * POOL_READS_PER_CHUNK, 2 + (i + 1) * POOL_READS_PER_CHUNK));
+    this.file.stats.rpcCalls += chunks.length;
+    const checks = await Promise.allSettled(chunks.map((chunk) =>
+      mevPoolClient.multicall({ contracts: [...headers, ...chunk] as any, allowFailure: true, blockNumber: head.number, batchSize: 0 }) as Promise<McResult[]>));
+    const valid = checks.map((check, index) => check.status === 'fulfilled' && check.value.length === 2 + chunks[index].length
+      && check.value[0]?.status === 'success' && check.value[0].result === head.number
+      && check.value[1]?.status === 'success' && check.value[1].result === head.timestamp ? check.value : null);
+    const stamped = valid.find((chunk) => chunk !== null);
+    if (!stamped) {
       throw new Error('pool snapshot did not match the block header');
     }
-    return { blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash, tokens, at: reads.at, results, readMs: Math.round(performance.now() - start) };
+    const results = [...stamped.slice(0, 2), ...valid.flatMap((chunk, i) => chunk?.slice(2) ?? chunks[i].map((): McResult => ({ status: 'failure' })))];
+    return {
+      blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash,
+      tokens, at: reads.at, results, readMs: Math.round(performance.now() - start),
+      failedChunks: valid.filter((chunk) => chunk === null).length,
+    };
   }
 
   private async onBlock(r: BlockRead) {
     const started = performance.now();
     const generation = this.armGeneration;
     this.file.stats.blocks++;
-    await this.reconcileWallet(r.blockNumber);
+    const recovery = this.reconcileWallet(r.blockNumber);
+    if (CONFIG.forkMode) await recovery;
     const nextMaxBase = r.nextBaseFee;
     const gasPriceEth = Number(nextMaxBase) / 1e18;
     const cands: Candidate[] = [];
     const now = Date.now();
+    const ethUsd = this.host.ethUsd();
+    const minimumNet = validPrice(ethUsd) ? this.minimumNet(ethUsd) : 20_000_000_000_000n;
     let est: { net: number; gross: number; gas: number; symbol: string } | null = null;
     for (const [ti, t] of r.tokens.entries()) {
       const res = t.pools.map((p, pi) => reservesOf(t, p, r.results, r.at[ti][pi]));
@@ -413,11 +451,14 @@ export class MevSearcher {
         if (!est || estimatedNet > est.net) est = { net: estimatedNet, gross: cycle.profit, gas: gasEth, symbol: t.token.symbol };
         if (cycle.profit <= gasEth * 0.8) continue;
         const cd = this.cooldown.get(`${poolIdentity(A)}|${poolIdentity(B)}`);
-        if (cd && now < cd.until && cycle.profit < cd.est * cd.grow) continue;
+        if (cd && now < cd.until && cycle.profit < cd.est * cd.grow) {
+          const retry = cd.gasRetry;
+          if (!retry || retry.profit - BigInt(retry.gasUnits) * nextMaxBase <= minimumNet) continue;
+        }
         cands.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet, gasUnits });
       }
     }
-    const block = { number: Number(r.blockNumber), at: now, candidates: cands.length, readMs: r.readMs, decisionMs: null as number | null };
+    const block = { number: Number(r.blockNumber), at: now, candidates: cands.length, readMs: r.readMs, decisionMs: null as number | null, failedChunks: r.failedChunks };
     this.lastBlock = block;
     if (est) {
       const hb = this.hourBest();
@@ -436,9 +477,15 @@ export class MevSearcher {
     block.decisionMs = Math.round(performance.now() - started);
     const canTryLive = () => this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending();
     if (canTryLive()) {
-      for (const offer of offers) {
+      const prepared = await Promise.all(offers.map((offer) => this.prepareLive(offer, r)));
+      const ranked = prepared.filter((offer) => offer !== null).sort((a, b) => {
+        const byNet = a.net - b.net;
+        const difference = byNet === 0n ? a.tip - b.tip : byNet;
+        return difference > 0n ? -1 : difference < 0n ? 1 : 0;
+      });
+      for (const offer of ranked) {
         if (!canTryLive()) break;
-        await this.sendLive(offer, r, nextMaxBase, generation);
+        await this.sendLive(offer, r, generation);
       }
     } else {
       for (const offer of offers.reverse()) this.record(offer.opp);
@@ -474,7 +521,7 @@ export class MevSearcher {
     const contract = this.contractReady ? this.selectedContract : null;
     try {
       const data = encodeArbitrage(funding, { token: t.token.address, buy: A, sell: B, amountIn, minProfit: 1n, tip: 0n, maxBlock });
-      const res = await publicClient.call({
+      const res = await mevReadClient.call({
         account: this.host.account.address,
         blockNumber,
         to: contract ?? SIM_ADDR,
@@ -518,9 +565,9 @@ export class MevSearcher {
       sizeEth: c.dx, grossEth: 0, gasEth: eth(gasWei), tipEth: 0, netEth: 0, netUsd: 0, status: 'failed',
     };
     if (!best) {
-      const allReverted = sims.every((s) => !s.ok && s.reverted);
-      // RPC outages are transient. Reserve the long cooldown for confirmed contract reverts.
-      this.cooldown.set(key, { until: Date.now() + (allReverted ? HOUR : 30_000), est: c.est, grow: allReverted ? 3 : 1.5 });
+      // Block-specific execution failures and ambiguous reverts can clear on subsequent heads.
+      const structuralFailure = sims.every((s) => !s.ok && s.reverted && STRUCTURAL_REVERTS.has(s.reason));
+      this.cooldown.set(key, { until: Date.now() + (structuralFailure ? HOUR : 30_000), est: c.est, grow: structuralFailure ? 3 : 1.5 });
       opp.note = `simulation: ${sims.find((s) => !s.ok)?.reason ?? 'reverted'}`;
       this.record(opp);
       return null;
@@ -543,7 +590,10 @@ export class MevSearcher {
     if (net < minNetWei) {
       // estimate far above reality = an illusion of the quick math: back off for longer
       const illusion = Number(b.profit) / 1e18 < c.est * 0.1;
-      this.cooldown.set(key, illusion ? { until: Date.now() + HOUR, est: c.est, grow: 3 } : { until: Date.now() + 5 * 60_000, est: c.est, grow: 1.5 });
+      this.cooldown.set(key, {
+        until: Date.now() + (illusion ? HOUR : 5 * 60_000), est: c.est, grow: illusion ? 3 : 1.5,
+        gasRetry: { profit: b.profit, gasUnits: b.gasUnits },
+      });
       if (b.profit * 4n >= gasWei) { // only list near misses (gross at least a quarter of the gas), not dust
         opp.status = 'below gas';
         opp.note = 'below configured net profit floor';
@@ -551,6 +601,7 @@ export class MevSearcher {
       }
       return null;
     }
+    this.cooldown.delete(key);
     st.profitable++;
     const tip = this.builderTip(net, minNetWei);
     opp.tipEth = eth(tip);
@@ -571,67 +622,83 @@ export class MevSearcher {
     return proposed < room ? proposed : room;
   }
 
-  private async sendLive(offer: Offer, r: BlockRead, nextMaxBase: bigint, generation: number) {
-    const exec = this.host.exec;
-    const account = this.host.account;
+  private beforeNextSlot(r: BlockRead): boolean {
+    return CONFIG.forkMode || Date.now() < r.timestamp * 1000 + SLOT_MS;
+  }
+
+  private skipOpportunity(opp: MevOpp, note: string) {
+    opp.status = 'skipped';
+    opp.note = note;
+    this.record(opp);
+    return null;
+  }
+
+  private async prepareLive(offer: Offer, r: BlockRead): Promise<PreparedOffer | null> {
     const contract = this.selectedContract;
     const { candidate: c, opp } = offer;
-    const skip = (note: string) => { opp.status = 'skipped'; opp.note = note; this.record(opp); };
-    const blockFresh = () => CONFIG.forkMode || (Date.now() / 1000 - r.timestamp <= MAX_BLOCK_AGE_SECONDS);
-    const canSend = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
-      && !this.deploying && !this.host.tradePending() && blockFresh();
-    if (!contract || !canSend()) return skip('live execution is unavailable or the block is stale');
-    if (this.walletPending()) return skip('an earlier wallet transaction is still settling');
+    if (!contract) return this.skipOpportunity(opp, 'verified FlashArbV2 unavailable');
+    if (!this.beforeNextSlot(r)) return this.skipOpportunity(opp, 'target slot passed before gas estimation');
     const ethUsd = this.host.ethUsd();
-    if (!validPrice(ethUsd)) return skip('ETH/USD price unavailable');
+    if (!validPrice(ethUsd)) return this.skipOpportunity(opp, 'ETH/USD price unavailable');
     const minimumNet = this.minimumNet(ethUsd);
     const target = r.blockNumber + 1n;
     const encode = (tip: bigint, minProfit: bigint) => encodeArbitrage(offer.funding, {
       buy: c.A, sell: c.B, token: c.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
     });
-    let gas: bigint, tip: bigint, worstGas: bigint, data: Hex;
     try {
       // Estimate with the builder payment path enabled, then simulate the exact calldata and gas limit.
-      const estimate = await publicClient.estimateGas({ account, to: contract, data: encode(1n, 1n), blockNumber: r.blockNumber });
       this.file.stats.rpcCalls++;
-      gas = (estimate * 125n + 99n) / 100n;
-      worstGas = gas * nextMaxBase;
-      const afterGas = offer.profit - worstGas;
-      if (afterGas < minimumNet) return skip('below configured profit floor with padded gas');
-      tip = this.builderTip(afterGas, minimumNet);
-      if (tip === 0n) return skip('profit does not cover a builder payment above the configured floor');
-      data = encode(tip, tip + worstGas + minimumNet);
+      const estimate = await mevReadClient.estimateGas({ account: this.host.account, to: contract, data: encode(1n, 1n), blockNumber: r.blockNumber });
+      const gas = (estimate * 125n + 99n) / 100n;
+      const gasBudget = gas * r.nextBaseFee;
+      const afterGas = offer.profit - gasBudget;
+      if (afterGas < minimumNet) return this.skipOpportunity(opp, 'below configured profit floor with padded gas');
+      const tip = this.builderTip(afterGas, minimumNet);
+      if (tip === 0n) return this.skipOpportunity(opp, 'profit does not cover a builder payment above the configured floor');
+      const minimumProfit = tip + gasBudget + minimumNet;
+      return { offer, contract, ethUsd, gas, gasBudget, tip, minimumProfit, data: encode(tip, minimumProfit), net: afterGas - tip };
     } catch (e) {
       opp.status = 'failed';
       opp.note = `gas estimate: ${reasonOf(e)}`;
       this.record(opp);
-      return;
+      return null;
     }
-    if (!canSend() || this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
+  }
+
+  private async sendLive(prepared: PreparedOffer, r: BlockRead, generation: number) {
+    const exec = this.host.exec;
+    const account = this.host.account;
+    const { offer, contract, ethUsd, data, gas, gasBudget, tip, minimumProfit, net } = prepared;
+    const { opp } = offer;
+    const skip = (note: string) => { this.skipOpportunity(opp, note); };
+    const canSend = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
+      && !this.deploying && !this.host.tradePending() && this.beforeNextSlot(r);
+    if (!canSend()) return skip('target slot passed or MEV became unavailable before signing');
+    if (this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
+    const target = r.blockNumber + 1n;
     try {
       this.file.stats.rpcCalls++;
       const [result, nonce, balance] = await Promise.all([
-        publicClient.call({ account, to: contract, data, gas, blockNumber: r.blockNumber }),
+        mevReadClient.call({ account, to: contract, data, gas, blockNumber: r.blockNumber }),
         exec.bundleNonce(),
-        publicClient.getBalance({ address: account.address }),
+        mevReadClient.getBalance({ address: account.address }),
       ]);
-      if (!result.data || decodeArbitrage(result.data) < tip + worstGas + minimumNet) {
+      if (!result.data || decodeArbitrage(result.data) < minimumProfit) {
         return skip('final simulation returned insufficient profit');
       }
-      if (balance < worstGas) return skip('wallet ETH does not cover the padded gas budget');
+      if (balance < gasBudget) return skip('wallet ETH does not cover the padded gas budget');
       const head = await this.head();
       if (head.hash !== r.hash || !canSend()) return skip('block changed or MEV was disarmed before signing');
       const signed = await account.signTransaction({
         chainId: publicClient.chain.id, type: 'eip1559', to: contract, data, nonce, gas,
-        maxFeePerGas: nextMaxBase, maxPriorityFeePerGas: 0n, value: 0n,
+        maxFeePerGas: r.nextBaseFee, maxPriorityFeePerGas: 0n, value: 0n,
       });
       if (!canSend()) return skip('MEV was disarmed before sending');
       const hash = keccak256(signed);
-      const net = offer.profit - tip - worstGas;
       const startedAt = Date.now();
       const submission: BundleSubmission = {
         target: Number(target), startedAt, leadMs: r.timestamp * 1000 + SLOT_MS - startedAt,
-        gasEth: eth(worstGas), tipEth: eth(tip), netUsd: eth(net) * ethUsd, builders: [],
+        gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(net) * ethUsd, builders: [],
       };
       Object.assign(opp, {
         hash, status: 'sent', gasEth: submission.gasEth, tipEth: submission.tipEth,

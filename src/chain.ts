@@ -10,6 +10,23 @@ export const publicClient = createPublicClient({
   }),
 });
 
+const mevRpcOptions = { retryCount: 0, timeout: 3_500 };
+
+/** Keep time-sensitive quotes and heads out of the market/history request batches. */
+export const mevReadClient = CONFIG.forkMode ? publicClient : createPublicClient({
+  chain: mainnet,
+  transport: http(CONFIG.rpcUrl, {
+    ...mevRpcOptions,
+    batch: { batchSize: 12, wait: 0 },
+  }),
+});
+
+/** Individual pool chunks have independent deadlines. */
+export const mevPoolClient = CONFIG.forkMode ? publicClient : createPublicClient({
+  chain: mainnet,
+  transport: http(CONFIG.rpcUrl, mevRpcOptions),
+});
+
 /** Client used only to broadcast signed transactions (Flashbots Protect by default). */
 export const sendClient = createClient({
   chain: mainnet,
