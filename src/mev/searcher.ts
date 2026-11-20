@@ -22,6 +22,7 @@ const SIM_ADDR: Address = '0x00000000000000000000000000000000000ab1e5';
 const HOUR = 3_600_000;
 const IDLE_BID_AFTER_MS = 30 * 60_000;
 const SLOT_MS = 12_000;
+const FALLBACK_LEAD_MS = 5_000;
 const HEAD_RETRY_MS = 400;
 const POOL_READS_PER_CHUNK = 160;
 const RECEIPT_CONFIRMATIONS = 2n;
@@ -161,6 +162,19 @@ interface Offer {
   funding: RouteFunding;
   score: bigint;
   opp: MevOpp;
+}
+
+interface SimulatedSize {
+  amount: bigint;
+  profit: bigint;
+  funding: RouteFunding;
+  gasUnits: number;
+  net: bigint;
+}
+
+interface EvaluatedRoute {
+  primary: Offer | null;
+  fallback?: Offer;
 }
 
 interface PreparedOffer {
@@ -497,10 +511,14 @@ export class MevSearcher {
       const alternative = cands.find((c) => c.t.token.address !== leadingToken);
       if (alternative) selected[selected.length - 1] = alternative;
     }
-    const shortlisted = await Promise.all(selected.map((c) => this.evaluate(c, r, nextMaxBase, policy)));
-    const offers = shortlisted.filter((offer) => offer !== null).sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
-    block.decisionMs = Math.round(performance.now() - started);
     const canTryLive = () => this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending();
+    const canTryFallback = () => canTryLive() && !this.host.tradePending()
+      && (CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS);
+    const allowFallback = canTryFallback();
+    const shortlisted = await Promise.all(selected.map((c) => this.evaluate(c, r, nextMaxBase, policy, allowFallback)));
+    const offers = shortlisted.flatMap((route) => route?.primary ? [route.primary] : [])
+      .sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
+    block.decisionMs = Math.round(performance.now() - started);
     if (canTryLive()) {
       const prepared = await Promise.all(offers.map((offer) => this.prepareLive(offer, r, policy)));
       const ranked = prepared.filter((offer) => offer !== null).sort((a, b) => {
@@ -511,6 +529,22 @@ export class MevSearcher {
       for (const offer of ranked) {
         if (!canTryLive()) break;
         await this.sendLive(offer, r, generation);
+      }
+      // Keep the original submission path fast. Spend one more gas quote only when no primary was signed.
+      if (canTryFallback() && !offers.some((offer) => offer.opp.hash)) {
+        const [bestFallback] = shortlisted.flatMap((route) => route?.fallback ? [{ route, offer: route.fallback }] : [])
+          .sort((a, b) => a.offer.score > b.offer.score ? -1 : a.offer.score < b.offer.score ? 1 : 0);
+        if (bestFallback) {
+          const extra = await this.prepareLive(bestFallback.offer, r, policy);
+          if (extra && canTryLive() && !this.host.tradePending()) {
+            if (!bestFallback.route.primary) {
+              this.file.stats.profitable++;
+              const { A, B } = extra.offer.candidate;
+              this.cooldown.delete(`${poolIdentity(A)}|${poolIdentity(B)}`);
+            }
+            await this.sendLive(extra, r, generation);
+          }
+        }
       }
     } else {
       for (const offer of offers.reverse()) this.record(offer.opp);
@@ -563,7 +597,7 @@ export class MevSearcher {
     }
   }
 
-  private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy): Promise<Offer | null> {
+  private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy, allowFallback: boolean): Promise<EvaluatedRoute | null> {
     const st = this.file.stats;
     st.candidates++;
     const key = `${poolIdentity(c.A)}|${poolIdentity(c.B)}`;
@@ -574,15 +608,17 @@ export class MevSearcher {
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));
     st.rpcCalls += sims.length;
     st.simulated++;
-    let best: { amount: bigint; profit: bigint; funding: RouteFunding; gasUnits: number; net: bigint } | null = null;
+    const successful: SimulatedSize[] = [];
     for (let i = 0; i < sims.length; i++) {
       const s = sims[i];
       if (!s.ok) continue;
       const { amount, funding } = trials[i];
       const gasUnits = c.gasUnits + EXECUTION_GAS_ADDON[funding];
       const net = s.profit - BigInt(gasUnits) * nextMaxBase;
-      if (!best || net > best.net) best = { amount, funding, profit: s.profit, gasUnits, net };
+      successful.push({ amount, funding, profit: s.profit, gasUnits, net });
     }
+    successful.sort((a, b) => a.net > b.net ? -1 : a.net < b.net ? 1 : 0);
+    const [best, ...alternatives] = successful;
     const ethUsd = this.host.ethUsd();
     const gasWei = BigInt(best?.gasUnits ?? c.gasUnits) * nextMaxBase;
     const opp: MevOpp = {
@@ -603,7 +639,6 @@ export class MevSearcher {
       return null;
     }
     const b = best;
-    opp.funding = FUNDING_NAMES[b.funding];
     this.previousSizes.delete(key);
     this.previousSizes.set(key, { amount: b.amount, at: Date.now() });
     if (this.previousSizes.size > 512) {
@@ -612,11 +647,22 @@ export class MevSearcher {
     }
     const net = b.net;
     this.trackSim(eth(b.profit), eth(gasWei), c.t.token.symbol);
-    opp.sizeEth = eth(b.amount);
-    opp.grossEth = eth(b.profit);
-    opp.netEth = eth(net);
-    opp.netUsd = validPrice(ethUsd) ? opp.netEth * ethUsd : 0;
     const minNetWei = validPrice(ethUsd) ? this.minimumNet(ethUsd, policy) : 20_000_000_000_000n;
+    const makeOffer = (trial: SimulatedSize): Offer => {
+      const tip = trial.net >= minNetWei ? this.builderTip(trial.net, minNetWei, policy) : 0n;
+      const netEth = eth(trial.net - tip);
+      return {
+        candidate: c, amount: trial.amount, profit: trial.profit, funding: trial.funding, score: trial.net - tip,
+        opp: {
+          ...opp, sizeEth: eth(trial.amount), grossEth: eth(trial.profit),
+          gasEth: eth(BigInt(trial.gasUnits) * nextMaxBase), tipEth: eth(tip), netEth,
+          netUsd: validPrice(ethUsd) ? netEth * ethUsd : 0,
+          funding: FUNDING_NAMES[trial.funding], status: 'would send',
+          note: validPrice(ethUsd) ? 'paper estimate' : 'paper estimate, ETH/USD price unavailable',
+        },
+      };
+    };
+    const primary = makeOffer(b);
     if (net < minNetWei) {
       // estimate far above reality = an illusion of the quick math: back off for longer
       const illusion = Number(b.profit) / 1e18 < c.est * 0.1;
@@ -625,21 +671,25 @@ export class MevSearcher {
         gasRetry: { profit: b.profit, gasUnits: b.gasUnits },
       });
       if (b.profit * 4n >= gasWei) { // only list near misses (gross at least a quarter of the gas), not dust
-        opp.status = 'below gas';
-        opp.note = 'below configured net profit floor';
-        this.record(opp);
+        this.record({ ...primary.opp, status: 'below gas', note: 'below configured net profit floor' });
       }
-      return null;
+      // The size simulation is pinned, but its rough gas cost can overstate the padded execution cost.
+      return allowFallback && validPrice(ethUsd) && net + gasWei / 5n >= minNetWei
+        ? { primary: null, fallback: primary } : null;
     }
     this.cooldown.delete(key);
     st.profitable++;
-    const tip = this.builderTip(net, minNetWei, policy);
-    opp.tipEth = eth(tip);
-    opp.netEth = eth(net - tip);
-    opp.netUsd = validPrice(ethUsd) ? opp.netEth * ethUsd : 0;
-    opp.status = 'would send';
-    opp.note = validPrice(ethUsd) ? 'paper estimate' : 'paper estimate, ETH/USD price unavailable';
-    return { candidate: c, amount: b.amount, profit: b.profit, funding: b.funding, score: net - tip, opp };
+    const runnerUp = alternatives[0];
+    let fallback: Offer | undefined;
+    if (allowFallback && validPrice(ethUsd) && runnerUp) {
+      // A comparable loan provider avoids repeating the funding path that failed the exact checks.
+      const distinct = alternatives.find((trial) => trial.funding !== b.funding && trial.net >= minNetWei
+        && trial.net * 5n >= runnerUp.net * 4n);
+      const trial = distinct ?? runnerUp;
+      const trialGas = BigInt(trial.gasUnits) * nextMaxBase;
+      if (trial.net + trialGas / 5n >= minNetWei) fallback = makeOffer(trial);
+    }
+    return { primary, fallback };
   }
 
   private profitPolicy(now: number): ProfitPolicy {
