@@ -28,10 +28,13 @@ export function decodeArbitrage(data: Hex): bigint {
   return decodeFunctionResult({ abi: FLASH_ARB_V2_ABI, functionName: 'execute', data });
 }
 
-/** Compare financing at bounded representative sizes. Explicit lender modes use the full size grid. */
+/** Compare the reserve estimate and smallest trial for each lender. Explicit modes use the full grid. */
 export function fundingTrials(mode: MevFundingMode, sizes: bigint[]) {
   if (mode === 'pool') return sizes.map((amount) => ({ funding: 0 as const, amount }));
   if (mode === 'aave') return sizes.map((amount) => ({ funding: 1 as const, amount }));
   if (mode === 'morpho') return sizes.map((amount) => ({ funding: 2 as const, amount }));
-  return ([0, 1, 2] as const).flatMap((funding) => (funding === 0 ? sizes : sizes.slice(0, 1)).map((amount) => ({ funding, amount })));
+  if (!sizes.length) return [];
+  const smallest = sizes.reduce((a, b) => a < b ? a : b);
+  const lenderSizes = [...new Set([sizes[0], smallest])];
+  return ([0, 1, 2] as const).flatMap((funding) => (funding === 0 ? sizes : lenderSizes).map((amount) => ({ funding, amount })));
 }

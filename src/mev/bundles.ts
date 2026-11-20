@@ -4,6 +4,7 @@ import { keccak256, stringToHex, toHex, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
 import { CONFIG, DATA_DIR, MEV } from '../config.js';
 import { publicClient } from '../chain.js';
+import type { BuilderTraceStatus } from './builder-trace.js';
 
 const AUTH_FILE = path.join(DATA_DIR, 'flashbots-auth.key');
 let auth: PrivateKeyAccount | null = null;
@@ -30,6 +31,7 @@ export interface BuilderResult {
   detail: string;
   elapsedMs: number;
   bundleHash?: Hex;
+  traceStatus?: BuilderTraceStatus;
 }
 
 /** Retain only structured acknowledgements and error codes supplied by the relay. */
@@ -37,7 +39,7 @@ export function parseBuilderReply(value: unknown): Pick<BuilderResult, 'ok' | 'd
   if (!value || typeof value !== 'object') return { ok: false, detail: 'no valid bundle acknowledgement' };
   const reply = value as { jsonrpc?: unknown; id?: unknown; error?: { code?: unknown }; result?: { bundleHash?: unknown } };
   const hash = reply.result?.bundleHash;
-  if (reply.jsonrpc === '2.0' && reply.id === 1 && !reply.error && typeof hash === 'string' && /^0x[0-9a-f]{64}$/i.test(hash)) {
+  if (reply.jsonrpc === '2.0' && (reply.id === 1 || reply.id === '1') && !reply.error && typeof hash === 'string' && /^0x[0-9a-f]{64}$/i.test(hash)) {
     return { ok: true, detail: 'acknowledged', bundleHash: hash as Hex };
   }
   const code = reply.error?.code;
@@ -68,13 +70,22 @@ export async function sendBundle(signedTxs: Hex[], targetBlock: bigint, canSend:
     return out;
   }
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendBundle', params: [{ txs: signedTxs, blockNumber: toHex(targetBlock) }] });
-  const signer = authSigner();
-  // Flashbots auth: EIP-191 signature of the hex string of keccak256(body), sent as "address:signature"
-  const signature = await signer.signMessage({ message: keccak256(stringToHex(body)) });
+  const builders = MEV.builders.map((url) => ({ url, builder: new URL(url).hostname }));
+  const unsignedHeaders = { 'content-type': 'application/json' };
+  let signedHeaders: Record<string, string> | null = null;
+  if (builders.some(({ builder }) => builder !== 'rpc.beaverbuild.org')) {
+    try {
+      const signer = authSigner();
+      // Flashbots auth: EIP-191 signature of the hex string of keccak256(body), sent as "address:signature".
+      const signature = await signer.signMessage({ message: keccak256(stringToHex(body)) });
+      signedHeaders = { ...unsignedHeaders, 'x-flashbots-signature': `${signer.address}:${signature}` };
+    } catch { /* Beaverbuild and Quasar support unsigned submissions. */ }
+  }
   if (!allowed()) return [];
-  const headers = { 'content-type': 'application/json', 'x-flashbots-signature': `${signer.address}:${signature}` };
-  return Promise.all(MEV.builders.map(async (url): Promise<BuilderResult> => {
-    const builder = new URL(url).hostname;
+  if (!signedHeaders && !builders.some(({ builder }) => builder === 'rpc.beaverbuild.org' || builder === 'rpc.quasar.win')) return [];
+  return Promise.all(builders.map(async ({ url, builder }): Promise<BuilderResult> => {
+    const headers = builder === 'rpc.beaverbuild.org' ? unsignedHeaders : signedHeaders ?? (builder === 'rpc.quasar.win' ? unsignedHeaders : null);
+    if (!headers) return { builder, ok: false, detail: 'local builder signature unavailable', elapsedMs: 0 };
     const started = performance.now();
     const signal = AbortSignal.timeout(4_000);
     const elapsedMs = () => Math.round(performance.now() - started);

@@ -9,6 +9,7 @@ import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../e
 import type { McResult } from '../market.js';
 import { writeJson } from '../persistence.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
+import { bundleTraceRequests, requestBuilderTrace } from './builder-trace.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
 import { sendBundle, type BuilderResult } from './bundles.js';
 import { routeInputSizes } from './sizing.js';
@@ -23,6 +24,7 @@ const SLOT_MS = 12_000;
 const HEAD_RETRY_MS = 400;
 const POOL_READS_PER_CHUNK = 160;
 const RECEIPT_CONFIRMATIONS = 2n;
+const MAX_STARTUP_TRACE_BUNDLES = 6;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String(e)).split('\n')[0]).slice(0, 200);
 const eth = (wei: bigint) => Number(wei) / 1e18;
@@ -175,10 +177,19 @@ interface RouteCooldown {
   until: number;
   est: number;
   grow: number;
+  revertStreak?: number;
   gasRetry?: { profit: bigint; gasUnits: number };
 }
 
 const STRUCTURAL_REVERTS = new Set(['v2 factory', 'v3 factory', 'v4 key', 'pool parameters', 'same pool']);
+const ROUTE_RETRY_MS = 30_000;
+const MAX_REVERT_RETRY_MS = 5 * 60_000;
+const MAX_REVERT_STREAK = 5;
+
+function estimateChanged(estimate: number, cooldown: RouteCooldown): boolean {
+  return estimate >= cooldown.est * cooldown.grow
+    || (cooldown.revertStreak !== undefined && estimate <= cooldown.est / cooldown.grow);
+}
 
 /** Short revert reason from a viem error ("unprofitable", "transfer", ...). */
 function reasonOf(e: unknown): string {
@@ -193,6 +204,7 @@ function reasonOf(e: unknown): string {
  * sizes against that block. A live order must cover its gas budget, builder tip and configured profit floor.
  */
 export class MevSearcher {
+  private readonly scheduledTraces = new WeakSet<BuilderResult>();
   file: MevFile;
   tokens: ArbToken[] = [];
   status = 'starting';
@@ -289,7 +301,7 @@ export class MevSearcher {
     if (this.deploying) return 'Deploying FlashArbV2…';
     if (this.file.deployTx) return 'Waiting for the deployment transaction to settle';
     if (this.file.armed && !this.contractReady) return 'Verifying the FlashArbV2 contract…';
-    if (this.file.armed) return 'LIVE: a Flashbots bundle is sent whenever an arbitrage still pays after gas';
+    if (this.file.armed) return 'Live mode: eligible bundles go to the configured builders';
     return 'Paper mode: every block is scanned and simulated, nothing is sent';
   }
 
@@ -306,6 +318,10 @@ export class MevSearcher {
         this.status = 'Finding arbitrage pools failed; retrying';
         await sleep(Math.min(120_000, 15_000 * (i + 1)));
       }
+    }
+    let recoveredTraces = 0;
+    for (const outcome of this.file.recent) {
+      if (outcome?.status === 'not included' && this.traceMissedBundle(outcome) && ++recoveredTraces >= MAX_STARTUP_TRACE_BUNDLES) break;
     }
     void this.loop();
     if (this.universe.broad && !this.stopping) void this.discoverMorePools();
@@ -451,7 +467,7 @@ export class MevSearcher {
         if (!est || estimatedNet > est.net) est = { net: estimatedNet, gross: cycle.profit, gas: gasEth, symbol: t.token.symbol };
         if (cycle.profit <= gasEth * 0.8) continue;
         const cd = this.cooldown.get(`${poolIdentity(A)}|${poolIdentity(B)}`);
-        if (cd && now < cd.until && cycle.profit < cd.est * cd.grow) {
+        if (cd && now < cd.until && !estimateChanged(cycle.profit, cd)) {
           const retry = cd.gasRetry;
           if (!retry || retry.profit - BigInt(retry.gasUnits) * nextMaxBase <= minimumNet) continue;
         }
@@ -466,11 +482,11 @@ export class MevSearcher {
     }
     cands.sort((x, y) => y.estimatedNet - x.estimatedNet);
     const selected = cands.slice(0, MEV.maxSimsPerBlock);
-    const selectedTokens = new Set(selected.map((c) => c.t.token.address));
-    const alternative = cands.find((c) => !selectedTokens.has(c.t.token.address));
-    // Several pools can price the same spread. Give a competitive independent route a probe.
-    if (selected.length > 1 && selectedTokens.size === 1 && alternative && alternative.estimatedNet > Math.max(0, selected.at(-1)!.estimatedNet / 2)) {
-      selected[selected.length - 1] = alternative;
+    // A single exaggerated token estimate can otherwise fill every simulation slot.
+    const leadingToken = selected[0]?.t.token.address;
+    if (selected.length > 1 && selected.every((c) => c.t.token.address === leadingToken)) {
+      const alternative = cands.find((c) => c.t.token.address !== leadingToken);
+      if (alternative) selected[selected.length - 1] = alternative;
     }
     const shortlisted = await Promise.all(selected.map((c) => this.evaluate(c, r, nextMaxBase)));
     const offers = shortlisted.filter((offer) => offer !== null).sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
@@ -565,9 +581,14 @@ export class MevSearcher {
       sizeEth: c.dx, grossEth: 0, gasEth: eth(gasWei), tipEth: 0, netEth: 0, netUsd: 0, status: 'failed',
     };
     if (!best) {
-      // Block-specific execution failures and ambiguous reverts can clear on subsequent heads.
-      const structuralFailure = sims.every((s) => !s.ok && s.reverted && STRUCTURAL_REVERTS.has(s.reason));
-      this.cooldown.set(key, { until: Date.now() + (structuralFailure ? HOUR : 30_000), est: c.est, grow: structuralFailure ? 3 : 1.5 });
+      const allReverted = sims.every((s) => !s.ok && s.reverted);
+      const structuralFailure = allReverted && sims.every((s) => !s.ok && STRUCTURAL_REVERTS.has(s.reason));
+      const previousFailure = this.cooldown.get(key);
+      const previousStreak = previousFailure && !estimateChanged(c.est, previousFailure) ? previousFailure.revertStreak ?? 0 : 0;
+      // A provider error does not count as evidence that the route keeps reverting.
+      const revertStreak = allReverted ? Math.min(previousStreak + 1, MAX_REVERT_STREAK) : undefined;
+      const delay = structuralFailure ? HOUR : Math.min(ROUTE_RETRY_MS * 2 ** ((revertStreak ?? 1) - 1), MAX_REVERT_RETRY_MS);
+      this.cooldown.set(key, { until: Date.now() + delay, est: c.est, grow: structuralFailure ? 3 : 1.5, revertStreak });
       opp.note = `simulation: ${sims.find((s) => !s.ok)?.reason ?? 'reverted'}`;
       this.record(opp);
       return null;
@@ -876,6 +897,29 @@ export class MevSearcher {
       throw e;
     }
     this.releaseBundle();
+    if (outcome.status === 'not included') this.traceMissedBundle(outcome);
+  }
+
+  /** Collect builder diagnostics after chain settlement without delaying scans or nonce release. */
+  private traceMissedBundle(outcome: MevOpp) {
+    const submission = outcome.submission;
+    if (CONFIG.forkMode || this.stopping || !submission || !Array.isArray(submission.builders)) return false;
+    let scheduled = false;
+    for (const request of bundleTraceRequests(submission.builders, MEV.builders, submission.startedAt)) {
+      if (this.scheduledTraces.has(request.builder)) continue;
+      this.scheduledTraces.add(request.builder);
+      scheduled = true;
+      setTimeout(() => {
+        if (this.stopping) return;
+        void requestBuilderTrace(request).then((status) => {
+          if (this.stopping || !status) return;
+          request.builder.traceStatus = status;
+          if (this.file.recent.includes(outcome)) this.save();
+          this.host.log(`[mev] ${request.builder.builder} trace for target block ${submission.target}: ${status}.`);
+        });
+      }, request.waitMs).unref();
+    }
+    return scheduled;
   }
 
   /** Keeps the newest 60 results; repeats of the same route and outcome within 10 minutes are merged. */

@@ -40,7 +40,7 @@ async function refresh() {
     render();
   } catch (e) {
     $('banner').className = 'banner bad';
-    $('bannerText').textContent = 'Cannot reach the local bot. Start it with npm start and check the terminal output.';
+    $('bannerText').textContent = 'Dashboard data is unavailable. Retrying automatically.';
   }
 }
 
@@ -228,21 +228,23 @@ function render() {
       coverage + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
     const st = X.stats;
     $('mevBlocks').textContent = st.blocks.toLocaleString();
-    const B = X.bestThisHour;
-    const bestVal = !B ? '–' : B.grossUsd != null
+    const B = X.bestThisHour?.exact ? X.bestThisHour : null;
+    const bestVal = !B ? '<span class="sub">No successful simulation this hour</span>' : B.grossUsd != null
       ? `<span class="${B.grossUsd > B.gasUsd ? 'pos' : ''}">${usd(B.grossUsd)}</span> <span class="sub">vs ${usd(B.gasUsd)} gas</span>`
       : `${B.grossEth.toFixed(5)} <span class="sub">vs ${B.gasEth.toFixed(5)} ETH gas</span>`;
-    $('mevGap').innerHTML = bestVal + (B ? `<div class="sub">${esc(B.symbol || '')} · ${B.exact ? 'exact simulation' : 'estimate'}</div>` : '');
+    $('mevGap').innerHTML = bestVal + (B ? `<div class="sub">${esc(B.symbol)} · before builder bid</div>` : '');
     $('mevSims').textContent = `${st.simulated} / ${st.profitable}`;
     $('mevBundles').textContent = `${st.bundles} / ${st.landed}`;
     $('mevProfit').innerHTML = `<span class="${cls(st.netEth)}">${st.netEth.toFixed(5)} ETH</span> <span class="sub">${usd(st.netUsd)}</span>`;
     $('mevRpc').textContent = st.rpcCalls.toLocaleString();
     const rTag = { landed: 'buy', 'would send': 'buy', sent: 'sell', failed: 'down' };
-    $('mevBody').innerHTML = (X.recent || []).length ? X.recent.map((o) => `<tr><td>${hm(o.t)}</td><td><b>${esc(o.symbol)}</b></td>
+    const mevBody = $('mevBody');
+    const openBundles = new Set(Array.from(mevBody.querySelectorAll('details[open]'), (item) => item.dataset.target));
+    mevBody.innerHTML = (X.recent || []).length ? X.recent.map((o) => `<tr><td>${hm(o.t)}</td><td><b>${esc(o.symbol)}</b></td>
       <td class="why">${esc(o.buy)} → ${esc(o.sell)}${o.funding ? `<div class="sub">${esc(o.funding)}</div>` : ''}</td><td class="r">${o.sizeEth.toFixed(3)}</td><td class="r">${o.grossEth.toFixed(5)}</td>
       <td class="r">${o.gasEth.toFixed(5)}</td><td class="r ${cls(o.netEth)}">${o.netEth.toFixed(5)}</td>
       <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
-      <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}${bundleDetails(o.submission)}</td></tr>`).join('')
+      <span class="why">${esc(o.note || '')}</span>${o.hash && o.status === 'landed' ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}${bundleDetails(o.submission, openBundles)}</td></tr>`).join('')
       : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
   }
   renderMevControls(X);
@@ -263,14 +265,15 @@ function render() {
   ].map(([a, v]) => `<span>${a}</span><span>${v}</span>`).join('');
 }
 
-function bundleDetails(submission) {
+function bundleDetails(submission, openBundles) {
   if (!submission) return '';
   const { target, leadMs, netUsd, gasEth, tipEth, builders } = submission;
   const timing = `${(Math.abs(leadMs) / 1000).toFixed(2)}s ${leadMs >= 0 ? 'before' : 'after'} expected slot`;
-  return `<details class="sub"><summary>Bundle for block ${esc(target)}</summary>
+  const open = openBundles.has(String(target)) ? ' open' : '';
+  return `<details class="sub" data-target="${esc(target)}"${open}><summary>Bundle for block ${esc(target)}</summary>
     <div>${timing} · quoted net ${usd(netUsd)}</div>
     <div>Gas budget ${gasEth.toFixed(6)} ETH · builder bid ${tipEth.toFixed(6)} ETH</div>
-    ${builders.map((builder) => `<div title="${esc(builder.bundleHash || '')}">${esc(builder.builder)} · ${esc(builder.detail)} · ${esc(builder.elapsedMs)} ms</div>`).join('')}
+    ${builders.map((builder) => `<div title="${esc(builder.bundleHash || '')}">${esc(builder.builder)} · ${esc(builder.detail)} · ${esc(builder.elapsedMs)} ms${builder.traceStatus ? ` · trace ${esc(builder.traceStatus)}` : ''}</div>`).join('')}
     </details>`;
 }
 
