@@ -218,19 +218,22 @@ async function sellFixtureTokensOnSushi() {
   }));
 }
 
-type OneShotMode = 'gas-only' | 'break-even';
+type DirectTestMode = 'gas-only' | 'break-even' | 'premium';
 
-async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, profit: bigint, funding: RouteFunding, mode?: OneShotMode) {
+async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, profit: bigint, funding: RouteFunding, mode?: DirectTestMode) {
   const gasOnly = mode === 'gas-only';
   const breakEven = mode === 'break-even';
+  const oneShot = gasOnly || breakEven;
+  const premium = mode === 'premium';
   const saved = { submission: MEV.submission, directMinNetUsd: MEV.directMinNetUsd,
-    directMaxGasUsd: MEV.directMaxGasUsd, directDailyGasUsd: MEV.directDailyGasUsd };
+    directMaxGasUsd: MEV.directMaxGasUsd, directDailyGasUsd: MEV.directDailyGasUsd, directPremiumMaxGasUsd: MEV.directPremiumMaxGasUsd };
   const maximumTestGasUsd = 1.5;
   Object.assign(MEV, {
     submission: 'direct', directMinNetUsd: breakEven ? 2_000 : 0.01,
-    directMaxGasUsd: gasOnly ? maximumTestGasUsd : 100, directDailyGasUsd: gasOnly ? 4 : 100,
+    directMaxGasUsd: gasOnly || premium ? maximumTestGasUsd : 100,
+    directDailyGasUsd: gasOnly || premium ? 4 : 100, directPremiumMaxGasUsd: premium ? 20 : 0,
   });
-  const ethUsd = 2_000;
+  const ethUsd = premium ? 4_000 : 2_000;
   const logs: string[] = [];
   const searcher = new MevSearcher({
     account: owner, exec: new LiveExecutor(owner), ethUsd: () => ethUsd, tradePending: () => false,
@@ -287,9 +290,16 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
         'the ordinary profit floor remains in effect for normal orders');
       searcher.queueGasOnlyTest(testId, maximumTestGasUsd, true);
     }
-    const prepared = await searcher['prepareLive'](offer, point, policy, mode ? searcher['queuedTest'] ?? undefined : undefined);
+    const prepared = await searcher['prepareLive'](offer, point, policy, oneShot ? searcher['queuedTest'] ?? undefined : undefined);
     assert.ok(prepared, opp.note);
-    if (mode) {
+    if (premium) {
+      assert.equal(prepared.premium, true);
+      assert.ok(prepared.fees.maxPriorityFeePerGas > BigInt(Math.round(MEV.directMaxPriorityGwei * 1e9)));
+      assert.ok(prepared.minimumProfit >= 2n * prepared.gasBudget);
+      assert.ok(prepared.minimumProfit - prepared.gasBudget >= parseEther('0.00125'));
+      assert.ok(Number(prepared.gasBudget) * ethUsd / 1e18 <= MEV.directPremiumMaxGasUsd);
+    }
+    if (oneShot) {
       const pinned = decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data: prepared.data });
       assert.equal(pinned.functionName, 'executePinned');
       assert.equal(pinned.args[0], implementationHash);
@@ -308,7 +318,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     assert.deepEqual(submitted.recent[0]?.submission?.builders, []);
     assert.equal(submitted.stats.bundles, bundles);
     assert.equal(submitted.stats.directAttempts, directAttempts + 1);
-    if (mode) {
+    if (oneShot) {
       assert.equal(submitted.gasOnlyTest?.status, 'submitted');
       assert.equal(submitted.gasOnlyTest?.hash, submitted.pending.hash);
     }
@@ -330,7 +340,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     } else {
       assert.ok(netUsd > 0, 'settled direct route covered actual gas');
     }
-    if (mode) {
+    if (oneShot) {
       assert.equal(settled.gasOnlyTest?.status, 'landed');
       assert.equal(settled.gasOnlyTest?.hash, receipt.transactionHash);
       const sent = await publicClient.getTransaction({ hash: receipt.transactionHash });
@@ -357,7 +367,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
   }
 }
 
-async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: RouteFunding, direct: boolean | OneShotMode = false) {
+async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: RouteFunding, direct: boolean | DirectTestMode = false) {
   const point = await fork.snapshot();
   try {
     const maxBlock = (await publicClient.getBlockNumber({ cacheTime: 0 })) + 3n;
@@ -464,7 +474,7 @@ if (useProxy) {
     await verifyCurveUpgrade(curve);
     const beforeCurve = await fork.snapshot();
     await buyFixtureTokens(sushiV2Router, parseEther('18'));
-    await testRoute('Curve Tricrypto buy with SparkLend through the direct searcher', curve, sushiV2, 4, true);
+    await testRoute('Curve Tricrypto buy with SparkLend through the premium direct searcher', curve, sushiV2, 4, 'premium');
     await testRoute('One-shot direct SparkLend test under the gas cap', curve, sushiV2, 4, 'gas-only');
     await fork.revert({ id: beforeCurve });
   }

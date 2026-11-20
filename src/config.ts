@@ -189,6 +189,22 @@ export const RISK = {
   gasUnits: { approve: 60_000, swap1Hop: 150_000, swap2Hop: 230_000 },
 };
 
+function directBroadcastRpcUrls(): string[] {
+  if (CONFIG.forkMode) return [];
+  const additions = str('MEV_DIRECT_BROADCAST_RPC_URLS').split(',').map((url) => url.trim()).filter(Boolean);
+  const primary = URL.canParse(CONFIG.rpcUrl) ? new URL(CONFIG.rpcUrl).href : CONFIG.rpcUrl;
+  const unique = new Set<string>();
+  for (const url of additions) {
+    const parsed = URL.canParse(url) ? new URL(url) : null;
+    if (parsed?.protocol !== 'https:' || parsed.username || parsed.password || parsed.href.includes('#')) {
+      throw new Error('MEV_DIRECT_BROADCAST_RPC_URLS must contain HTTPS URLs without embedded credentials or fragments');
+    }
+    if (parsed.href !== primary) unique.add(parsed.href);
+  }
+  if (unique.size > 2) throw new Error('MEV_DIRECT_BROADCAST_RPC_URLS allows up to two additional endpoints');
+  return [...unique];
+}
+
 /**
  * MEV arbitrage searcher: watches every token that has 2+ WETH pools (Uniswap v3 fee tiers, Uniswap v2, SushiSwap),
  * and when the same token is cheaper in one pool than another, buys in the cheap pool and sells in the dear one in a
@@ -208,8 +224,10 @@ export const MEV = {
   directCadenceMaxRoutes: num('MEV_DIRECT_CADENCE_MAX_ROUTES', 8),
   directMinNetUsd: num('MEV_DIRECT_MIN_NET_USD', mevMinNetUsd),
   directMaxGasUsd: num('MEV_DIRECT_MAX_GAS_USD', 0),
+  directPremiumMaxGasUsd: num('MEV_DIRECT_PREMIUM_MAX_GAS_USD', 0),
   directDailyGasUsd: num('MEV_DIRECT_DAILY_GAS_USD', 0),
   directMaxPriorityGwei: num('MEV_DIRECT_MAX_PRIORITY_GWEI', 0.25),
+  directBroadcastRpcUrls: directBroadcastRpcUrls(),
   funding: str('MEV_FUNDING', 'auto') as MevFundingMode,
   v2ContractAddress: configuredMevV2 ? getAddress(configuredMevV2) : null,
   v3ContractAddress: configuredMevV3 ? getAddress(configuredMevV3) : null,
@@ -267,6 +285,9 @@ check(Number.isInteger(MEV.directCadenceMaxRoutes) && MEV.directCadenceMaxRoutes
 check(MEV.directMinNetUsd > 0, 'MEV_DIRECT_MIN_NET_USD must be > 0');
 check(MEV.directMaxGasUsd >= 0 && MEV.directDailyGasUsd >= MEV.directMaxGasUsd,
   'MEV direct gas limits must be nonnegative and the daily limit must cover one transaction');
+check(MEV.directPremiumMaxGasUsd >= 0 && MEV.directPremiumMaxGasUsd <= 20
+  && (MEV.directPremiumMaxGasUsd === 0 || MEV.directPremiumMaxGasUsd >= MEV.directMaxGasUsd),
+  'MEV_DIRECT_PREMIUM_MAX_GAS_USD must be zero or between the regular per-transaction gas cap and $20');
 check(MEV.directMaxPriorityGwei >= 1e-9 && MEV.directMaxPriorityGwei <= 10,
   'MEV_DIRECT_MAX_PRIORITY_GWEI must be between 0.000000001 and 10');
 check(MEV.minPoolWeth >= 0.1, 'MEV_MIN_POOL_WETH must be >= 0.1');

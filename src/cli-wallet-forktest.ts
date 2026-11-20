@@ -12,7 +12,7 @@ import { assertForkTestEnvironment } from './forktest-env.js';
 import { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_BYTECODE, FLASH_ARB_PROXY_RUNTIME } from './mev/artifact-proxy.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './mev/artifact-v2.js';
 import { FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from './mev/artifact-v3.js';
-import { submitDirect } from './mev/direct.js';
+import { submitDirect } from './mev/direct-broadcast.js';
 import { encodeArbitrage } from './mev/flash-arb.js';
 import { NextVenueKind } from './mev/next-pools.js';
 import { pinnedArbitrage, proxyCreationData, proxyReleaseHash, verifyFlashProxy } from './mev/proxy.js';

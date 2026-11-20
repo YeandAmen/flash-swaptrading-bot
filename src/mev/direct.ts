@@ -1,13 +1,5 @@
-import { createClient, http, keccak256, parseGwei, type Address, type Hex } from 'viem';
-import { sendRawTransaction } from 'viem/actions';
-import { mainnet } from 'viem/chains';
+import { parseGwei, type Address, type Hex } from 'viem';
 import { MIN_PRIORITY_FEE_WEI, mevReadClient } from '../chain.js';
-import { CONFIG } from '../config.js';
-
-const directClient = createClient({
-  chain: mainnet,
-  transport: http(CONFIG.rpcUrl, { retryCount: 0, timeout: 3_500, fetchOptions: { redirect: 'error' } }),
-});
 
 const PRIORITY_CACHE_MS = 24_000;
 const DEFAULT_PRIORITY_FEE = parseGwei('0.1');
@@ -18,7 +10,7 @@ let readingTip: Promise<void> | undefined;
 export async function directPriorityFee(maximumWei: bigint, faster = false): Promise<bigint> {
   if (maximumWei <= 0n) throw new RangeError('Direct priority fee cap must be positive');
   if (!cachedTip || Date.now() >= cachedTip.expiresAt) {
-    readingTip ??= mevReadClient.getFeeHistory({ blockCount: 10, rewardPercentiles: [50, 75] })
+    readingTip ??= mevReadClient.getFeeHistory({ blockCount: 10, rewardPercentiles: [50, 90] })
       .then(({ reward }) => {
         const [ordinary, expedited] = [0, 1].map((index) => {
           const samples = (reward ?? []).flatMap((row) => row[index] === undefined ? [] : [row[index]])
@@ -54,20 +46,13 @@ export function directFees(nextBaseWei: bigint, priorityWei: bigint, horizon: nu
   return { maxFeePerGas: ceiling + priorityWei, maxPriorityFeePerGas: priorityWei };
 }
 
-/** Publish once through Ethereum JSON-RPC. A timeout still leaves the transaction unresolved. */
-export async function submitDirect(serialized: Hex): Promise<Hex> {
-  if (!CONFIG.allowLiveTrading && !CONFIG.forkMode) throw new Error('Live transaction canceled before broadcast');
-  const expected = keccak256(serialized);
-  let acknowledged: Hex;
-  try {
-    acknowledged = await sendRawTransaction(directClient, { serializedTransaction: serialized });
-  } catch {
-    throw new Error('The Ethereum RPC did not acknowledge the direct MEV transaction');
-  }
-  if (typeof acknowledged !== 'string' || acknowledged.toLowerCase() !== expected) {
-    throw new Error('The Ethereum RPC returned an unexpected transaction hash');
-  }
-  return expected;
+/** Clamp a next-block fee to what the order can pay at its full gas limit. */
+export function affordableDirectFees(nextBaseWei: bigint, gas: bigint, desiredTip: bigint,
+  minimumTip: bigint, availableWei: bigint) {
+  if (gas <= 0n || availableWei < 0n) return null;
+  const affordableTip = availableWei / gas - nextBaseWei;
+  const tip = affordableTip < desiredTip ? affordableTip : desiredTip;
+  return tip >= minimumTip ? directFees(nextBaseWei, tip, 1) : null;
 }
 
 /**

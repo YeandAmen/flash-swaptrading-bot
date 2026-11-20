@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { encodePacked, formatUnits, parseEther, parseUnits, type Hex } from 'viem';
-import { ADDR, CONFIG, DATA_DIR, GAS_TOPUP, ML, RISK, STRATEGY, TOKENS, USDC_DECIMALS, type TokenCfg } from './config.js';
-import { publicClient } from './chain.js';
+import { ADDR, CONFIG, DATA_DIR, GAS_TOPUP, MEV, ML, RISK, STRATEGY, TOKENS, USDC_DECIMALS, type TokenCfg } from './config.js';
+import { erc20Abi, publicClient } from './chain.js';
 import { appendRotatingLog, readLogTail, redactDiagnostic } from './diagnostics.js';
 import { writeJson } from './persistence.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
@@ -60,6 +60,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const usd = (x: number) => `$${x.toFixed(2)}`;
 const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String(e)).split('\n')[0]).slice(0, 300);
 const HOUR = 3_600_000;
+const MEV_GAS_DEMAND_MS = 90_000;
 const positive = (value: number | undefined): value is number => value !== undefined && Number.isFinite(value) && value > 0;
 const liveEnabled = () => CONFIG.allowLiveTrading || CONFIG.forkMode;
 
@@ -103,6 +104,7 @@ export class Engine {
   private lastResearchAt = 0;
   private researchWorker: Worker | null = null;
   private lastGasWarn = 0;
+  private mevGasDemand: { gasWei: bigint; expiresAt: number; armedAt: number; epoch: number } | null = null;
   private liveActed = false; // a live buy/sell was attempted this tick
   private entryEpoch = 0;
   private disarmEpoch = 0;
@@ -307,6 +309,7 @@ export class Engine {
           baseFeeGwei: () => (this.snap && this.isCurrent(this.snap) ? this.snap.baseFeeGwei : null),
           tokens: () => this.market.tokens.map((t) => t.token),
           tradePending: () => !!this.state.pending || !!this.liveFault || this.stopping || this.panicActive,
+          requestGasTopUp: (gasWei) => this.requestMevGasTopUp(gasWei),
         });
         this.startupStep = 'First market snapshot';
         await this.tick();
@@ -684,6 +687,12 @@ export class Engine {
     if (Date.now() - this.lastGasWarn > 30 * 60_000) { this.lastGasWarn = Date.now(); this.log(`[live] ${msg}`, 'warn'); }
   }
 
+  private requestMevGasTopUp(gasWei: bigint) {
+    const mev = this.mev?.file;
+    if (!GAS_TOPUP.enabled || !this.state.armed || !mev?.armed || mev.armedAt === null || gasWei <= 0n) return;
+    this.mevGasDemand = { gasWei, expiresAt: Date.now() + MEV_GAS_DEMAND_MS, armedAt: mev.armedAt, epoch: this.entryEpoch };
+  }
+
   /** Buys a little ETH for gas with USDC when the wallet runs low (approve + swap + unwrap, journaled like trades). */
   private async maybeTopUpGas(snap: Snapshot) {
     if (!GAS_TOPUP.enabled || !this.state.armed || !this.canTrade(snap) || this.state.pending) return;
@@ -695,7 +704,12 @@ export class Engine {
     const exitNeed = live.positions.reduce((s, p) => s + this.ethForSwap(snap, this.findTm(p.symbol)?.hops ?? 2), 0);
     const critical = live.positions.length > 0 && eth < exitNeed * 1.5;
     const entriesPossible = (this.mlActive || this.regime.riskOn) && !live.halted && !this.state.entriesPaused && !(live.pausedUntil && now < live.pausedUntil);
-    if (!critical) {
+    const demand = this.mevGasDemand;
+    const demandArmed = () => !!demand && this.mev?.file.armed === true
+      && this.mev.file.armedAt === demand.armedAt && this.entryEpoch === demand.epoch;
+    const replenishMev = !critical && demand && demandArmed() && demand.expiresAt > now
+      && b.eth < demand.gasWei && MEV.directPremiumMaxGasUsd > 0;
+    if (!critical && !replenishMev) {
       if (eth >= GAS_TOPUP.belowEth) return; // fixed trigger: a gas spike must not make the bot buy ever more ETH
       if (live.positions.length === 0 && !entriesPossible) return; // nothing to spend gas on yet (e.g. risk-off): keep the USDC
     }
@@ -705,24 +719,71 @@ export class Engine {
     if (recent.length >= GAS_TOPUP.maxPerDay) { this.warnLive(`Daily gas top-up limit (${GAS_TOPUP.maxPerDay}) reached; ETH ${eth.toFixed(5)}`); return; }
     if (eth < this.ethForSwap(snap, 1) * 1.2) { this.warnLive(`ETH (${eth.toFixed(5)}) is too low even to buy gas. Send ~0.001 ETH once; after that the bot refills itself.`); return; }
     const usdc = Number(formatUnits(b.usdc, USDC_DECIMALS));
-    const amount = Math.floor(Math.min(GAS_TOPUP.usd, usdc * (critical ? 1 : 0.25)) * 100) / 100;
+    const poolFee = this.market.usdcWeth.fee;
+    const path = encodePacked(['address', 'uint24', 'address'], [ADDR.usdc, poolFee, ADDR.weth]);
+    const maxGasShare = critical ? 0.6 : 0.3;
+    const spotGasEth = (RISK.gasUnits.approve + RISK.gasUnits.swap1Hop + 40_000) * (snap.baseFeeGwei + snap.tipGwei) * 1e-9;
+    let amount = Math.floor(Math.min(GAS_TOPUP.usd, usdc * (critical ? 1 : 0.25)) * 100) / 100;
+    let gasCostEth = spotGasEth;
+    let minimumEthOut: bigint | undefined;
+    if (replenishMev) {
+      const wallet = this.wallet.account.address;
+      const [currentEth, currentUsdc] = await Promise.all([
+        publicClient.getBalance({ address: wallet, blockTag: 'latest' }),
+        publicClient.readContract({ address: ADDR.usdc, abi: erc20Abi, functionName: 'balanceOf', args: [wallet], blockTag: 'latest' }),
+      ]);
+      if (currentEth >= demand.gasWei) {
+        if (this.mevGasDemand === demand) this.mevGasDemand = null;
+        return;
+      }
+      if (this.mevGasDemand !== demand || !demandArmed() || Date.now() >= demand.expiresAt) return;
+      // Allow for a reset and an approval, the swap and unwrap, and the executor's padded fee ceiling.
+      gasCostEth = (2 * RISK.gasUnits.approve + RISK.gasUnits.swap1Hop + 40_000)
+        * 1.3 * (2 * snap.baseFeeGwei + snap.tipGwei) * 1e-9;
+      const gasCostWei = BigInt(Math.ceil(gasCostEth * 1e18));
+      if (currentEth < gasCostWei) {
+        this.warnLive('The wallet does not have enough ETH to pay for the USDC gas top-up transaction.');
+        return;
+      }
+      const slippageFactor = (10_000 - RISK.maxSlippageBps) / 10_000;
+      const refill = demand.gasWei - currentEth + gasCostWei;
+      const efficiencyFloor = (gasCostWei * 10n + 2n) / 3n; // Own gas must stay at most 30% of the ETH bought.
+      minimumEthOut = refill > efficiencyFloor ? refill : efficiencyFloor;
+      const requiredUsd = Number(formatUnits(minimumEthOut, 18)) * snap.ethUsd;
+      amount = Math.ceil(Math.max(1, requiredUsd / (slippageFactor * (1 - poolFee / 1e6))) * 100) / 100;
+      if (amount > Math.min(MEV.directPremiumMaxGasUsd, Number(formatUnits(currentUsdc, USDC_DECIMALS)))) {
+        this.warnLive(`The MEV gas shortfall needs about ${usd(amount)} USDC, above the available balance or gas refill limit.`);
+        return;
+      }
+      const quote = await quoteExactIn(path, parseUnits(amount.toFixed(6), USDC_DECIMALS));
+      const minimumOut = quote.amountOut * BigInt(10_000 - RISK.maxSlippageBps) / 10_000n;
+      if (minimumOut < minimumEthOut) {
+        this.warnLive('The USDC gas top-up would not cover the MEV gas shortfall at the current quote.');
+        return;
+      }
+      if (this.mevGasDemand !== demand || !demandArmed() || Date.now() >= demand.expiresAt
+        || !this.canTrade(snap) || this.state.pending || this.panicActive) return;
+      this.mevGasDemand = null;
+    }
     if (amount < 1) { this.warnLive(`ETH is low (${eth.toFixed(5)}) but there is no free USDC to buy gas with`); return; }
-    // efficiency: the top-up's own gas must stay a small part of the ETH it buys
-    const selfGasEth = (RISK.gasUnits.approve + RISK.gasUnits.swap1Hop + 40_000) * (snap.baseFeeGwei + snap.tipGwei) * 1e-9;
     const ethBought = amount / snap.ethUsd;
-    if (selfGasEth > ethBought * (critical ? 0.6 : 0.3)) {
-      this.warnLive(`Gas is expensive (${snap.baseFeeGwei.toFixed(1)} gwei): a ${usd(amount)} top-up would burn ${((selfGasEth / ethBought) * 100).toFixed(0)}% of itself. Waiting.`);
+    if (gasCostEth > ethBought * maxGasShare) {
+      this.warnLive(`Gas is expensive (${snap.baseFeeGwei.toFixed(1)} gwei): a ${usd(amount)} top-up would burn ${((gasCostEth / ethBought) * 100).toFixed(0)}% of itself. Waiting.`);
       return;
     }
 
     const usdcIn = parseUnits(amount.toFixed(6), USDC_DECIMALS);
-    const path = encodePacked(['address', 'uint24', 'address'], [ADDR.usdc, this.market.usdcWeth.fee, ADDR.weth]);
-    this.log(`[live] Gas is low (${eth.toFixed(5)} ETH): buying ${usd(amount)} of ETH with USDC`, 'trade');
+    const reason = replenishMev ? 'MEV gas top-up' : 'gas top-up';
+    this.log(replenishMev
+      ? `[live] MEV gas shortfall: buying ${usd(amount)} of ETH with USDC for future routes`
+      : `[live] Gas is low (${eth.toFixed(5)} ETH): buying ${usd(amount)} of ETH with USDC`, 'trade');
     const epoch = this.entryEpoch;
-    const canSend = () => this.state.armed && epoch === this.entryEpoch && this.canTrade(snap);
+    const canSend = () => this.state.armed && epoch === this.entryEpoch && !this.panicActive && this.canTrade(snap)
+      && (!replenishMev || (demandArmed() && Date.now() < demand.expiresAt));
     try {
-      const journal = this.journal({ side: 'GAS', symbol: 'ETH', amountIn: usdcIn.toString(), reason: 'gas top-up', stopPct: 0, targetPct: 0, mid: snap.ethUsd });
-      const r = await this.liveExec.topUpGas(usdcIn, path, RISK.maxSlippageBps, snap.ethUsd, journal.onSwapSigned, (m) => this.log(`[live] ${m}`), journal.onApprovalSigned, canSend);
+      const journal = this.journal({ side: 'GAS', symbol: 'ETH', amountIn: usdcIn.toString(), reason, stopPct: 0, targetPct: 0, mid: snap.ethUsd });
+      const r = await this.liveExec.topUpGas(usdcIn, path, RISK.maxSlippageBps, snap.ethUsd,
+        journal.onSwapSigned, (m) => this.log(`[live] ${m}`), journal.onApprovalSigned, canSend, minimumEthOut);
       this.bookGasTopup(r.usdcIn, r.ethOut, r.gasUsd, r.blockNumber);
     } catch (e) {
       this.discardUnsigned();

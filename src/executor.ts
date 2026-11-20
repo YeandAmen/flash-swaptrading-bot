@@ -353,16 +353,19 @@ export class LiveExecutor implements Executor {
    * Gas top-up: swap `usdcIn` USDC -> WETH and unwrap to native ETH in one transaction.
    * Returns USDC spent and ETH received (read from the WETH Withdrawal event).
    */
-  async topUpGas(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void, onApprovalSigned?: (hash: Hex) => void, canSend?: () => boolean) {
-    return this.exclusive(() => this.topUpGasNow(usdcIn, path, slippageBps, ethUsd, onSigned, log, onApprovalSigned, canSend));
+  async topUpGas(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void, onApprovalSigned?: (hash: Hex) => void, canSend?: () => boolean, minimumEthOut?: bigint) {
+    return this.exclusive(() => this.topUpGasNow(usdcIn, path, slippageBps, ethUsd, onSigned, log, onApprovalSigned, canSend, minimumEthOut));
   }
 
-  private async topUpGasNow(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void, onApprovalSigned?: (hash: Hex) => void, canSend?: () => boolean) {
+  private async topUpGasNow(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void, onApprovalSigned?: (hash: Hex) => void, canSend?: () => boolean, minimumEthOut?: bigint) {
     const owner = this.account.address;
     const hashes: Hex[] = [];
     let gasWei = await this.ensureAllowance(ADDR.usdc, usdcIn, hashes, log, onApprovalSigned, canSend);
     const q = await quoteExactIn(path, usdcIn);
     const minOut = (q.amountOut * BigInt(10_000 - slippageBps)) / 10_000n;
+    if (minimumEthOut !== undefined && minOut < minimumEthOut) {
+      throw new Error('The updated USDC quote no longer covers the required ETH top-up');
+    }
     const deadline = Math.floor(Date.now() / 1000) + 300;
     const swap = encodeFunctionData({
       abi: swapRouter02Abi, functionName: 'exactInput',
