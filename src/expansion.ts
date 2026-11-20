@@ -22,7 +22,9 @@ let loggedSignature: string | null = null;
 let loggedOutcome: string | null = null;
 const solanaTestSizes = [50, 250, 1000, 10] as const;
 const solanaProfitTestMultipliers = [1, 2, 5, 10] as const;
+const solanaLoanFractions = [1, 0.5, 1, 0.2] as const;
 let solanaTestScans = 0;
+let solanaRegularScans = 0;
 let stopping = false;
 const schedule = new Set<ReturnType<typeof setTimeout>>();
 
@@ -68,6 +70,8 @@ export function startExpansion() {
         ? solanaTestSizes[solanaTestScans % solanaTestSizes.length]
         : Math.min(100_000, (test.minimumLoanUsd ?? 500) * solanaProfitTestMultipliers[solanaTestScans % solanaProfitTestMultipliers.length]);
       solanaTestScans += 1;
+    } else if (config.loanUsdc !== undefined && config.loanUsdc >= 1 && config.loanUsdc <= 100_000) {
+      config.loanUsdc = Math.max(1, config.loanUsdc * solanaLoanFractions[solanaRegularScans++ % solanaLoanFractions.length]);
     }
     solanaResult = await scanSolanaCycle(config, execution ? (candidate) => execution.submit(candidate) : undefined, test ?? undefined);
     if (test) execution?.recordTestScan(test.id, solanaResult.routes.length);
@@ -75,6 +79,7 @@ export function startExpansion() {
       ? solanaResult.routes[0].detail ?? 'The venue quotes are unavailable' : null;
     solanaStatus = liveError ?? quoteFailure ?? (execution ? 'Guarded live scan completed' : 'Unsigned scan completed');
     solanaUpdatedAt = Date.now();
+    solanaActivity.recordScan(solanaResult.routes.filter((route) => route.quotedNetBeforeNetworkUsdc !== undefined).length, solanaUpdatedAt);
     const status = worker?.summary;
     if (status?.ready && !verifiedGuardLogged) {
       solanaActivity.record('info', 'Immutable Lighthouse program verified on Solana mainnet', `https://explorer.solana.com/address/${LIGHTHOUSE}`);
@@ -113,6 +118,7 @@ export function expansionView() {
       status: solanaLive?.summary.ready ? 'Uses the verified Lighthouse balance guard' : 'Uses the deployed Lighthouse program',
     },
     logs: solanaActivity.view(),
+    scanWindow: solanaActivity.scanWindow(),
     test: solanaLive?.summary.test ?? null,
   } };
 }

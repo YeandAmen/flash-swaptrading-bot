@@ -138,6 +138,14 @@ function renderNetworkLog(network, entries, fallback) {
   }).join('') : '<div class="empty">No activity recorded.</div>');
 }
 
+function renderNetworkScanWindow(network, scanWindow) {
+  const element = $(network + 'ScanWindow');
+  element.hidden = !scanWindow;
+  if (!scanWindow) return;
+  const { minutes, scans, routes } = scanWindow;
+  element.textContent = `Last ${minutes} minutes · ${networkNumber(scans)} ${scans === 1 ? 'scan' : 'scans'} · ${networkNumber(routes)} route checks`;
+}
+
 const networkOutcomes = {
   landed: 'Landed', finalized: 'Finalized', reverted: 'Reverted', replaced: 'Replaced',
   failed: 'Failed', expired: 'Expired', 'invariant-breach': 'Invariant breach',
@@ -191,6 +199,7 @@ function renderArbitrum(arb) {
   $('arbitrumBlock').textContent = scanned ? networkNumber(arb.block) : '–';
   $('arbitrumRoutes').textContent = scanned ? networkNumber(arb.routes) : '–';
   $('arbitrumGas').textContent = networkGas(arb?.balanceEth, 'ETH');
+  renderNetworkScanWindow('arbitrum', arb?.scanWindow);
 
   const deployment = arb?.deployment;
   const address = deployment?.address ?? arb?.executor;
@@ -228,10 +237,18 @@ function renderSolana(solana) {
   const qualified = routes?.filter((route) => route.qualified).length;
   const status = completed && qualified !== undefined
     ? `${qualified} qualifying ${qualified === 1 ? 'route' : 'routes'}` : solana?.status;
-  $('solanaStatus').textContent = (status || 'Solana state unavailable.') + networkAge(checkedAt);
+  const principal = Number.isFinite(result?.loanUsdc) ? ` · ${networkGas(result.loanUsdc, 'USDC')} loan` : '';
+  $('solanaStatus').textContent = (status || 'Solana state unavailable.') + principal + networkAge(checkedAt);
   $('solanaSlot').textContent = result?.slot > 0 ? networkNumber(result.slot) : '–';
   $('solanaRoutes').textContent = routes ? networkNumber(routes.length) : '–';
   $('solanaGas').textContent = networkGas(result?.walletSol, 'SOL');
+  renderNetworkScanWindow('solana', solana?.scanWindow);
+
+  const executionStatus = execution?.status;
+  const showExecution = Boolean(solana?.mode === 'live' && executionStatus && executionStatus !== 'Live Solana scanning'
+    && (execution.pending || (completed && qualified > 0)));
+  $('solanaExecutionStatus').hidden = !showExecution;
+  $('solanaExecutionStatus').textContent = showExecution ? executionStatus : '';
 
   const deployment = solana?.deployment;
   const programLinks = [
@@ -549,10 +566,10 @@ function renderMevCadence(cadence) {
   const minuteMs = 60_000;
   const target = Math.round(intervalMs / minuteMs);
   const remainingMs = Number.isFinite(elapsedMs) ? intervalMs - elapsedMs : null;
-  const due = remainingMs === null ? 'scanning for a fill'
-    : remainingMs > 0 ? `due in ${Math.ceil(remainingMs / minuteMs)} min` : 'due now';
-  const timing = state === 'paper' ? 'paper mode' : state === 'overdue' ? 'overdue' : due;
-  const parts = [`${target}-minute direct trade target`, timing];
+  const timing = state === 'paper' ? 'paper mode'
+    : state === 'overdue' ? 'still searching for a qualifying route'
+    : remainingMs === null ? 'checking routes' : `fill target in ${Math.max(0, Math.ceil(remainingMs / minuteMs))} min`;
+  const parts = [`${target}-minute search target`, timing];
   if (routeLimit > baseRouteLimit) {
     parts.push(`expanded search checks up to ${routeLimit} routes per block`);
   }

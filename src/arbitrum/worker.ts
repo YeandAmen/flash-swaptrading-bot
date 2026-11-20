@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { formatEther, isAddress, isAddressEqual, keccak256, parseEventLogs, type Address, type Hash, type Hex } from 'viem';
+import { formatEther, isAddress, isAddressEqual, keccak256, parseEther, parseEventLogs, type Address, type Hash, type Hex } from 'viem';
 import { CONFIG, DATA_DIR } from '../config.js';
 import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest, type FlashTestOptions } from '../network-test.js';
 import { NetworkActivity } from '../network-activity.js';
@@ -18,6 +18,7 @@ const dayMs = 86400_000;
 const txLimitUsd = 0.50;
 const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
+const extraLoanSizes = ['0.01', '0.1', '0.5', '2', '8'].flatMap((size) => [undefined, parseEther(size)]);
 type Pending = { hash: Hash; nonce: number; ethUsd: number; budgetUsd: number };
 type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'replaced'; gasUsd: number; netUsd: number; at: number; loanUsd?: number };
 type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest };
@@ -27,6 +28,7 @@ export class ArbitrumWorker {
   private readonly executionEnabled = process.env.ARBITRUM_LIVE === 'on' && CONFIG.allowLiveTrading;
   private markets: Awaited<ReturnType<typeof discoverArbitrumPools>> = [];
   private refreshAfter = 0;
+  private regularScans = 0;
   private verified = false;
   private executorCheckAt = 0;
   private journal: Journal | null = null;
@@ -59,7 +61,10 @@ export class ArbitrumWorker {
     balanceEth: null as string | null, pending: null as Hash | null, settled: null as Settlement | null,
   };
 
-  view() { return { ...this.summary, deployment: this.deployment, logs: this.activity.view(), test: flashTestView(this.journal?.test) }; }
+  view() {
+    return { ...this.summary, deployment: this.deployment, logs: this.activity.view(),
+      scanWindow: this.activity.scanWindow(), test: flashTestView(this.journal?.test) };
+  }
 
   queueTest(id: string, options?: FlashTestOptions) {
     if (!this.journal || this.summary.mode !== 'live' || this.halted || this.journal.pending) throw new Error('Arbitrum live wallet is not ready for a test');
@@ -161,22 +166,23 @@ export class ArbitrumWorker {
         if (await this.tryOrders(leads, ethUsd, test)) return;
       }
     }
-    const result = await scanArbitrum(this.client, block, this.markets, test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test);
+    const extraSize = test ? undefined : extraLoanSizes[this.regularScans++ % extraLoanSizes.length];
+    const result = await scanArbitrum(this.client, block, this.markets,
+      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize);
     if (test) test.checked += result.quotedRoutes;
     this.summary.block = Number(block);
     this.summary.pools = this.markets.reduce((sum, market) => sum + market.pools.length, 0);
     this.summary.routes = result.quotedRoutes;
     this.summary.updatedAt = Date.now();
-    this.summary.status = result.best ? 'Comparing exact payout and fees' : 'No positive payout after loan fees';
+    this.activity.recordScan(result.quotedRoutes, this.summary.updatedAt);
+    if (this.journal?.pending) this.summary.status = 'Waiting for transaction receipt';
+    else if (!result.best) this.summary.status = 'No positive payout after loan fees';
+    else if (!this.summary.executor) this.summary.status = 'Flash payout quoted. Deploy executor to check full fees';
+    else {
+      this.summary.status = 'No fresh route passed padded gas and payout floor';
+      await this.tryOrders(result.opportunities.slice(0, 3), result.ethUsd, test);
+    }
     this.activity.record('info', `Block ${block}: ${result.quotedRoutes} routes across ${this.summary.pools} pools. ${this.summary.status}.`, undefined, this.summary.updatedAt);
-    if (!this.summary.executor || !result.best || this.journal?.pending) {
-      if (this.journal?.pending) this.summary.status = 'Waiting for transaction receipt';
-      else if (result.best) this.summary.status = 'Flash payout quoted. Deploy executor to check full fees.';
-      return;
-    }
-    if (!await this.tryOrders(result.opportunities.slice(0, 3), result.ethUsd, test) && this.summary.status !== 'Daily gas budget used') {
-      this.summary.status = test ? 'No fresh route passed repayment and gas checks' : 'No fresh route passed padded gas and payout floor';
-    }
   }
 
   private async tryOrders(candidates: ArbQuote[], ethUsd: number, test: FlashTest | null): Promise<boolean> {
@@ -200,7 +206,19 @@ export class ArbitrumWorker {
         this.client.getBalance({ address: account.address }),
         this.client.getBlockNumber({ cacheTime: 0 }),
       ]);
-      if (nonce !== pending || balance < prepared.gasBudget || head >= prepared.deadline || !this.active || this.halted || !canTest()) return true;
+      if (!this.active || this.halted || !canTest()) return true;
+      if (nonce !== pending) {
+        this.summary.status = 'Waiting for the wallet nonce to settle';
+        return true;
+      }
+      if (balance < prepared.gasBudget) {
+        this.summary.status = 'Quoted route exceeds the wallet ETH available for gas';
+        continue;
+      }
+      if (head >= prepared.deadline) {
+        this.summary.status = 'Quoted route expired before signing';
+        continue;
+      }
       const serializedTransaction = await account.signTransaction({ ...prepared.tx, type: 'eip1559', chainId: arbitrumChainId, nonce });
       if (!this.active || this.halted || !canTest()) return true;
       const hash = keccak256(serializedTransaction);

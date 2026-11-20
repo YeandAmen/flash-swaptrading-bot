@@ -237,9 +237,10 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
         <p id="arbitrumStatus" class="network-status">Waiting for dashboard data…</p>
         <dl class="network-stats">
           <div><dt>L2 block</dt><dd id="arbitrumBlock">–</dd></div>
-          <div><dt>Routes checked</dt><dd id="arbitrumRoutes">–</dd></div>
+          <div><dt>Routes in last scan</dt><dd id="arbitrumRoutes">–</dd></div>
           <div><dt>Gas balance</dt><dd id="arbitrumGas">–</dd></div>
         </dl>
+        <p id="arbitrumScanWindow" class="sub network-status" hidden></p>
         <div class="network-detail">
           <h4>Deployment</h4>
           <div id="arbitrumDeployment" class="network-links">–</div>
@@ -263,9 +264,11 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
         <p id="solanaStatus" class="network-status">Waiting for dashboard data…</p>
         <dl class="network-stats">
           <div><dt>Slot</dt><dd id="solanaSlot">–</dd></div>
-          <div><dt>Routes checked</dt><dd id="solanaRoutes">–</dd></div>
+          <div><dt>Routes in last scan</dt><dd id="solanaRoutes">–</dd></div>
           <div><dt>Gas balance</dt><dd id="solanaGas">–</dd></div>
         </dl>
+        <p id="solanaScanWindow" class="sub network-status" hidden></p>
+        <p id="solanaExecutionStatus" class="network-status" hidden></p>
         <div class="network-detail">
           <h4>Programs</h4>
           <div id="solanaDeployment" class="network-links">–</div>

@@ -26,6 +26,7 @@ const routeV2 = Buffer.from('bb64facc31c4af14', 'hex');
 const addressDecoder = getAddressDecoder();
 const VENUES = ['Whirlpool', 'Raydium CLMM'] as const;
 const JUPITER_BUILD = 'https://api.jup.ag/swap/v2/build';
+const defaultLoanUsdc = 250;
 export const SOLANA_TEST_MAX_FEE_LAMPORTS = 50_000n;
 
 type Rpc = ReturnType<typeof createSolanaRpc>;
@@ -108,7 +109,7 @@ export function solanaScanConfig(env: NodeJS.ProcessEnv = process.env): SolanaSc
     wallet: env.SOLANA_WALLET_ADDRESS ?? '',
     rpcUrl: env.SOLANA_RPC_URL,
     jupiterApiKey: env.JUPITER_API_KEY,
-    loanUsdc: envNumber(env.SOLANA_LOAN_USDC),
+    loanUsdc: envNumber(env.SOLANA_LOAN_USDC) ?? defaultLoanUsdc,
     minNetUsdc: envNumber(env.SOLANA_MIN_NET_USDC),
     maxFeeLamports: envNumber(env.SOLANA_MAX_FEE_LAMPORTS),
   };
@@ -272,7 +273,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   const wallet = address(config.wallet);
   const test = execute && requestedTest ? (typeof requestedTest === 'string' ? { id: requestedTest } : requestedTest) : null;
   const limits = solanaTestMinimums(test);
-  const configuredLoan = usdcAmount(config.loanUsdc ?? 250, 1, 100_000, 'Loan size');
+  const configuredLoan = usdcAmount(config.loanUsdc ?? defaultLoanUsdc, 1, 100_000, 'Loan size');
   const loan = limits.minimumLoan !== undefined && limits.minimumLoan > configuredLoan ? limits.minimumLoan : configuredLoan;
   const gasOnlyTest = !!test && limits.minimumNet === undefined;
   const minimumNet = gasOnlyTest ? 1n : limits.minimumNet ?? usdcAmount(config.minNetUsdc ?? 0.05, 0.000001, 1_000, 'Minimum net profit');

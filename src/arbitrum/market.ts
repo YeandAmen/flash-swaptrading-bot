@@ -101,7 +101,8 @@ export async function arbitrumEthUsd(client: ArbitrumClient, blockNumber?: bigin
   return Number(price) / 1e8;
 }
 
-export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[], test: boolean | number = false) {
+export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[],
+  test: boolean | number = false, extraSize?: bigint) {
   const [premiumBps, config, available, ethUsd] = await Promise.all([
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'FLASHLOAN_PREMIUM_TOTAL', blockNumber }),
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'getConfiguration', args: [weth], blockNumber }),
@@ -111,7 +112,7 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
   const active = (config & (1n << 56n)) !== 0n && (config & (1n << 60n)) === 0n && (config & (1n << 63n)) !== 0n;
   if (!active) throw new Error('Aave WETH flash loans are disabled');
   const sizes = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
-    : test ? testAmounts : amounts;
+    : test ? testAmounts : extraSize === undefined ? amounts : [...amounts, extraSize];
   const buys = markets.flatMap((market) => market.pools.flatMap((pool) =>
     sizes.filter((size) => size <= available).map((size) => ({ market, pool, size }))));
   const bought = await client.multicall({
