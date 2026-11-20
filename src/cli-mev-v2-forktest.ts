@@ -288,7 +288,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     if (breakEven) {
       assert.equal(await searcher['prepareLive'](offer, point, policy), null,
         'the ordinary profit floor remains in effect for normal orders');
-      searcher.queueGasOnlyTest(testId, maximumTestGasUsd, true);
+      searcher.queueGasOnlyTest(testId, maximumTestGasUsd, true, true);
     }
     const prepared = await searcher['prepareLive'](offer, point, policy, oneShot ? searcher['queuedTest'] ?? undefined : undefined);
     assert.ok(prepared, opp.note);
@@ -309,6 +309,14 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
         'the break-even order must enforce full padded gas coverage in the contract');
       assert.equal(execution.args[0].tip, 0n);
       assert.equal(execution.args[0].funding, funding);
+      assert.equal(execution.args[0].maxBlock, head.number + (breakEven ? 2n : 1n));
+      if (breakEven) {
+        assert.equal(prepared.privateSubmission, true);
+        assert.ok(profit - prepared.minimumProfit >= (profit + 9n) / 10n);
+        const growth = point.nextBaseFee / 8n;
+        assert.equal(prepared.fees.maxFeePerGas - prepared.fees.maxPriorityFeePerGas,
+          point.nextBaseFee + (growth > 0n ? growth : 1n), 'private bid must cover both eligible blocks');
+      }
       assert.ok(Number(prepared.gasBudget) / 1e18 * ethUsd <= maximumTestGasUsd);
     }
     await searcher['sendLive'](prepared, point, searcher['armGeneration']);
@@ -319,6 +327,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     assert.equal(submitted.stats.bundles, bundles);
     assert.equal(submitted.stats.directAttempts, directAttempts + 1);
     if (oneShot) {
+      assert.equal(submitted.recent[0]?.submission?.privateSubmission ?? false, breakEven);
       assert.equal(submitted.gasOnlyTest?.status, 'submitted');
       assert.equal(submitted.gasOnlyTest?.hash, submitted.pending.hash);
     }
@@ -355,7 +364,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
       assert.equal(searcher.view().stats.directAttempts, directAttempts + 1,
         'a consumed test cannot submit on the next head');
       const restarted = new MevSearcher(searcher['host']);
-      restarted.queueGasOnlyTest(testId, maximumTestGasUsd, breakEven);
+      restarted.queueGasOnlyTest(testId, maximumTestGasUsd, breakEven, breakEven);
       assert.equal(restarted.view().gasOnlyTest?.status, 'landed');
       assert.equal(restarted.view().gasOnlyTest?.hash, receipt.transactionHash,
         'replaying the same test ID after restart must leave the settled receipt in place');

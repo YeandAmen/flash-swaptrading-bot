@@ -46,23 +46,31 @@ export function directFees(nextBaseWei: bigint, priorityWei: bigint, horizon: nu
   return { maxFeePerGas: ceiling + priorityWei, maxPriorityFeePerGas: priorityWei };
 }
 
-/** Clamp a next-block fee to what the order can pay at its full gas limit. */
+/** Preserve payout margin for movement before inclusion, rounding up to wei. */
+export function directExecutionReserve(proceeds: bigint): bigint {
+  return proceeds > 0n ? (proceeds + 9n) / 10n : 0n;
+}
+
+/** Clamp a fee to what the order can pay at its full gas limit over the target horizon. */
 export function affordableDirectFees(nextBaseWei: bigint, gas: bigint, desiredTip: bigint,
-  minimumTip: bigint, availableWei: bigint) {
+  minimumTip: bigint, availableWei: bigint, horizon = 1) {
   if (gas <= 0n || availableWei < 0n) return null;
-  const affordableTip = availableWei / gas - nextBaseWei;
+  const baseCeiling = horizon === 1 ? nextBaseWei : directFees(nextBaseWei, 0n, horizon).maxFeePerGas;
+  const affordableTip = availableWei / gas - baseCeiling;
   const tip = affordableTip < desiredTip ? affordableTip : desiredTip;
-  return tip >= minimumTip ? directFees(nextBaseWei, tip, 1) : null;
+  return tip >= minimumTip ? directFees(nextBaseWei, tip, horizon) : null;
 }
 
 /**
  * Locate a confirmed nonce consumer. An unused nonce, null receipt or empty
  * mempool view is insufficient evidence that a direct signature is gone.
  */
-export async function findNonceConsumer(address: Address, nonce: number, confirmedBlock: bigint, firstBlock: bigint): Promise<Hex | null> {
-  if (firstBlock < 0n || confirmedBlock < firstBlock) return null;
+type NonceConsumer = { status: 'included'; hash: Hex } | { status: 'unused' | 'unknown' };
+
+export async function findNonceConsumer(address: Address, nonce: number, confirmedBlock: bigint, firstBlock: bigint): Promise<NonceConsumer> {
+  if (firstBlock < 0n || confirmedBlock < firstBlock) return { status: 'unknown' };
   const countAt = (blockNumber: bigint) => mevReadClient.getTransactionCount({ address, blockNumber });
-  if (await countAt(confirmedBlock) <= nonce) return null;
+  if (await countAt(confirmedBlock) <= nonce) return { status: 'unused' };
 
   let start = firstBlock;
   let end = confirmedBlock;
@@ -74,7 +82,7 @@ export async function findNonceConsumer(address: Address, nonce: number, confirm
 
   const block = await mevReadClient.getBlock({ blockNumber: start, includeTransactions: true });
   const match = block.transactions.find((tx) => tx.nonce === nonce && tx.from.toLowerCase() === address.toLowerCase());
-  if (!match) return null;
+  if (!match) return { status: 'unknown' };
   const canonical = await mevReadClient.getBlock({ blockNumber: start });
-  return canonical.hash === block.hash ? match.hash : null;
+  return canonical.hash === block.hash ? { status: 'included', hash: match.hash } : { status: 'unknown' };
 }

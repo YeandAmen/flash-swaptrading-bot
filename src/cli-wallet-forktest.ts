@@ -543,6 +543,45 @@ try {
   assert.equal(await nonce(), privateNonce, 'an expired private submission spends no gas and leaves the nonce unused');
   console.log('✓ Expired private one-shot reconciled after restart without spending gas or consuming a nonce');
 
+  const replacementSource = await publicClient.getBlockNumber({ cacheTime: 0 });
+  const replacementDeadline = replacementSource + 2n;
+  const replacedHash = keccak256('0x2345');
+  fs.writeFileSync(mevStateFile, JSON.stringify({
+    ...recoveredPrivate.file, pending: {
+      kind: 'direct', privateSubmission: true, nonce: privateNonce, target: replacementDeadline.toString(),
+      contract: oldProxy, ethUsd, hash: replacedHash, opp: {
+        ...privateOpportunity, hash: replacedHash, block: Number(replacementSource),
+        submission: { ...privateOpportunity.submission, target: Number(replacementDeadline) },
+      },
+    },
+  }));
+  const replacementExecutor = new LiveExecutor(account);
+  const recoveredReplacement = new MevSearcher({ ...mevHost, exec: replacementExecutor });
+  assert.equal(recoveredReplacement.view().pending?.hash, replacedHash);
+
+  const replacement = await account.signTransaction({
+    chainId: 1, type: 'eip1559', nonce: privateNonce, to: account.address, gas: 21_000n,
+    maxFeePerGas: parseGwei('1'), maxPriorityFeePerGas: parseGwei('0.05'), value: 0n,
+  });
+  const replacementReceipt = await publicClient.waitForTransactionReceipt({
+    hash: await submitDirect(replacement), pollingInterval: 100, timeout: 10_000,
+  });
+  assert.equal(replacementReceipt.status, 'success');
+  assert.equal(replacementReceipt.blockNumber, replacementSource + 1n, 'the replacement mined in the first eligible block');
+  await recoveredReplacement.reconcileWallet(replacementReceipt.blockNumber);
+  assert.equal(recoveredReplacement.view().pending?.hash, replacedHash, 'the private nonce remains reserved before the deadline');
+  await test.mine({ blocks: 2 });
+  await recoveredReplacement.reconcileWallet(await publicClient.getBlockNumber({ cacheTime: 0 }));
+  assert.equal(recoveredReplacement.view().pending, null);
+  assert.equal(recoveredReplacement.walletPending(), false);
+  const replaced = recoveredReplacement.view().recent.find((opportunity) => opportunity.hash === replacedHash);
+  assert.equal(replaced?.status, 'not included');
+  assert.match(replaced?.note ?? '', /different confirmed transaction used the nonce/);
+  assert.equal(replaced?.gasEth, 0);
+  assert.equal(recoveredReplacement.view().settings.direct.spentGasUsd, gasEth * ethUsd);
+  assert.equal(await replacementExecutor.bundleNonce(), privateNonce + 1, 'wallet uses the next nonce after recovering a replacement');
+  console.log('✓ Two-block private recovery found a nonce replacement in the first block without charging MEV gas');
+
 } finally {
   MEV.v2ContractAddress = originalV2Address;
   MEV.v3ContractAddress = originalV3Address;

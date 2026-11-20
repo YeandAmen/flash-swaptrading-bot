@@ -102,38 +102,50 @@ export async function sendBundle(signedTxs: Hex[], targetBlock: bigint, canSend:
   }));
 }
 
-/** Route one signed transaction to the private relay without handing it to the public mempool. */
+/** Route one transaction through private endpoints that honor its block deadline. */
 export async function submitPrivateDirect(signed: Hex, maxBlock: bigint, canSend: () => boolean = () => true): Promise<Hex> {
   const allowed = () => (CONFIG.allowLiveTrading || CONFIG.forkMode) && canSend();
   if (maxBlock <= 0n) throw new Error('A private transaction needs a positive block deadline');
   if (!allowed()) throw new Error('Private transaction canceled before submission');
   const expected = keccak256(signed);
-  let result: unknown;
   if (CONFIG.forkMode) {
-    result = await publicClient.request({ method: 'eth_sendRawTransaction', params: [signed] });
-  } else {
-    const body = JSON.stringify({
-      jsonrpc: '2.0', id: 1, method: 'eth_sendPrivateTransaction',
-      params: [{ tx: signed, maxBlockNumber: toHex(maxBlock), preferences: { fast: true } }],
-    });
-    const signer = authSigner();
-    const signature = await signer.signMessage({ message: keccak256(stringToHex(body)) });
-    if (!allowed()) throw new Error('Private transaction canceled before submission');
-    try {
-      const response = await fetch(FLASHBOTS_RELAY, {
-        method: 'POST', redirect: 'error', body, signal: AbortSignal.timeout(3_500),
-        headers: { 'content-type': 'application/json', 'x-flashbots-signature': `${signer.address}:${signature}` },
-      });
-      if (!response.ok) throw new Error('HTTP response rejected');
-      const reply = await response.json() as { jsonrpc?: unknown; id?: unknown; error?: unknown; result?: unknown } | null;
-      if (reply?.jsonrpc === '2.0' && (reply.id === 1 || reply.id === '1') && !reply.error) result = reply.result;
-    } catch {
-      // Network errors can include request details. The caller must reconcile the signed nonce.
-      throw new Error('The private relay did not acknowledge the transaction');
+    const result = await publicClient.request({ method: 'eth_sendRawTransaction', params: [signed] });
+    if (typeof result !== 'string' || result.toLowerCase() !== expected) {
+      throw new Error('The private transaction acknowledgement did not match its signed hash');
     }
+    return expected;
   }
-  if (typeof result !== 'string' || result.toLowerCase() !== expected) {
-    throw new Error('The private transaction acknowledgement did not match its signed hash');
+
+  const body = JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'eth_sendPrivateTransaction',
+    params: [{ tx: signed, maxBlockNumber: toHex(maxBlock), preferences: { fast: true } }],
+  });
+  const signer = authSigner();
+  const signature = await signer.signMessage({ message: keccak256(stringToHex(body)) });
+  if (!allowed()) throw new Error('Private transaction canceled before submission');
+  const headers = { 'content-type': 'application/json' };
+  const send = async (url: string, requestHeaders: Record<string, string>) => {
+    const response = await fetch(url, {
+      method: 'POST', redirect: 'error', headers: requestHeaders, body, signal: AbortSignal.timeout(3_500),
+    });
+    if (!response.ok) throw new Error('HTTP response rejected');
+    const reply = await response.json() as { jsonrpc?: unknown; id?: unknown; error?: unknown; result?: unknown } | null;
+    if (reply?.jsonrpc !== '2.0' || (reply.id !== 1 && reply.id !== '1') || reply.error
+      || typeof reply.result !== 'string' || reply.result.toLowerCase() !== expected) {
+      throw new Error('The private transaction acknowledgement did not match its signed hash');
+    }
+    return expected;
+  };
+
+  const submissions = [send(FLASHBOTS_RELAY, { ...headers, 'x-flashbots-signature': `${signer.address}:${signature}` })];
+  // Alchemy offers a second ingress to Flashbots and preserves maxBlockNumber.
+  if (/^https:\/\/eth-mainnet\.g\.alchemy\.com\/v2\/[A-Za-z0-9_-]+$/.exec(CONFIG.rpcUrl)?.[0] === CONFIG.rpcUrl) {
+    submissions.push(send(CONFIG.rpcUrl, headers));
   }
-  return expected;
+  try {
+    return await Promise.any(submissions);
+  } catch {
+    // Network errors can include URLs or raw transaction data. Reconcile the signed nonce instead.
+    throw new Error('No private endpoint acknowledged the transaction');
+  }
 }
