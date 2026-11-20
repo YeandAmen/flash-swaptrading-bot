@@ -310,7 +310,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
         'the break-even order must enforce full padded gas coverage in the contract');
       assert.equal(execution.args[0].tip, 0n);
       assert.equal(execution.args[0].funding, funding);
-      assert.equal(execution.args[0].maxBlock, head.number + (breakEven || privateGasOnly ? 2n : 1n));
+      assert.equal(execution.args[0].maxBlock, head.number + (privateGasOnly ? 5n : breakEven ? 2n : 1n));
       if (breakEven) {
         assert.equal(prepared.privateSubmission, true);
         assert.ok(profit - prepared.minimumProfit >= (profit + 9n) / 10n);

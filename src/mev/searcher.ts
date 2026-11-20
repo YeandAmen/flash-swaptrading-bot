@@ -46,6 +46,7 @@ const DASHBOARD_BUNDLE_LIMIT = 5;
 const MAX_STARTUP_TRACE_BUNDLES = 6;
 const DIRECT_WINDOW = 1;
 const PRIVATE_DIRECT_WINDOW = 2;
+const PRIVATE_FUNCTIONAL_TEST_WINDOW = 5;
 const DIRECT_SEND_LEAD_MS = 1_500;
 const PREMIUM_MIN_NET_USD = 5;
 const PREMIUM_TARGET_TIP_WEI = 1_000_000_000n;
@@ -1038,7 +1039,8 @@ export class MevSearcher {
     const direct = MEV.submission === 'direct';
     const privateSubmission = direct && (test?.privateSubmission ?? MEV.directProtected) ? true : undefined;
     const privateGasOnly = privateSubmission && gasOnly;
-    let horizon = privateSubmission ? PRIVATE_DIRECT_WINDOW : DIRECT_WINDOW;
+    let horizon = privateGasOnly ? PRIVATE_FUNCTIONAL_TEST_WINDOW
+      : privateSubmission ? PRIVATE_DIRECT_WINDOW : DIRECT_WINDOW;
     let target = r.blockNumber + BigInt(horizon);
     const reserve = direct && !gasOnly ? directExecutionReserve(offer.profit) : 0n;
     const spendableProceeds = offer.profit - reserve;
@@ -1068,9 +1070,13 @@ export class MevSearcher {
         let budgetFees = maxGasWei !== null
           ? affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, horizon) : null;
         if (!budgetFees && privateGasOnly && maxGasWei !== null) {
-          horizon = DIRECT_WINDOW;
-          target = r.blockNumber + BigInt(horizon);
-          budgetFees = affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, horizon);
+          for (const shorter of [PRIVATE_DIRECT_WINDOW, DIRECT_WINDOW]) {
+            budgetFees = affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, shorter);
+            if (!budgetFees) continue;
+            horizon = shorter;
+            target = r.blockNumber + BigInt(horizon);
+            break;
+          }
         }
         let affordableFees = gasOnly || !budgetFees ? budgetFees : affordableDirectFees(
           r.nextBaseFee, gas, budgetFees.maxPriorityFeePerGas, minimumTip, spendableProceeds - minimumNet, horizon,
