@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Ethereum ERC-20 token trading bot (Uniswap v3) with a localhost dashboard",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc -p .",
     "start": "node dist/server.js",
@@ -26,9 +28,15 @@
     "wallet:fork-test": "node scripts/fork-test.mjs cli-wallet-forktest",
     "wallet:local-test": "node scripts/fork-test.mjs cli-wallet-forktest --standalone",
     "build:contract": "node scripts/build-contract.mjs",
-    "mev:scan": "node dist/cli-mev-scan.js"
+    "mev:scan": "node dist/cli-mev-scan.js",
+    "arbitrum:scan": "node dist/arbitrum/cli.js scan",
+    "arbitrum:quote": "node dist/arbitrum/cli.js quote",
+    "arbitrum:deploy": "node dist/arbitrum/cli.js deploy",
+    "solana:scan": "node dist/solana/cli.js",
+    "solana:test": "node --test dist/solana/scan.test.js"
   },
   "dependencies": {
+    "@solana/kit": "8.3.0",
     "express": "^4.22.3",
     "qrcode": "^1.5.4",
     "viem": "^2.58.1"

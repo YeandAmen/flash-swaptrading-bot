@@ -6,6 +6,7 @@ import { formatUnits, type Hex } from 'viem';
 import { CONFIG, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from './config.js';
 import { endpointOrigin, redactDiagnostic } from './diagnostics.js';
 import { Engine } from './engine.js';
+import { armArbitrum, disarmArbitrum, expansionView, startExpansion, stopExpansion } from './expansion.js';
 import { DeploymentFeeLimitError, DeploymentGasError } from './executor.js';
 import type { PortfolioState } from './types.js';
 
@@ -163,6 +164,7 @@ app.get('/api/state', (_req, res) => {
       ml: engine.research ? { ...engine.research.ml, rulesOos: slimBt(engine.research.ml.rulesOos), mlOos: slimBt(engine.research.ml.mlOos) } : null,
     },
     events: engine.events.slice(-150).reverse().map((event) => ({ ...event, msg: redactDiagnostic(event.msg) })),
+    networks: expansionView(),
     mev: mev ? {
       ...mev,
       status: redactDiagnostic(mev.status),
@@ -237,7 +239,12 @@ app.post('/api/arm', (req, res) => {
   if (req.body?.confirm !== 'LIVE') { res.status(400).json({ error: 'Type LIVE to confirm' }); return; }
   if (allowArming(res)) void control(() => engine.arm())(req, res);
 });
-app.post('/api/disarm', control(() => engine.disarm()));
+app.post('/api/disarm', control(() => { try { disarmArbitrum(); } finally { engine.disarm(); } }));
+app.post('/api/arbitrum/disarm', control(() => disarmArbitrum()));
+app.post('/api/arbitrum/arm', (req, res) => {
+  if (req.body?.confirm !== 'ARBITRUM') { res.status(400).json({ error: 'Type ARBITRUM to arm' }); return; }
+  if (allowLiveControl(res)) void control(() => armArbitrum())(req, res);
+});
 for (const action of ['deploy', 'upgrade'] as const) {
   app.get(`/api/mev/${action}/quote`, async (_req, res) => {
     try {
@@ -297,12 +304,13 @@ app.post('/api/paper/reset', control(() => engine.resetPaper()));
 app.post('/api/backtest', control(() => { void engine.runResearchNow(); }));
 app.post('/api/panic', (req, res) => {
   const kind = kindOf(req);
-  if (kind === 'paper' || allowLiveControl(res)) void control(() => engine.panic(kind))(req, res);
+  if (kind === 'paper' || allowLiveControl(res)) void control(async () => { try { if (kind === 'live') disarmArbitrum(); } finally { await engine.panic(kind); } })(req, res);
 });
 
 const server = app.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`Dashboard: http://127.0.0.1:${CONFIG.port}`);
   void engine.start();
+  startExpansion();
 });
 
 // Keep the Mac from sleeping while the bot runs (caffeinate exits by itself when this process exits).
@@ -319,6 +327,7 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log('Shutting down: waiting for any in-flight trade, then saving state...');
+  stopExpansion();
   server.close();
   setTimeout(() => process.exit(0), 28_000).unref();
   try { await engine.stop(); } catch { /* ignore */ }

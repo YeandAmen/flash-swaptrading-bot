@@ -7,14 +7,15 @@ import { generatePrivateKey } from 'viem/accounts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const [requestedSuite = 'cli-forktest', mode = '', ...extra] = process.argv.slice(2);
+const useArbitrum = requestedSuite === 'cli-arbitrum-contract-forktest';
 const useProxy = requestedSuite === 'cli-mev-proxy-forktest';
 const useV3 = useProxy || requestedSuite === 'cli-mev-v3-forktest';
 const suite = requestedSuite === 'cli-mev-forktest' || useV3 ? 'cli-mev-v2-forktest' : requestedSuite;
-const suites = ['cli-forktest', 'cli-mev-v2-forktest', 'cli-wallet-forktest'];
+const suites = ['cli-forktest', 'cli-mev-v2-forktest', 'cli-wallet-forktest', 'cli-arbitrum-contract-forktest'];
 const standalone = suite === 'cli-wallet-forktest' && mode === '--standalone';
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   ['PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE'].includes(key.toUpperCase())));
-const argv = ['--host', '127.0.0.1', '--port', '0', '--chain-id', '1', '--accounts', '0', '--color', 'never'];
+const argv = ['--host', '127.0.0.1', '--port', '0', '--chain-id', useArbitrum ? '42161' : '1', '--accounts', '0', '--color', 'never'];
 
 function listeningPort(child) {
   return new Promise((resolve, reject) => {
@@ -68,7 +69,7 @@ try {
     let upstream;
     try { upstream = new URL(process.env.FORK_RPC_URL ?? ''); } catch { /* handled below */ }
     if (!upstream || !['http:', 'https:'].includes(upstream.protocol)) {
-      throw new Error('Set FORK_RPC_URL to an Ethereum mainnet archive RPC URL for Anvil’s read-only upstream');
+      throw new Error(`Set FORK_RPC_URL to an ${useArbitrum ? 'Arbitrum One' : 'Ethereum mainnet'} archive RPC URL for Anvil’s read-only upstream`);
     }
     argv.push('--fork-url', upstream.href, '--no-storage-caching');
     const block = process.env.FORK_BLOCK_NUMBER;

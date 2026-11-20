@@ -153,6 +153,17 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     </div>
   </section>
 
+  <section class="card" id="extraNetworks" hidden>
+    <h2>Arbitrage networks</h2>
+    <button id="arbitrumModeBtn" class="ghost" hidden></button>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Network</th><th>Mode</th><th class="r">Block / slot</th><th class="r">Routes</th><th class="r">Gas balance</th><th>Status</th></tr></thead>
+        <tbody id="extraNetworkRows"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="card">
     <h2>Strategy brain <span class="sub" id="regime"></span></h2>
     <div class="sub" id="uniStats" style="margin:-4px 0 10px"></div>

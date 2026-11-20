@@ -73,8 +73,32 @@ function posList(list, max) {
     <div class="sub">entry ${price(p.entryMid)} · stop ${price(p.stopPrice)}${p.trailActive ? ' (trailing)' : ''} · target ${price(p.targetPrice)} · since ${time(p.entryTime)}</div></div>`).join('');
 }
 
+function renderNetworks(networks) {
+  const arb = networks?.arbitrum;
+  const solana = networks?.solana;
+  const routes = solana?.result?.routes;
+  const rows = [];
+  if (arb && arb.mode !== 'off') {
+    const executor = arb.executor ? ` <a target="_blank" rel="noopener noreferrer" href="https://arbiscan.io/address/${esc(arb.executor)}">Executor ↗</a>` : '';
+    const settled = arb.settled ? ` · <a target="_blank" rel="noopener noreferrer" href="https://arbiscan.io/tx/${esc(arb.settled.hash)}">${esc(arb.settled.status)}</a> ${usd(arb.settled.netUsd)} net` : '';
+    rows.push(['Arbitrum One', arb.mode, arb.block, arb.routes, arb.balanceEth ? `${esc(arb.balanceEth.slice(0, 12))} ETH` : '–', esc(arb.status) + executor + settled]);
+  }
+  if (solana && solana.mode !== 'off') {
+    const balance = solana.result?.walletSol;
+    const qualified = routes?.filter((route) => route.qualified).length;
+    const status = solana.status !== 'Unsigned scan completed' || qualified === undefined ? solana.status : `${qualified} qualifying unsigned routes`;
+    rows.push(['Solana', solana.mode, solana.result?.slot, routes?.length, Number.isFinite(balance) ? `${balance.toFixed(6)} SOL` : '–', esc(status)]);
+  }
+  $('extraNetworks').hidden = rows.length === 0;
+  $('arbitrumModeBtn').hidden = !arb?.canArm;
+  $('arbitrumModeBtn').textContent = arb?.mode === 'live' ? 'Disarm Arbitrum' : 'Arm Arbitrum';
+  $('extraNetworkRows').innerHTML = rows.map(([name, mode, block, routes, balance, status]) =>
+    `<tr><td>${name}</td><td>${esc(mode)}</td><td class="r">${block ? block.toLocaleString() : '–'}</td><td class="r">${routes ?? '–'}</td><td class="r">${balance}</td><td>${status}</td></tr>`).join('');
+}
+
 function render() {
   if (!S) return;
+  renderNetworks(S.networks);
   const c = S.chain;
   $('cBlock').textContent = c ? c.block.toLocaleString() : '–';
   const g = (x) => (x < 0.01 ? x.toPrecision(2) : x.toFixed(2));
@@ -465,9 +489,21 @@ $('armConfirm').onclick = async () => {
   try { await api('/api/arm', { confirm: typed }); dlg.close(); refresh(); } catch (e) { alert(e.message); }
 };
 $('disarmBtn').onclick = async () => {
-  if (!confirm('Disarm spot and MEV? Open positions stay in the wallet. Submitted transactions can still settle.')) return;
+  if (!confirm('Disarm spot, Ethereum MEV, and Arbitrum? Open positions stay in the wallet. Submitted transactions can still settle.')) return;
   try { await api('/api/disarm'); } catch (e) { alert(e.message); }
   refresh();
+};
+$('arbitrumModeBtn').onclick = async () => {
+  const arm = S?.networks?.arbitrum?.mode !== 'live';
+  try {
+    if (arm) {
+      if (prompt('Type ARBITRUM to enable live arbitrage and gas spend on Arbitrum One.')?.trim() !== 'ARBITRUM') return;
+      await api('/api/arbitrum/arm', { confirm: 'ARBITRUM' });
+    } else {
+      await api('/api/arbitrum/disarm');
+    }
+    refresh();
+  } catch (error) { alert(error.message); }
 };
 const mevDeployDlg = $('mevDeployDlg');
 function updateMevContractConfirm() {

@@ -196,3 +196,43 @@ The proxy uses standardized implementation and admin slots. [ERC-1967](https://e
 | `MEV_BUILDERS`, `MEV_BUILDER_TIP_PCT`, `MEV_MAX_TRACKED_POOLS`, `MEV_MAX_SIMS_PER_BLOCK` | Bundle destinations, builder bid, active read budget and candidate simulation budget. |
 
 Use one running bot per wallet. Back up the wallet and its state, including `state.json`, `wallet-transaction.json`, and MEV journal files. Preserve the journals if a signed transaction cannot be reconciled. A restart restores monitoring and resets both live arming flags.
+
+## Arbitrum One and Solana
+
+The dashboard can run a separate Arbitrum One scanner and a Solana paper scanner alongside Ethereum. Each flash loan, swap cycle, and repayment happens on one network. Fund gas on the network where the transaction runs.
+
+### Arbitrum One
+
+Set `ARBITRUM=on` to start scanning Aave V3 WETH flash-loan routes across Uniswap v3 and hook-free v4 pools. Set `ARBITRUM_RPC_URL` if you have a dedicated provider. The public fallback is the official Arbitrum One RPC. The scanner queries chain ID 42161 and uses the Arbitrum L2 block number for deadlines.
+
+```sh
+npm run build
+npm run arbitrum:scan
+```
+
+For deployment, set `ARBITRUM_OWNER_ADDRESS` to the EVM bot wallet and fund it with native ETH on Arbitrum One. Preview the maximum deployment fee, then explicitly opt in to signing and run deployment. The argument is the maximum deployment fee in USD.
+
+```sh
+npm run arbitrum:quote
+ALLOW_LIVE_TRADING=on npm run arbitrum:deploy -- 2
+```
+
+Set `ARBITRUM_EXECUTOR_ADDRESS` to the verified address returned by the command and restart the service. The deployment command records its hash before broadcast and reconciles that hash on retry. The worker verifies the deployed bytecode and owner. With `ARBITRUM_LIVE=on` and global signing enabled, it submits qualifying routes after a pending-state simulation. The initial limits are $0.50 per transaction, $2 over 24 hours and at least $0.05 modeled net after padded fees. An included revert still costs gas.
+
+To test with fake funds on a pinned Arbitrum archive fork:
+
+```sh
+FORK_RPC_URL=https://arb1.arbitrum.io/rpc FORK_BLOCK_NUMBER=525952800 node scripts/fork-test.mjs cli-arbitrum-contract-forktest
+```
+
+### Solana
+
+Create a Solana keypair in private local storage and copy only its public address into `SOLANA_WALLET_ADDRESS`. Never use the Ethereum wallet key as a Solana seed. The scanner uses Kamino USDC and Jupiter Build instructions for two-pool SOL/USDC routes. It checks composed unsigned transactions and reports paper results. Set `SOLANA=on` to include it in the dashboard. A dedicated `SOLANA_RPC_URL` and `JUPITER_API_KEY` are optional.
+
+```sh
+mkdir -p -m 700 data
+solana-keygen new --silent --outfile data/solana-bot.json
+solana-keygen pubkey data/solana-bot.json
+npm run solana:scan
+npm run solana:test
+```
