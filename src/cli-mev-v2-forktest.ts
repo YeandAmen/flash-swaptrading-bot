@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createPublicClient, createTestClient, createWalletClient, encodeFunctionData, http, parseAbi, parseEther, parseEventLogs, type Address, type Hex } from 'viem';
+import { createPublicClient, createTestClient, createWalletClient, encodeFunctionData, getAddress, http, keccak256, parseAbi, parseEther, parseEventLogs, type Address, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import { erc20Abi } from './chain.js';
@@ -7,6 +7,8 @@ import { ADDR, CONFIG } from './config.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './mev/artifact-v2.js';
 import { FLASH_ARB_V3_ABI, FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from './mev/artifact-v3.js';
+import { FLASH_ARB_LOGIC_BYTECODE, FLASH_ARB_LOGIC_RUNTIME } from './mev/artifact-logic.js';
+import { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_BYTECODE, FLASH_ARB_PROXY_RUNTIME } from './mev/artifact-proxy.js';
 import { NextVenueKind } from './mev/next-pools.js';
 import { discoverArbPools, poolIdentity, toNextVenue, type ArbPool } from './mev/pools.js';
 import { loadOrCreateWallet } from './wallet.js';
@@ -15,6 +17,10 @@ import { loadOrCreateWallet } from './wallet.js';
 await assertForkTestEnvironment();
 assert.equal(CONFIG.allowLiveTrading, false);
 const useV3 = process.env.MEV_FORK_USE_V3 === '1';
+const useProxy = process.env.MEV_FORK_USE_PROXY === '1';
+const implementationSlot = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+const adminSlot = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103';
+let implementationHash = keccak256(FLASH_ARB_V3_RUNTIME);
 
 const transport = http(CONFIG.rpcUrl, { timeout: 120_000, retryCount: 0, fetchOptions: { redirect: 'error' } });
 const fork = createTestClient({ chain: mainnet, mode: 'anvil', transport });
@@ -31,10 +37,12 @@ const fixtureRouterAbi = parseAbi([
   'function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable returns (uint256[] amounts)',
   'function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[] amounts)',
 ]);
+const sparkWeth = '0x59cD1C87501baa753d0B5B5Ab5D8416A45cD71DB';
 const lenders: Record<number, Address> = {
   1: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2',
   2: '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb',
   3: '0xbA1333333333a1BA1108E8412f11850A5C319bA9',
+  4: '0xC13e21B648A5Ee794902342038FF3aDAB66BE987',
 };
 
 async function confirmed(hash: Hex) {
@@ -44,7 +52,7 @@ async function confirmed(hash: Hex) {
 }
 
 const [market] = await discoverArbPools([{ address: ADDR.usdc, symbol: 'USDC', decimals: 6, core: true }], 2,
-  { includePancakeV3: true, includeUniswapV4: true });
+  { includePancakeV3: true, includeUniswapV4: true, ...(useProxy && { includePancakeV2: true }) });
 assert.ok(market, 'fork has canonical USDC markets');
 function pick(kind: NextVenueKind, fee: number, nativeEth = false) {
   const pool = market.pools.find((p) => p.kind === kind && Math.round(p.fee * 1e6) === fee && Boolean(p.v4?.nativeEth) === nativeEth);
@@ -52,6 +60,8 @@ function pick(kind: NextVenueKind, fee: number, nativeEth = false) {
   return pool;
 }
 const pancake500 = pick(NextVenueKind.PancakeV3, 500);
+const pancakeV2 = useProxy ? pick(NextVenueKind.PancakeV2, 2500) : null;
+if (pancakeV2) assert.equal(pancakeV2.address.toLowerCase(), '0x2e8135be71230c6b1b4045696d41c09db0414226');
 const v4Native500 = pick(NextVenueKind.UniswapV4, 500, true);
 const v4Weth500 = pick(NextVenueKind.UniswapV4, 500);
 const sushiV2 = pick(NextVenueKind.SushiV2, 3000);
@@ -60,15 +70,96 @@ console.log('✓ canonical Pancake v3, native ETH Uniswap v4, and WETH Uniswap v
 
 const bytecode = useV3 ? FLASH_ARB_V3_BYTECODE : FLASH_ARB_V2_BYTECODE;
 const runtime = useV3 ? FLASH_ARB_V3_RUNTIME : FLASH_ARB_V2_RUNTIME;
-const deployment = await confirmed(await walletClient.deployContract({ account: owner, abi: FLASH_ARB_V2_ABI, bytecode }));
+const deployment = await confirmed(await (useProxy ? walletClient.deployContract({
+  account: owner, abi: FLASH_ARB_PROXY_ABI, bytecode: FLASH_ARB_PROXY_BYTECODE, args: [FLASH_ARB_V3_BYTECODE, implementationHash],
+}) : walletClient.deployContract({ account: owner, abi: FLASH_ARB_V2_ABI, bytecode })));
+assert.ok(deployment.contractAddress);
 const contract = deployment.contractAddress;
-assert.ok(contract);
-assert.equal((await publicClient.getCode({ address: contract }))?.toLowerCase(), runtime.toLowerCase());
+assert.equal(await publicClient.getCode({ address: contract }), useProxy ? FLASH_ARB_PROXY_RUNTIME : runtime);
 assert.equal(await publicClient.readContract({ address: contract, abi: FLASH_ARB_V2_ABI, functionName: 'owner' }), owner.address);
 if (useV3) {
   await assert.rejects(publicClient.simulateContract({
     address: contract, abi: FLASH_ARB_V3_ABI, functionName: 'onBalancerV3Loan', args: ['0x'], account: fixture.address,
   }), /callback context/);
+}
+
+async function slotAddress(slot: Hex) {
+  const value = await publicClient.getStorageAt({ address: contract, slot, blockNumber: await publicClient.getBlockNumber({ cacheTime: 0 }) });
+  assert.ok(value && /^0x0{24}[0-9a-f]{40}$/i.test(value));
+  return getAddress(`0x${value.slice(-40)}`);
+}
+
+async function verifyUpgrade() {
+  const previous = await slotAddress(implementationSlot);
+  assert.equal(await publicClient.getCode({ address: previous }), FLASH_ARB_V3_RUNTIME);
+  assert.equal(await slotAddress(adminSlot), owner.address);
+  const nextHash = keccak256(FLASH_ARB_LOGIC_RUNTIME);
+  const upgrade = { address: contract, abi: FLASH_ARB_PROXY_ABI, functionName: 'upgradeRelease' } as const;
+
+  await assert.rejects(publicClient.simulateContract({
+    ...upgrade, account: fixture.address, args: [FLASH_ARB_LOGIC_BYTECODE, implementationHash, nextHash],
+  }), /Unauthorized/);
+  await assert.rejects(publicClient.simulateContract({
+    ...upgrade, account: owner.address, args: [FLASH_ARB_LOGIC_BYTECODE, nextHash, implementationHash],
+  }), /WrongImplementation/);
+  await assert.rejects(publicClient.simulateContract({
+    ...upgrade, account: owner.address, args: [FLASH_ARB_V3_BYTECODE, implementationHash, nextHash],
+  }), /WrongImplementation/);
+  const badOwnerRuntime = '0x600060005260206000f3';
+  const badOwnerBytecode = '0x600a600c600039600a6000f3600060005260206000f3';
+  await assert.rejects(publicClient.simulateContract({
+    ...upgrade, account: owner.address, args: [badOwnerBytecode, implementationHash, keccak256(badOwnerRuntime)],
+  }), /IncompatibleOwner/);
+  assert.equal(await slotAddress(implementationSlot), previous);
+
+  const receipt = await confirmed(await walletClient.writeContract({
+    ...upgrade, account: owner, args: [FLASH_ARB_LOGIC_BYTECODE, implementationHash, nextHash],
+  }));
+  const newImplementation = await slotAddress(implementationSlot);
+  assert.notEqual(newImplementation, previous);
+  assert.equal(await publicClient.getCode({ address: newImplementation }), FLASH_ARB_LOGIC_RUNTIME);
+  assert.equal(await publicClient.getCode({ address: contract }), FLASH_ARB_PROXY_RUNTIME);
+  assert.equal(await slotAddress(adminSlot), owner.address);
+  assert.equal(await publicClient.readContract({ address: contract, abi: FLASH_ARB_V3_ABI, functionName: 'owner' }), owner.address);
+  const [upgraded] = parseEventLogs({ abi: FLASH_ARB_PROXY_ABI, eventName: 'Upgraded', logs: receipt.logs });
+  assert.equal(upgraded?.args.implementation, newImplementation);
+
+  // A previously signed order remains rejected even when its route value would otherwise decode.
+  const staleOrder = {
+    funding: 0, token: ADDR.usdc, buy: toNextVenue(pancake500), sell: toNextVenue(sushiV2),
+    amountIn: parseEther('1'), minProfit: 1n, tip: 0n, maxBlock: 0n,
+  };
+  const staleData = encodeOrder(staleOrder);
+  const execute = { address: contract, abi: FLASH_ARB_PROXY_ABI, functionName: 'executePinned' } as const;
+  await assert.rejects(publicClient.simulateContract({
+    ...execute, account: owner.address, args: [implementationHash, staleData],
+  }), /WrongImplementation/);
+  await assert.rejects(publicClient.simulateContract({
+    ...execute, account: fixture.address, args: [nextHash, staleData],
+  }), /Unauthorized/);
+  await assert.rejects(publicClient.simulateContract({
+    ...execute, account: owner.address, args: [nextHash, '0x8da5cb5b'],
+  }), /InvalidExecution/);
+  await assert.rejects(publicClient.simulateContract({
+    address: contract, account: owner.address, abi: [...FLASH_ARB_V3_ABI, ...FLASH_ARB_PROXY_ABI],
+    functionName: 'execute', args: [staleOrder],
+  }), /InvalidExecution/);
+  implementationHash = nextHash;
+  console.log('✓ upgrade preserved the proxy address and owner, and blocked old, arbitrary, and unauthorized execution');
+}
+
+function orderData(order: Parameters<typeof encodeOrder>[0]) {
+  const data = encodeOrder(order);
+  return useProxy ? encodeFunctionData({
+    abi: FLASH_ARB_PROXY_ABI, functionName: 'executePinned', args: [implementationHash, data],
+  }) : data;
+}
+
+function encodeOrder(order: {
+  funding: number; token: Address; buy: ReturnType<typeof toNextVenue>; sell: ReturnType<typeof toNextVenue>;
+  amountIn: bigint; minProfit: bigint; tip: bigint; maxBlock: bigint;
+}) {
+  return encodeFunctionData({ abi: FLASH_ARB_V3_ABI, functionName: 'execute', args: [order] });
 }
 
 async function balanceOf(token: Address, account: Address) {
@@ -103,7 +194,12 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: nu
       const amountIn = parseEther(size);
       const args = { ...prepare, amountIn };
       try {
-        const simulated = await publicClient.simulateContract({ address: contract!, abi: FLASH_ARB_V2_ABI, functionName: 'execute', account: owner.address, args: [args] });
+        const simulated = useProxy ? await publicClient.simulateContract({
+          address: contract, abi: FLASH_ARB_PROXY_ABI, functionName: 'executePinned', account: owner.address,
+          args: [implementationHash, encodeOrder(args)],
+        }) : await publicClient.simulateContract({
+          address: contract, abi: FLASH_ARB_V2_ABI, functionName: 'execute', account: owner.address, args: [args],
+        });
         if (simulated.result > parseEther('0.002')) {
           profitable = { args, profit: simulated.result };
           break;
@@ -115,7 +211,8 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: nu
     assert.ok(profitable, `${label} must simulate a profit: ${errors.join(' | ')}`);
     const order = { ...profitable.args, minProfit: profitable.profit };
     const ethBefore = await publicClient.getBalance({ address: owner.address });
-    const vaultBalance = funding === 3 ? await balanceOf(ADDR.weth, lenders[funding]) : 0n;
+    const custody = funding === 3 ? lenders[3] : funding === 4 ? sparkWeth : null;
+    const custodyBalance = custody ? await balanceOf(ADDR.weth, custody) : 0n;
     let hash: Hex;
     if (useV3) {
       const fees = await publicClient.estimateFeesPerGas();
@@ -123,7 +220,7 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: nu
       const signed = await owner.signTransaction({
         type: 'eip1559', chainId: mainnet.id, to: contract!, nonce, gas: 3_000_000n,
         maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
-        data: encodeFunctionData({ abi: FLASH_ARB_V2_ABI, functionName: 'execute', args: [order] }),
+        data: orderData(order),
       });
       hash = await publicClient.sendRawTransaction({ serializedTransaction: signed });
     } else {
@@ -137,9 +234,9 @@ async function testRoute(label: string, buy: ArbPool, sell: ArbPool, funding: nu
       const [funded] = parseEventLogs({ abi: FLASH_ARB_V2_ABI, eventName: 'FundedBy', logs: receipt.logs });
       assert.ok(funded);
       assert.equal(funded.args.funding, funding);
-      assert.equal(funded.args.premium > 0n, funding === 1, 'only Aave charges a funding premium');
+      assert.equal(funded.args.premium > 0n, funding === 1, 'the tested reserve premiums match the protocol at this block');
       assert.equal(await publicClient.readContract({ address: ADDR.weth, abi: erc20Abi, functionName: 'allowance', args: [contract!, lenders[funding]] }), 0n, 'flash lender left no usable allowance');
-      if (funding === 3) assert.equal(await balanceOf(ADDR.weth, lenders[funding]), vaultBalance, 'Balancer principal returned in full');
+      if (custody) assert.equal(await balanceOf(ADDR.weth, custody), custodyBalance, 'flash principal returned in full');
     }
     const expected = payout.args.profit - payout.args.tip - receipt.gasUsed * receipt.effectiveGasPrice;
     const ethAfter = await publicClient.getBalance({ address: owner.address });
@@ -166,9 +263,19 @@ await testRoute('Morpho Blue funding with WETH v4', v4Weth500, sushiV2, 2);
 if (useV3) await testRoute('Balancer V3 funding with WETH v4', v4Weth500, sushiV2, 3);
 await fork.revert({ id: baseline });
 
+if (useProxy) {
+  await verifyUpgrade();
+  const beforeSpark = await fork.snapshot();
+  await buyFixtureTokens(sushiV2Router, parseEther('18'));
+  await testRoute('SparkLend funding after the proxy upgrade', v4Weth500, sushiV2, 4);
+  if (pancakeV2) await testRoute('Pancake v2 buy-pool flash swap after upgrade', pancakeV2, sushiV2, 0);
+  await fork.revert({ id: beforeSpark });
+}
 await buyFixtureTokens(uniswapV2Router, parseEther('30'));
 await sellFixtureTokensOnSushi();
 console.log('✓ fork-local Sushi v2 sell fixture prepared');
 await testRoute('Pancake v3 callback on the sell leg', sushiV2, pancake500, 0);
+if (pancakeV2) await testRoute('Pancake v2 settlement on the sell leg', sushiV2, pancakeV2, 0);
 await testRoute('native ETH v4 settlement on the sell leg', sushiV2, v4Native500, 0);
-console.log(useV3 ? 'ALL FLASHARB V3 DIRECT RPC FORK TESTS PASSED' : 'ALL FLASHARB V2 FORK TESTS PASSED');
+console.log(useProxy ? 'ALL FLASHARB PROXY FORK TESTS PASSED'
+  : useV3 ? 'ALL FLASHARB V3 DIRECT RPC FORK TESTS PASSED' : 'ALL FLASHARB V2 FORK TESTS PASSED');

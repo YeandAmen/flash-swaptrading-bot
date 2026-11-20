@@ -7,15 +7,15 @@ import { fileURLToPath } from 'node:url';
 process.chdir(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
 
 const target = process.argv[2] ?? 'all';
-if (!['v2', 'v3', 'all'].includes(target)) throw new Error('Use npm run build:contract -- v2|v3|all');
+if (!['v2', 'v3', 'proxy', 'logic', 'all'].includes(target)) throw new Error('Use npm run build:contract -- v2|v3|proxy|logic|all');
 const compiler = process.env.SOLC || 'solc';
 const release = '0.8.26+commit.8a97fa7a';
 const version = execFileSync(compiler, ['--version'], { encoding: 'utf8' }).match(/Version: (\S+)/)?.[1];
 if (!version?.startsWith(`${release}.`) && version !== release) throw new Error(`Expected Solidity ${release}, received ${version ?? 'unknown'}`);
 
-for (const version of target === 'all' ? ['v2', 'v3'] : [target]) {
+for (const version of target === 'all' ? ['v2', 'v3', 'proxy', 'logic'] : [target]) {
   const suffix = version.toUpperCase();
-  const name = `FlashArb${suffix}`;
+  const name = ({ proxy: 'FlashArbProxy', logic: 'FlashArbLogic' })[version] ?? `FlashArb${suffix}`;
   const source = `contracts/${name}.sol`;
   const out = execFileSync(compiler, [
     '--via-ir', '--optimize', '--optimize-runs', '200', '--evm-version', 'cancun', '--combined-json', 'abi,bin,bin-runtime', source,

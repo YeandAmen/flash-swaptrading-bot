@@ -9,10 +9,11 @@ import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../e
 import type { McResult } from '../market.js';
 import { writeJson } from '../persistence.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
-import { FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
+import { FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
 import { bundleTraceRequests, requestBuilderTrace } from './builder-trace.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
 import { sendBundle, type BuilderResult } from './bundles.js';
+import { pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
 import { routeInputSizes } from './sizing.js';
 import { arbGas, bestCycle, buildStateReads, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
 import { MevUniverse } from './universe.js';
@@ -106,6 +107,8 @@ interface MevStats {
   rpcCalls: number;
 }
 
+type ProxyAction = 'deploy' | 'upgrade';
+
 interface MevFile {
   version: 1;
   armed: boolean;
@@ -117,9 +120,15 @@ interface MevFile {
   v3Contract?: Address | null;
   v3DeployedAt?: number;
   v3DeployGasUsd?: number;
+  proxyContract?: Address;
+  proxyImplementation?: Address;
+  proxyRelease?: Hex;
+  proxyDeployedAt?: number;
+  proxyDeployGasUsd?: number;
   deployedAt: number | null;
   deployTx: Hex | null;
-  deployVersion?: 'v2' | 'v3' | null;
+  deployVersion?: 'v2' | 'v3' | 'proxy' | 'proxy-upgrade' | null;
+  deployRelease?: Hex | null;
   deployNonce: number | null;
   deployStartedAt: number | null;
   deployGasUsd: number;
@@ -265,18 +274,34 @@ export class MevSearcher {
 
   constructor(private host: MevHost, private persist = true) {
     this.file = this.load();
+    const searcher = this;
     this.universe = new MevUniverse(persist, (message, level) => this.host.log(`[mev] ${message}`, level), {
       includePancakeV3: true, includeUniswapV4: true,
+      get includePancakeV2() { return searcher.supportsPancakeV2; },
     });
   }
 
   private get v3Address() { return this.file.v3Contract ?? MEV.v3ContractAddress; }
-  private get isV3() { return this.v3Address !== null; }
-  private get contractLabel() { return this.isV3 ? 'FlashArbV3' : 'FlashArbV2'; }
-  private get contractRuntime() { return this.isV3 ? FLASH_ARB_V3_RUNTIME : FLASH_ARB_V2_RUNTIME; }
-  private get selectedContract() { return this.v3Address ?? this.file.v2Contract ?? null; }
-  private get configuredContract() { return this.isV3 ? MEV.v3ContractAddress : MEV.v2ContractAddress; }
-  private get canDeployV3() { return MEV.enabled && this.persist && !this.stopping && !this.stateReadError && !this.isV3; }
+  private get isV3() { return Boolean(this.file.proxyContract || this.v3Address); }
+  private get supportsSpark() { return Boolean(this.file.proxyRelease && releaseSupportsSpark(this.file.proxyRelease)); }
+  private get supportsPancakeV2() { return Boolean(this.file.proxyRelease && releaseSupportsPancakeV2(this.file.proxyRelease)); }
+  private get contractLabel() { return this.file.proxyContract ? 'FlashArb Proxy' : this.isV3 ? 'FlashArbV3' : 'FlashArbV2'; }
+  private get contractRuntime(): Hex {
+    if (this.file.proxyRelease) return releaseRuntime(this.file.proxyRelease) ?? proxyReleaseRuntime;
+    return this.isV3 ? FLASH_ARB_V3_RUNTIME : FLASH_ARB_V2_RUNTIME;
+  }
+  private get selectedContract() { return this.file.proxyContract ?? this.v3Address ?? this.file.v2Contract ?? null; }
+  private get configuredContract() { return this.file.proxyContract ? null : this.isV3 ? MEV.v3ContractAddress : MEV.v2ContractAddress; }
+  private proxyActionAvailable(action: ProxyAction) {
+    if (!MEV.enabled || !this.persist || this.stopping || this.stateReadError) return false;
+    const f = this.file;
+    if (action === 'deploy') return !f.proxyContract;
+    return Boolean(f.proxyContract && f.proxyRelease && releaseRuntime(f.proxyRelease) && f.proxyRelease !== proxyReleaseHash);
+  }
+
+  private liveData(data: Hex): Hex {
+    return this.file.proxyRelease ? pinnedArbitrage(data, this.file.proxyRelease) : data;
+  }
 
   private get pending() { return this.file.pending; }
 
@@ -286,11 +311,21 @@ export class MevSearcher {
     try {
       const f = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as MevFile;
       if (f.version !== 1 || !f.stats || !Array.isArray(f.recent)) throw new Error('invalid MEV state');
+      const proxyJournal = f.deployVersion === 'proxy' || f.deployVersion === 'proxy-upgrade';
+      if (Boolean(f.proxyContract) !== Boolean(f.proxyRelease)
+        || Boolean(f.proxyContract) !== Boolean(f.proxyImplementation)
+        || proxyJournal !== Boolean(f.deployRelease)
+        || (proxyJournal && !f.deployTx)
+        || (f.deployVersion === 'proxy-upgrade' && !f.proxyContract)) throw new Error('invalid FlashArb proxy state');
       if ((f.deployTx != null && !/^0x[0-9a-f]{64}$/i.test(f.deployTx))
-        || (f.deployVersion != null && f.deployVersion !== 'v2' && f.deployVersion !== 'v3')
+        || (f.deployVersion != null && !['v2', 'v3', 'proxy', 'proxy-upgrade'].includes(f.deployVersion))
         || (f.contract != null && !/^0x[0-9a-f]{40}$/i.test(f.contract))
         || (f.v2Contract != null && !/^0x[0-9a-f]{40}$/i.test(f.v2Contract))
-        || (f.v3Contract != null && !/^0x[0-9a-f]{40}$/i.test(f.v3Contract))) throw new Error('invalid MEV contract state');
+        || (f.v3Contract != null && !/^0x[0-9a-f]{40}$/i.test(f.v3Contract))
+        || (f.proxyContract != null && !/^0x[0-9a-f]{40}$/i.test(f.proxyContract))
+        || (f.proxyImplementation != null && !/^0x[0-9a-f]{40}$/i.test(f.proxyImplementation))
+        || (f.proxyRelease != null && !/^0x[0-9a-f]{64}$/i.test(f.proxyRelease))
+        || (f.deployRelease != null && !/^0x[0-9a-f]{64}$/i.test(f.deployRelease))) throw new Error('invalid MEV contract state');
       f.best = Array.isArray(f.best) ? f.best.filter((x) => x && typeof x === 'object' && !Array.isArray(x)) : [];
       f.deployStartedAt ??= null;
       f.deployNonce ??= null;
@@ -343,11 +378,12 @@ export class MevSearcher {
   private modeText(): string {
     if (this.stateReadError) return this.stateReadError;
     if (!MEV.enabled) return 'Off (MEV=off in .env)';
-    if (this.deploying) return 'Deploying FlashArbV3…';
+    if (this.deploying) return 'Preparing the FlashArb proxy transaction…';
     if (this.file.deployTx) return 'Waiting for the deployment transaction to settle';
     if (this.file.armed && !this.contractReady) return `Verifying the ${this.contractLabel} contract…`;
     if (this.file.armed) return 'Live mode: eligible bundles go to the configured builders';
-    if (MEV.funding === 'balancer' && !this.isV3) return 'Deploy FlashArbV3 to simulate routes funded by Balancer V3';
+    if (MEV.funding === 'spark' && !this.supportsSpark) return 'Deploy or upgrade FlashArb Proxy to simulate routes funded by SparkLend';
+    if (MEV.funding === 'balancer' && !this.isV3) return 'Deploy FlashArb Proxy to simulate routes funded by Balancer V3';
     return 'Paper mode: every block is scanned and simulated, nothing is sent';
   }
 
@@ -608,7 +644,7 @@ export class MevSearcher {
         account: this.host.account.address,
         blockNumber,
         to: contract ?? SIM_ADDR,
-        data,
+        data: contract ? this.liveData(data) : data,
         stateOverride: contract
           ? undefined
           : [{ address: SIM_ADDR, code: this.contractRuntime, stateDiff: [{ slot: pad('0x0'), value: pad(this.host.account.address) }] }],
@@ -628,7 +664,7 @@ export class MevSearcher {
     const previous = this.previousSizes.get(key);
     const sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previous && Date.now() - previous.at < 10 * 60_000 ? previous.amount : undefined);
     if (!sizes.length) return null;
-    const trials = fundingTrials(MEV.funding, sizes, this.isV3);
+    const trials = fundingTrials(MEV.funding, sizes, this.isV3, this.supportsSpark);
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));
     st.rpcCalls += sims.length;
     st.simulated++;
@@ -762,9 +798,9 @@ export class MevSearcher {
     if (!validPrice(ethUsd)) return this.skipOpportunity(opp, 'ETH/USD price unavailable');
     const minimumNet = this.minimumNet(ethUsd, policy);
     const target = r.blockNumber + 1n;
-    const encode = (tip: bigint, minProfit: bigint) => encodeArbitrage(offer.funding, {
+    const encode = (tip: bigint, minProfit: bigint) => this.liveData(encodeArbitrage(offer.funding, {
       buy: c.A, sell: c.B, token: c.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
-    });
+    }));
     try {
       // Estimate with the builder payment path enabled, then simulate the exact calldata and gas limit.
       this.file.stats.rpcCalls++;
@@ -1048,6 +1084,7 @@ export class MevSearcher {
     if (!CONFIG.forkMode && MEV.builders.length === 0) throw new Error('MEV requires at least one configured builder.');
     if (this.stateReadError) throw new Error(this.stateReadError);
     if (!this.persist || this.stopping || this.walletPending()) throw new Error('MEV cannot arm while wallet recovery or contract preparation is in progress.');
+    if (MEV.funding === 'spark' && !this.supportsSpark) throw new Error('SparkLend funding requires a compatible FlashArb Proxy release.');
     if (MEV.funding === 'balancer' && !this.isV3) throw new Error('Balancer V3 funding requires FlashArbV3.');
     const existing = this.selectedContract;
     const configured = this.configuredContract;
@@ -1055,7 +1092,7 @@ export class MevSearcher {
       throw new Error(`The configured ${this.contractLabel} address conflicts with the saved deployment. Review both addresses before arming.`);
     }
     const address = existing ?? configured;
-    if (!address) throw new Error('Deploy FlashArbV3 from the dashboard before arming MEV.');
+    if (!address) throw new Error('Deploy FlashArb Proxy from the dashboard before arming MEV.');
     if (this.file.armed) return;
     const generation = ++this.armGeneration;
     this.contractReady = false;
@@ -1085,17 +1122,28 @@ export class MevSearcher {
     return code?.toLowerCase() === runtime.toLowerCase() && owner?.toLowerCase() === this.host.account.address.toLowerCase();
   }
 
-  private clearDeployment(deployment?: { address: Address; gasWei: bigint }) {
+  private clearDeployment(deployment?: { address: Address; gasWei: bigint; implementation?: Address }) {
     const f = this.file;
     const previous = {
       contract: f.contract, deployedAt: f.deployedAt, deployGasUsd: f.deployGasUsd,
       v2Contract: f.v2Contract, v2DeployedAt: f.v2DeployedAt, v2DeployGasUsd: f.v2DeployGasUsd,
       v3Contract: f.v3Contract, v3DeployedAt: f.v3DeployedAt, v3DeployGasUsd: f.v3DeployGasUsd,
-      deployTx: f.deployTx, deployVersion: f.deployVersion, deployNonce: f.deployNonce, deployStartedAt: f.deployStartedAt,
+      proxyContract: f.proxyContract, proxyImplementation: f.proxyImplementation, proxyRelease: f.proxyRelease,
+      proxyDeployedAt: f.proxyDeployedAt, proxyDeployGasUsd: f.proxyDeployGasUsd,
+      deployTx: f.deployTx, deployVersion: f.deployVersion, deployRelease: f.deployRelease, deployNonce: f.deployNonce, deployStartedAt: f.deployStartedAt,
     };
     if (deployment) {
       const cost = eth(deployment.gasWei) * (this.host.ethUsd() ?? 0);
-      if (f.deployVersion === 'v3') {
+      if (f.deployVersion === 'proxy' || f.deployVersion === 'proxy-upgrade') {
+        if (!deployment.implementation || !f.deployRelease) throw new Error('Missing verified proxy release');
+        f.proxyContract = deployment.address;
+        f.proxyImplementation = deployment.implementation;
+        f.proxyRelease = f.deployRelease;
+        if (f.deployVersion === 'proxy') {
+          f.proxyDeployedAt = Date.now();
+          f.proxyDeployGasUsd = cost;
+        }
+      } else if (f.deployVersion === 'v3') {
         f.v3Contract = deployment.address;
         f.v3DeployedAt = Date.now();
         f.v3DeployGasUsd = cost;
@@ -1112,6 +1160,7 @@ export class MevSearcher {
     }
     f.deployTx = null;
     f.deployVersion = null;
+    f.deployRelease = null;
     f.deployNonce = null;
     f.deployStartedAt = null;
     try {
@@ -1136,12 +1185,8 @@ export class MevSearcher {
     const receipt = result.receipt;
     if (f.deployNonce !== null) this.host.exec.noteNonceUsed(f.deployNonce);
     if (receipt.status === 'success') {
-      const expectedRuntime = f.deployVersion === 'v3' ? FLASH_ARB_V3_RUNTIME : f.deployVersion === 'v2' ? FLASH_ARB_V2_RUNTIME : null;
-      if (!receipt.contractAddress || receipt.from.toLowerCase() !== this.host.account.address.toLowerCase()
-        || (expectedRuntime && !await this.contractOk(receipt.contractAddress, expectedRuntime, receipt.blockNumber))) {
-        throw new Error('Confirmed deployment could not be verified');
-      }
-      this.clearDeployment({ address: receipt.contractAddress, gasWei: receipt.gasUsed * receipt.effectiveGasPrice });
+      await this.verifyAndRecordDeployment(receipt.contractAddress ?? null, receipt.to ?? null, receipt.from,
+        receipt.gasUsed * receipt.effectiveGasPrice, receipt.blockNumber);
       this.host.log('[mev] Restored the confirmed contract deployment.', 'trade');
     } else {
       this.clearDeployment();
@@ -1149,9 +1194,36 @@ export class MevSearcher {
     }
   }
 
+  private async verifyAndRecordDeployment(created: Address | null, to: Address | null, from: Address, gasWei: bigint, blockNumber: bigint) {
+    const f = this.file;
+    const upgrade = f.deployVersion === 'proxy-upgrade';
+    const address = upgrade ? f.proxyContract : created;
+    const wallet = this.host.account.address;
+    if (!address || from.toLowerCase() !== wallet.toLowerCase()
+      || (upgrade ? to?.toLowerCase() !== address.toLowerCase() : to !== null)) throw new Error('Confirmed deployment has an unexpected sender or destination');
+
+    if (f.deployVersion === 'proxy' || upgrade) {
+      const implementation = f.deployRelease && await verifyFlashProxy(address, wallet, f.deployRelease, blockNumber);
+      if (!implementation) throw new Error('Confirmed FlashArb proxy bytecode, release or wallet ownership could not be verified');
+      this.clearDeployment({ address, gasWei, implementation });
+      if (this.reads && !this.stopping) {
+        void this.refreshPools().catch((error) => this.host.log('[mev] Pool refresh after proxy activation: ' + errMsg(error), 'warn'));
+      }
+    } else {
+      const runtime = f.deployVersion === 'v3' ? FLASH_ARB_V3_RUNTIME : f.deployVersion === 'v2' ? FLASH_ARB_V2_RUNTIME : null;
+      if (runtime && !await this.contractOk(address, runtime, blockNumber)) throw new Error('Confirmed deployment could not be verified');
+      this.clearDeployment({ address, gasWei });
+    }
+    return address;
+  }
+
   private async verifyForArm(address: Address, generation: number) {
     try {
-      if (!await this.contractOk(address)) throw new Error(`${this.contractLabel} bytecode or bot wallet ownership could not be verified.`);
+      const proxy = this.file.proxyRelease;
+      const verified = proxy
+        ? await verifyFlashProxy(address, this.host.account.address, proxy)
+        : await this.contractOk(address);
+      if (!verified) throw new Error(`${this.contractLabel} bytecode or bot wallet ownership could not be verified.`);
       if (!this.liveArmed(generation)) return;
       if (!this.selectedContract) {
         const previous = this.file.v2Contract;
@@ -1174,12 +1246,21 @@ export class MevSearcher {
     }
   }
 
-  async deploymentQuote() {
-    if (!this.canDeployV3 || this.walletPending()) throw new Error('FlashArbV3 deployment quote is unavailable.');
-    const { balance, minimumWei, estimatedWei, gas, maxFeePerGas } = await this.host.exec.quoteDeployment(FLASH_ARB_V3_BYTECODE);
+  private proxyTransaction(action: ProxyAction) {
+    if (action === 'deploy') return { data: proxyCreationData(), address: undefined };
+    const { proxyContract, proxyRelease } = this.file;
+    if (!proxyContract || !proxyRelease) throw new Error('A verified proxy deployment is required before upgrades.');
+    return { data: proxyUpgradeData(proxyRelease), address: proxyContract };
+  }
+
+  async deploymentQuote(action: ProxyAction = 'deploy') {
+    if (!this.proxyActionAvailable(action) || this.walletPending()) throw new Error('The FlashArb proxy gas quote is unavailable.');
+    const { data, address } = this.proxyTransaction(action);
+    const { balance, minimumWei, estimatedWei, gas, maxFeePerGas } = await this.host.exec.quoteDeployment(data, address);
     const maximumWei = estimatedWei === null ? null : gas * maxFeePerGas;
     return {
-      version: 'v3' as const,
+      version: 'proxy' as const,
+      release: proxyReleaseHash,
       maximumWei: maximumWei?.toString() ?? null,
       balanceEth: eth(balance),
       minimumEth: eth(minimumWei),
@@ -1188,56 +1269,60 @@ export class MevSearcher {
     };
   }
 
-  /** This action authorizes one deployment. Live trading stays separately controlled. */
-  async deployFromDashboard(maximumGasWei: bigint, disarmSpot?: () => void): Promise<Address> {
+  /** The dashboard authorizes one wallet transaction for a single bundled release. */
+  async deployFromDashboard(maximumGasWei: bigint, disarmSpot?: () => void, action: ProxyAction = 'deploy', release: Hex = proxyReleaseHash): Promise<Address> {
     if (!MEV.enabled) throw new Error('MEV is turned off in .env (MEV=off).');
     if (!CONFIG.allowLiveTrading && !CONFIG.forkMode) throw new Error('Live execution is disabled (ALLOW_LIVE_TRADING=off).');
     if (this.stateReadError) throw new Error(this.stateReadError);
-    if (!this.canDeployV3 || this.walletPending() || this.host.tradePending()) {
-      throw new Error('FlashArbV3 is already selected or the wallet is unavailable for a deployment.');
+    if (release !== proxyReleaseHash || !this.proxyActionAvailable(action) || this.walletPending() || this.host.tradePending()) {
+      throw new Error('The requested FlashArb proxy release is unavailable or another wallet transaction is in progress.');
     }
 
+    const { data, address } = this.proxyTransaction(action);
     let generation = this.armGeneration;
     this.deploying = true;
     this.status = this.modeText();
     const f = this.file;
     const canSend = () => this.deploying && this.armGeneration === generation && !this.stopping
       && !this.stateReadError && !this.pending && !this.host.tradePending();
+    const log = (message: string) => this.host.log('[mev] ' + message);
+    const onSigned = (hash: Hex, nonce: number) => {
+      f.deployTx = hash;
+      f.deployVersion = action === 'deploy' ? 'proxy' : 'proxy-upgrade';
+      f.deployRelease = release;
+      f.deployNonce = nonce;
+      f.deployStartedAt = Date.now();
+      try {
+        this.writeState();
+      } catch (error) {
+        f.deployTx = null;
+        f.deployVersion = null;
+        f.deployRelease = null;
+        f.deployNonce = null;
+        f.deployStartedAt = null;
+        throw error;
+      }
+    };
+    const options = {
+      maximumGasWei,
+      beforeSign: () => {
+        disarmSpot?.();
+        if (f.armed) this.disarm('for the FlashArb proxy transaction');
+        generation = this.armGeneration;
+      },
+    };
     try {
-      const r = await this.host.exec.deployContract(
-        FLASH_ARB_V3_BYTECODE,
-        (message) => this.host.log('[mev] ' + message),
-        (hash, nonce) => {
-          f.deployTx = hash;
-          f.deployVersion = 'v3';
-          f.deployNonce = nonce;
-          f.deployStartedAt = Date.now();
-          try {
-            this.writeState();
-          } catch (error) {
-            f.deployTx = null;
-            f.deployVersion = null;
-            f.deployNonce = null;
-            f.deployStartedAt = null;
-            throw error;
-          }
-        },
-        canSend,
-        {
-          maximumGasWei,
-          beforeSign: () => {
-            disarmSpot?.();
-            if (f.armed) this.disarm('for the FlashArbV3 deployment');
-            generation = this.armGeneration;
-          },
-        },
-      );
-      if (!await this.contractOk(r.address, FLASH_ARB_V3_RUNTIME, r.blockNumber)) throw new Error('Confirmed FlashArbV3 deployment could not be verified');
-      this.clearDeployment({ address: r.address, gasWei: r.gasWei });
-      this.host.log('[mev] Verified FlashArbV3 deployment at ' + r.address, 'trade');
-      return r.address;
+      if (address && (!f.proxyRelease || !await verifyFlashProxy(address, this.host.account.address, f.proxyRelease))) {
+        throw new Error('The proxy changed since its last verified deployment.');
+      }
+      const r = address ? await this.host.exec.upgradeContract(address, data, log, onSigned, canSend, options)
+        : await this.host.exec.deployContract(data, log, onSigned, canSend, options);
+      const target = await this.verifyAndRecordDeployment(address ? null : r.address, address ?? null,
+        this.host.account.address, r.gasWei, r.blockNumber);
+      this.host.log('[mev] Verified FlashArb Proxy release at ' + target, 'trade');
+      return target;
     } catch (error) {
-      if (error instanceof UncertainTxError) throw new Error('The deployment transaction is awaiting confirmation. Recovery continues in paper mode.');
+      if (error instanceof UncertainTxError) throw new Error('The FlashArb proxy transaction is awaiting confirmation. Recovery continues in paper mode.');
       throw error;
     } finally {
       this.deploying = false;
@@ -1263,11 +1348,14 @@ export class MevSearcher {
       armed: f.armed,
       contract: this.selectedContract,
       configuredContract: this.configuredContract,
-      canDeployV3: this.canDeployV3,
-      contractVersion: this.isV3 ? 'v3' : 'v2',
+      canDeployProxy: this.proxyActionAvailable('deploy'),
+      canUpgradeProxy: this.proxyActionAvailable('upgrade'),
+      proxyImplementation: f.proxyImplementation ?? null,
+      proxyRelease: f.proxyRelease ?? null,
+      contractVersion: f.proxyContract ? 'proxy' : this.isV3 ? 'v3' : 'v2',
       fundingMode: MEV.funding,
-      deployedAt: (this.isV3 ? f.v3DeployedAt : f.v2DeployedAt) ?? null,
-      deployGasUsd: (this.isV3 ? f.v3DeployGasUsd : f.v2DeployGasUsd) ?? 0,
+      deployedAt: (f.proxyContract ? f.proxyDeployedAt : this.isV3 ? f.v3DeployedAt : f.v2DeployedAt) ?? null,
+      deployGasUsd: (f.proxyContract ? f.proxyDeployGasUsd : this.isV3 ? f.v3DeployGasUsd : f.v2DeployGasUsd) ?? 0,
       tokens: this.tokens.length,
       pools: this.tokens.reduce((s, t) => s + t.pools.length, 0),
       venues,
@@ -1286,7 +1374,8 @@ export class MevSearcher {
       best: f.best.slice(-24),
       stats: f.stats,
       pending: this.pending ? { hash: this.pending.hash, target: Number(this.pending.target) } : null,
-      deploymentPending: f.deployTx,
+      deploymentPending: f.deployVersion === 'proxy-upgrade' ? null : f.deployTx,
+      upgradePending: f.deployVersion === 'proxy-upgrade' ? f.deployTx : null,
       recent: retainRecent(f.recent, DASHBOARD_RECENT_LIMIT, DASHBOARD_BUNDLE_LIMIT),
       settings: {
         tipPct: MEV.builderTipPct, minNetUsd: MEV.minNetUsd, minPoolWeth: MEV.minPoolWeth,

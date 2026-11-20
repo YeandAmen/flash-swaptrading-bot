@@ -270,9 +270,9 @@ export class LiveExecutor implements Executor {
     return { block, tip, estimatedGas, base: block.baseFeePerGas ?? parseGwei('1') };
   }
 
-  async quoteDeployment(bytecode: Hex) {
+  async quoteDeployment(data: Hex, to?: Address) {
     const [{ block, tip, estimatedGas, base }, balance] = await Promise.all([
-      this.estimateFees(bytecode),
+      this.estimateFees(data, to),
       publicClient.getBalance({ address: this.address, blockTag: 'latest' }),
     ]);
     const next = block.baseFeePerGas === null ? base : nextBaseFee(block);
@@ -290,8 +290,8 @@ export class LiveExecutor implements Executor {
   }
 
   private async transactionFees(to: Address | null, data: Hex, maximumGasWei?: bigint) {
-    if (to === null) {
-      const quote = await this.quoteDeployment(data);
+    if (to === null || maximumGasWei !== undefined) {
+      const quote = await this.quoteDeployment(data, to ?? undefined);
       if (quote.balance < quote.minimumWei) throw new DeploymentGasError(quote.balance, quote.minimumWei);
       if (maximumGasWei !== undefined) {
         if (maximumGasWei < quote.minimumWei) throw new DeploymentFeeLimitError(quote.minimumWei);
@@ -314,6 +314,14 @@ export class LiveExecutor implements Executor {
       const { hash, receipt } = await this.sendTx(null, bytecode, 'deploy', log, onSigned, canSend, options);
       if (!receipt.contractAddress) throw new Error(`deploy ${hash} mined but created no contract`);
       return { address: receipt.contractAddress, hash, gasWei: receipt.gasUsed * receipt.effectiveGasPrice, blockNumber: receipt.blockNumber };
+    });
+  }
+
+  /** Upgrades the bot's proxy using the same gas approval and wallet journal as creation. */
+  async upgradeContract(address: Address, data: Hex, log: (m: string) => void, onSigned: (hash: Hex, nonce: number) => void, canSend: () => boolean, options: DeploymentOptions) {
+    return this.exclusive(async () => {
+      const { hash, receipt } = await this.sendTx(address, data, 'upgrade', log, onSigned, canSend, options);
+      return { address, hash, gasWei: receipt.gasUsed * receipt.effectiveGasPrice, blockNumber: receipt.blockNumber };
     });
   }
 

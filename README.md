@@ -90,7 +90,7 @@ On Windows PowerShell, use `curl.exe` for these commands.
 
 ## 4. Arbitrage venues and funding
 
-FlashArbV2 supports Uniswap v2/v3, SushiSwap v2/v3, and PancakeSwap v3 WETH pairs, plus supported hook-free, static-fee Uniswap v4 ETH or WETH pools. Eligible routes can use pool funding, Aave V3 WETH flash loans, or Morpho Blue WETH flash loans. `MEV_FUNDING=auto` compares available sources. Use `pool`, `aave`, or `morpho` to select one source. Aave charges a repayment premium. Morpho Blue has no lender premium and can lend up to its available balance.
+The FlashArb proxy supports Uniswap v2/v3, SushiSwap v2/v3, and PancakeSwap v2/v3 WETH pairs, plus hook-free, static-fee Uniswap v4 ETH or WETH pools. Funding can come from the buy pool, Aave V3, Morpho Blue, Balancer V3, or SparkLend. `MEV_FUNDING=auto` compares the available sources. Use `pool`, `aave`, `morpho`, `balancer`, or `spark` to select one source. The scanner uses the capabilities of the selected release and reads the actual repayment and gas costs in simulations.
 
 The searcher checks canonical factory or PoolManager state. It compares live pool depth, quotes candidate sizes at a consistent block, and rejects candidates that fail the profit floor after gas and any applicable flash-loan premium and builder tip. The V4 scanner restricts compatibility to pool types the contract can settle. Tokens from the public Ethereum token lists are indexed in paced batches. `MEV_UNIVERSE=spot` restricts the sweep to the spot and core universe, and `MEV_MAX_TRACKED_POOLS` limits active per-block reads.
 
@@ -137,31 +137,27 @@ Remove-Item Env:FORK_BLOCK_NUMBER
 
 Ethereum block `26451239` contains the canonical PancakeSwap v3 and Uniswap v4 pools used by the V2 fixture. Choose another archive snapshot by setting `FORK_BLOCK_NUMBER`. Use the `ANVIL` environment variable for a locally installed executable outside your `PATH`.
 
-## 6. Deploy FlashArbV3 from the dashboard
+## 6. Deploy and upgrade the FlashArb proxy
 
-Paper scanning is available after startup. If the live controls are disabled, check `ALLOW_LIVE_TRADING` in `.env`. The default `off` blocks every broadcast, including contract deployment. Both live modes start disarmed on every restart.
+Paper scanning is available after startup. The default `ALLOW_LIVE_TRADING=off` blocks signing, including contract actions. Set it to `on` and restart the bot when you want to authorize a deployment or upgrade.
 
-1. To allow a real mainnet deployment, set `ALLOW_LIVE_TRADING=on` in `.env` and restart the bot. Use `npm run service:restart` for the installed macOS service, or stop and restart `npm start` for a foreground run.
-2. Open [the local dashboard](http://127.0.0.1:7777), wait for the wallet to be ready, and select **Deploy FlashArbV3**. The dialog shows the estimated fee and the maximum gas charge you authorize. If the balance is low, it shows the minimum ETH needed at current gas prices.
-3. Type `DEPLOY` and authorize the action with the password from `npm run --silent dashboard:password`. The bot rechecks the gas cap and disarms both modes before signing. It selects V3 after verifying the deployed bytecode and wallet ownership at the confirmed receipt block. An existing V2 stays in the local deployment history.
-4. **Arm MEV** separately when you want live arbitrage. Spot trading has its own arming control. To return to paper-only operation, set `ALLOW_LIVE_TRADING=off` and restart.
+1. Open [the local dashboard](http://127.0.0.1:7777), wait for the wallet to be ready, and select **Deploy upgradeable FlashArb**. The dialog shows the implementation hash, the estimated fee, and the exact maximum gas charge.
+2. Type `DEPLOY` and enter the operator password from `npm run --silent dashboard:password`. One transaction creates the proxy and its initial implementation. The bootstrapped proxy uses the bot wallet as its trading owner and upgrade admin.
+3. The bot disarms Spot and MEV before signing. It selects the proxy after verifying the receipt, proxy bytecode, ERC-1967 slots, implementation bytecode, and wallet ownership. Use **Arm MEV** separately when you want live arbitrage. An existing standalone deployment remains selected until the proxy passes verification.
+4. When a later bot release includes a new approved implementation, choose **Upgrade FlashArb implementation** and confirm with `UPGRADE`. One transaction creates and activates the new implementation at the same proxy address. The gas quote covers the implementation deployment and switch. An upgrade also disarms both live modes.
 
-The dashboard reuses a verified V2 deployment. To adopt a manually deployed copy, set `MEV_V2_CONTRACT_ADDRESS` to the FlashArbV2 address owned by the bot wallet and restart. The bot verifies its runtime and owner before use.
+Profitable trades repay the lender and forward proceeds and relevant route leftovers to the bot wallet in one transaction. Call the owner-only `sweep` function on the proxy to recover assets transferred to it outside a route.
 
-### Manual FlashArbV3 deployment and fork tests
-
-FlashArbV3 adds Balancer V3 WETH funding to the existing swap routes and lending options. It executes the two swaps, repays the lender and returns the contract's proceeds to its deploying wallet in the same transaction. The owner and runtime checks apply to the configured V3 address. [Balancer V3 flash loans](https://docs.balancer.fi/concepts/vault/flash-loans.html)
+For maintainers, keep the trading owner in persistent slot zero, the execution lock in transient slot zero, and the existing execution and settlement interfaces compatible. Keep previously supported implementation runtimes in the bot's release list so existing proxies can still operate after a software update. Rebuild with solc 0.8.26, then verify the upgrade on a pinned Ethereum fork using fake funds.
 
 ```sh
-npm run build:contract -- v3
+npm run build:contract -- logic
 npm run build
-FORK_BLOCK_NUMBER=26451239 npm run mev-v3-fork-test
-npm run --silent mev:v3:bytecode
+npm run wallet:local-test
+FORK_BLOCK_NUMBER=26451239 npm run mev-proxy-fork-test
 ```
 
-The fork suite signs fake-funded transactions and submits them to the local Anvil node via Ethereum JSON-RPC. The last command prints creation bytecode for deployment from the bot wallet. The constructor takes no arguments. After deploying and settling any outstanding bot transactions, configure the new address as `MEV_V3_CONTRACT_ADDRESS` with any V2 address setting removed, then restart. Use `MEV_FUNDING=auto` to compare all four funding sources or `MEV_FUNDING=balancer` for Balancer V3. Live MEV continues to use the configured private bundle destinations.
-
-Successful routes settle the loan and forward net proceeds and relevant route leftovers to the owner. An owner-only recovery path handles assets transferred to the contract outside a route. For manual deployment, use `npm run --silent mev:v2:bytecode` to obtain the public creation data and deploy from the bot wallet on Ethereum mainnet. If you change the Solidity source, rebuild it with `npm run build:contract` using `solc` 0.8.26, then run `npm run build`.
+The proxy uses standardized implementation and admin slots. [ERC-1967](https://eips.ethereum.org/EIPS/eip-1967) · [SparkLend Ethereum deployment verification](https://docs.spark.fi/assets/Chainsecurity-SparkLend-Deployment-Verification.pdf)
 
 ## Commands and key settings
 
@@ -185,7 +181,7 @@ Successful routes settle the loan and forward net proceeds and relevant route le
 | `PORT`, `DATA_DIR`, `WALLET_KEY_FILE` | Local dashboard port, state directory and optional protected key import. |
 | `TOKEN_MODE`, `TOKEN_LIST_URLS`, `MEV_UNIVERSE` | Spot token strategy and separate MEV list scope. |
 | `MEV_V2_CONTRACT_ADDRESS` | Optional existing FlashArbV2 deployment owned by the bot wallet. |
-| `MEV_FUNDING`, `MEV_MIN_POOL_WETH`, `MEV_MIN_NET_USD` | V2 funding selection, depth and profit floors. |
+| `MEV_FUNDING`, `MEV_MIN_POOL_WETH`, `MEV_MIN_NET_USD` | Funding selection, pool depth, and net profit floor. |
 | `MEV_BUILDERS`, `MEV_BUILDER_TIP_PCT`, `MEV_MAX_TRACKED_POOLS`, `MEV_MAX_SIMS_PER_BLOCK` | Bundle destinations, builder bid, active read budget and candidate simulation budget. |
 
 Use one running bot per wallet. Back up the wallet and its state, including `state.json`, `wallet-transaction.json`, and MEV journal files. Preserve the journals if a signed transaction cannot be reconciled. A restart restores monitoring and resets both live arming flags.

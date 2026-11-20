@@ -15,9 +15,22 @@ let stateRequest = null;
 let tab = 'live';
 let qrLoaded = false;
 let panicPending = false;
-let mevDeploySubmitting = false;
-let mevDeployQuoteRequest = 0;
-let mevDeployMaximumWei = null;
+const mevContractActions = {
+  deploy: {
+    label: 'Deploy upgradeable FlashArb',
+    confirmation: 'DEPLOY',
+    impact: 'The bot wallet will own the proxy. The bot uses the new address after verifying the deployment. Spot and MEV are disarmed before signing. Re-arm the modes you want after deployment.',
+  },
+  upgrade: {
+    label: 'Upgrade FlashArb implementation',
+    confirmation: 'UPGRADE',
+    impact: 'The bot keeps its FlashArb proxy address. This upgrade deploys and installs a new implementation in one transaction. Spot and MEV are disarmed before signing. Re-arm the modes you want after verification.',
+  },
+};
+let mevContractAction = null;
+let mevContractSubmitting = false;
+let mevContractQuoteRequest = 0;
+let mevContractQuote = null;
 
 async function api(path, body) {
   const send = (authorization) => fetch(path, {
@@ -314,33 +327,47 @@ function bundleDetails(submission, openBundles) {
     </details>`;
 }
 
+function availableMevContractAction(mev) {
+  if (mev?.mode === 'off') return null;
+  if (mev?.canUpgradeProxy === true) return 'upgrade';
+  return mev?.canDeployProxy === true ? 'deploy' : null;
+}
+
 function renderMevControls(X) {
   const contract = X?.contract || X?.configuredContract;
-  const contractName = X?.contractVersion === 'v3' ? 'FlashArbV3' : 'FlashArbV2';
+  const isProxy = X?.contractVersion === 'proxy';
+  const contractName = isProxy ? 'FlashArb proxy' : 'Legacy FlashArb';
   const off = X?.mode === 'off';
-  const canDeploy = X?.canDeployV3 === true && !off;
+  const action = availableMevContractAction(X);
   let reason = '';
   if (!X) reason = 'Waiting for bot status.';
   else if (off) reason = 'MEV scanning is disabled by MEV=off in .env.';
-  else if (X.deploymentPending) reason = 'Waiting for the contract deployment receipt.';
-  else if (mevDeploySubmitting || X.mode === 'deploying') reason = 'Preparing FlashArbV3 deployment…';
+  else if (X.upgradePending) reason = 'Waiting for the FlashArb upgrade receipt.';
+  else if (X.deploymentPending) reason = 'Waiting for the FlashArb deployment receipt.';
+  else if (X.mode === 'upgrading' || (mevContractSubmitting && mevContractAction === 'upgrade')) reason = 'Preparing the FlashArb upgrade…';
+  else if (X.mode === 'deploying' || mevContractSubmitting) reason = 'Preparing the FlashArb deployment…';
   else if (X.mode === 'arming') reason = `Checking ${contractName} before arming…`;
-  else if (!S.liveTradingAllowed) reason = 'Set ALLOW_LIVE_TRADING=on in .env and restart to enable deployment and live MEV.';
+  else if (!S.liveTradingAllowed) reason = 'Set ALLOW_LIVE_TRADING=on in .env and restart to enable contract changes and live MEV.';
   else if (!S.health.ready) reason = S.health.reason || 'Waiting for the bot to be ready.';
   else if (X.pending) reason = 'Waiting for a submitted MEV bundle to settle.';
 
-  $('mevDeployBtn').hidden = !canDeploy;
-  $('mevDeployBtn').disabled = Boolean(reason || !canDeploy);
+  const actionButton = $('mevDeployBtn');
+  actionButton.hidden = action === null;
+  actionButton.disabled = Boolean(reason || action === null);
+  if (action) actionButton.textContent = mevContractActions[action].label;
   $('mevArmBtn').hidden = Boolean(X?.armed || off);
   $('mevArmBtn').disabled = Boolean(reason || !contract);
   $('mevDisarmBtn').hidden = !X?.armed;
   $('mevContract').hidden = !contract;
   $('mevContract').textContent = contract ? `${contractName} ${contract}${X.contract ? '' : ' (configured)'}` : '';
-  const status = reason || (canDeploy && !contract ? 'Deploy FlashArbV3 to enable MEV arming.' : '');
+  const implementation = $('mevImplementation');
+  implementation.hidden = !(isProxy && X.proxyImplementation);
+  implementation.textContent = implementation.hidden ? '' : `Implementation ${X.proxyImplementation}`;
+  const status = reason || (action === 'deploy' && !contract ? 'Deploy upgradeable FlashArb to enable MEV arming.' : '');
   const statusNode = $('mevDeploy');
   if (statusNode.textContent !== status) statusNode.textContent = status;
   statusNode.hidden = !status;
-  updateMevDeployConfirm();
+  updateMevContractConfirm();
 }
 
 function spark(svg, pts, base) {
@@ -382,25 +409,31 @@ $('disarmBtn').onclick = async () => {
   refresh();
 };
 const mevDeployDlg = $('mevDeployDlg');
-function updateMevDeployConfirm() {
-  $('mevDeployConfirm').disabled = $('mevDeployBtn').disabled || mevDeployMaximumWei === null
-    || $('mevDeployInput').value.trim() !== 'DEPLOY';
+function updateMevContractConfirm() {
+  const action = mevContractActions[mevContractAction];
+  $('mevDeployConfirm').disabled = !action || mevContractAction !== availableMevContractAction(S?.mev)
+    || $('mevDeployBtn').disabled || mevContractQuote === null
+    || $('mevDeployInput').value.trim() !== action.confirmation;
 }
-async function loadMevDeployQuote() {
-  mevDeployMaximumWei = null;
-  updateMevDeployConfirm();
+async function loadMevContractQuote(action) {
+  mevContractQuote = null;
+  updateMevContractConfirm();
+  const releaseLabel = $('mevDeployRelease');
+  releaseLabel.hidden = true;
+  const transaction = action === 'upgrade' ? 'The upgrade' : 'Deployment';
   const fee = S.forkMode
-    ? 'Deployment spends test ETH from the bot wallet on this local fork.'
-    : 'Deployment sends a mainnet transaction and spends real ETH from the bot wallet.';
+    ? `${transaction} spends test ETH from the bot wallet on this local fork.`
+    : `${transaction} sends a mainnet transaction and spends real ETH from the bot wallet.`;
   $('mevDeployGas').textContent = fee + ' Checking current gas prices…';
-  const request = ++mevDeployQuoteRequest;
+  const request = ++mevContractQuoteRequest;
   try {
-    const response = await fetch('/api/mev/deploy/quote', { cache: 'no-store', signal: AbortSignal.timeout(10_000) });
+    const response = await fetch(`/api/mev/${action}/quote`, { cache: 'no-store', signal: AbortSignal.timeout(10_000) });
     if (!response.ok) throw new Error();
     const quote = await response.json();
-    if (request !== mevDeployQuoteRequest || !mevDeployDlg.open) return;
-    if (quote.version !== 'v3' || (quote.maximumWei === null) !== (quote.maximumEth === null)
-      || (quote.maximumWei !== null && (typeof quote.maximumWei !== 'string' || !/^[1-9][0-9]*$/.test(quote.maximumWei)))) {
+    if (request !== mevContractQuoteRequest || !mevDeployDlg.open) return;
+    if (quote.version !== 'proxy' || typeof quote.release !== 'string' || !/^0x[a-f0-9]{64}$/i.test(quote.release)
+      || (quote.maximumWei === null) !== (quote.maximumEth === null)
+      || (quote.maximumWei !== null && (typeof quote.maximumWei !== 'string' || !/^[1-9][0-9]{0,77}$/.test(quote.maximumWei)))) {
       throw new Error();
     }
     const eth = (value, amount = value.toFixed(8)) => {
@@ -414,49 +447,63 @@ async function loadMevDeployQuote() {
       ? `Wallet balance is ${eth(quote.balanceEth)}. At current gas prices the wallet needs at least ${eth(quote.minimumEth)}.`
       : `Estimated fee is ${eth(quote.estimatedEth)}. The transaction gas cap is ${eth(quote.maximumEth, exactCap)}.`;
     $('mevDeployGas').textContent = `${fee} ${cost} Gas is rechecked when you confirm.`;
-    mevDeployMaximumWei = quote.maximumWei;
-    updateMevDeployConfirm();
+    releaseLabel.textContent = `Implementation code hash ${quote.release}`;
+    releaseLabel.hidden = false;
+    if (quote.maximumWei !== null) mevContractQuote = quote;
+    updateMevContractConfirm();
   } catch {
-    if (request === mevDeployQuoteRequest && mevDeployDlg.open) {
+    if (request === mevContractQuoteRequest && mevDeployDlg.open) {
       $('mevDeployGas').textContent = fee + ' Gas quote unavailable. Reopen this dialog to request a fresh quote.';
     }
   }
 }
 $('mevDeployBtn').onclick = async () => {
-  if ($('mevDeployBtn').disabled) return;
+  const action = availableMevContractAction(S?.mev);
+  if (!action || $('mevDeployBtn').disabled) return;
+  mevContractAction = action;
+  const details = mevContractActions[action];
+  $('mevDeployTitle').textContent = details.label + '?';
+  $('mevDeployImpact').textContent = details.impact;
+  $('mevDeployKeyword').textContent = details.confirmation;
+  $('mevDeployConfirm').textContent = details.label;
   $('mevDeployInput').value = '';
   $('mevDeployError').hidden = true;
   mevDeployDlg.showModal();
-  await loadMevDeployQuote();
+  await loadMevContractQuote(action);
 };
-$('mevDeployInput').oninput = updateMevDeployConfirm;
+$('mevDeployInput').oninput = updateMevContractConfirm;
 $('mevDeployCancel').onclick = () => mevDeployDlg.close();
-mevDeployDlg.oncancel = (event) => { if (mevDeploySubmitting) event.preventDefault(); };
+mevDeployDlg.oncancel = (event) => { if (mevContractSubmitting) event.preventDefault(); };
 $('mevDeployConfirm').onclick = async () => {
   if ($('mevDeployConfirm').disabled) return;
-  mevDeploySubmitting = true;
+  const action = mevContractAction;
+  const { confirmation } = mevContractActions[action];
+  const { maximumWei, release } = mevContractQuote;
+  mevContractSubmitting = true;
   $('mevDeployCancel').disabled = true;
   $('mevDeployInput').disabled = true;
   $('mevDeployError').hidden = true;
   renderMevControls(S.mev);
   let retryQuote = false;
   try {
-    await api('/api/mev/deploy', { confirm: 'DEPLOY', version: 'v3', maximumWei: mevDeployMaximumWei });
+    await api(`/api/mev/${action}`, { confirm: confirmation, version: 'proxy', maximumWei, release });
     mevDeployDlg.close();
   } catch (error) {
-    mevDeployMaximumWei = null;
+    mevContractQuote = null;
     $('mevDeployInput').value = '';
     $('mevDeployError').textContent = error.message;
     $('mevDeployError').hidden = false;
     retryQuote = true;
   } finally {
     await refresh();
-    mevDeploySubmitting = false;
+    mevContractSubmitting = false;
     $('mevDeployCancel').disabled = false;
     $('mevDeployInput').disabled = false;
     renderMevControls(S?.mev);
   }
-  if (retryQuote && mevDeployDlg.open && !$('mevDeployBtn').disabled) await loadMevDeployQuote();
+  if (retryQuote && mevDeployDlg.open && !$('mevDeployBtn').disabled && action === availableMevContractAction(S?.mev)) {
+    await loadMevContractQuote(action);
+  }
 };
 const mevDlg = $('mevDlg');
 $('mevArmBtn').onclick = () => {

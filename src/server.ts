@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import QRCode from 'qrcode';
-import { formatUnits } from 'viem';
+import { formatUnits, type Hex } from 'viem';
 import { CONFIG, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from './config.js';
 import { createDashboardCredentialCheck } from './dashboard-auth.js';
 import { endpointOrigin, redactDiagnostic } from './diagnostics.js';
@@ -244,23 +244,29 @@ app.post('/api/arm', (req, res) => {
   if (allowArming(req, res)) void control(() => engine.arm())(req, res);
 });
 app.post('/api/disarm', control(() => engine.disarm()));
-app.get('/api/mev/deploy/quote', async (_req, res) => {
-  try {
-    if (engine.mev) { res.json(await engine.mev.deploymentQuote()); return; }
-  } catch { /* quotes are optional and may be unavailable while the RPC is warming up */ }
-  res.status(503).json({ error: 'The deployment gas quote is currently unavailable.' });
-});
-app.post('/api/mev/deploy', (req, res) => {
-  const { confirm, version, maximumWei } = req.body ?? {};
-  if (confirm !== 'DEPLOY' || version !== 'v3' || typeof maximumWei !== 'string' || !/^[1-9][0-9]{0,77}$/.test(maximumWei)) {
-    res.status(400).json({ error: 'Refresh the dashboard and confirm a FlashArbV3 gas quote.' });
-    return;
-  }
-  if (!allowArming(req, res)) return;
-  const mev = engine.mev;
-  if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
-  void control(async () => ({ address: await mev.deployFromDashboard(BigInt(maximumWei), () => engine.disarm()) }))(req, res);
-});
+for (const action of ['deploy', 'upgrade'] as const) {
+  app.get(`/api/mev/${action}/quote`, async (_req, res) => {
+    try {
+      if (engine.mev) { res.json(await engine.mev.deploymentQuote(action)); return; }
+    } catch { /* quotes are unavailable when the wallet is busy or the release cannot be estimated */ }
+    res.status(503).json({ error: 'The FlashArb proxy gas quote is currently unavailable.' });
+  });
+  app.post(`/api/mev/${action}`, (req, res) => {
+    const { confirm, version, maximumWei, release } = req.body ?? {};
+    if (confirm !== action.toUpperCase() || version !== 'proxy'
+      || typeof maximumWei !== 'string' || !/^[1-9][0-9]{0,77}$/.test(maximumWei)
+      || typeof release !== 'string' || !/^0x[0-9a-f]{64}$/.test(release)) {
+      res.status(400).json({ error: 'Refresh the dashboard and confirm the FlashArb proxy release and gas quote.' });
+      return;
+    }
+    if (!allowArming(req, res)) return;
+    const mev = engine.mev;
+    if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
+    void control(async () => ({
+      address: await mev.deployFromDashboard(BigInt(maximumWei), () => engine.disarm(), action, release as Hex),
+    }))(req, res);
+  });
+}
 app.post('/api/mev/arm', (req, res) => {
   if (req.body?.confirm !== 'MEV') { res.status(400).json({ error: 'Type MEV to confirm' }); return; }
   if (!allowArming(req, res)) return;

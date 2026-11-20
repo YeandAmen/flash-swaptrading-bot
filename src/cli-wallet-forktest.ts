@@ -2,15 +2,17 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createTestClient, http, parseEther, parseGwei } from 'viem';
+import { createTestClient, encodeDeployData, http, keccak256, parseEther, parseGwei, zeroAddress } from 'viem';
 import { mainnet } from 'viem/chains';
 import { publicClient } from './chain.js';
 import { CONFIG, DATA_DIR, MEV } from './config.js';
 import { Engine } from './engine.js';
 import { DeploymentGasError, LiveExecutor, LiveSendBlocked } from './executor.js';
 import { assertForkTestEnvironment } from './forktest-env.js';
+import { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_BYTECODE, FLASH_ARB_PROXY_RUNTIME } from './mev/artifact-proxy.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './mev/artifact-v2.js';
-import { FLASH_ARB_V3_ABI, FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from './mev/artifact-v3.js';
+import { FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from './mev/artifact-v3.js';
+import { proxyCreationData, proxyReleaseHash, verifyFlashProxy } from './mev/proxy.js';
 import { MevSearcher } from './mev/searcher.js';
 import { loadOrCreateWallet } from './wallet.js';
 
@@ -147,7 +149,7 @@ try {
   const paper = new MevSearcher(mevHost);
   assert.equal(paper.view().mode, 'paper');
   assert.equal(paper.view().contract, null);
-  assert.equal(paper.view().canDeployV3, true);
+  assert.equal(paper.view().canDeployProxy, true);
   assert.throws(() => paper.arm(), /deploy|contract/i);
   assert.equal(await nonce(), beforeLegacyDeploy, 'arming cannot deploy a contract');
 
@@ -158,7 +160,7 @@ try {
   assert.equal(wrongCode.view().mode, 'paper', 'wrong configured runtime leaves MEV disarmed');
   assert.equal(await nonce(), beforeLegacyDeploy, 'invalid configured address cannot trigger deployment');
 
-  // Seed an existing installation independently of the dashboard, which now deploys V3.
+  // Seed an existing installation independently of the dashboard, which now deploys the proxy.
   const legacyV2 = await exec.deployContract(FLASH_ARB_V2_BYTECODE, log);
   const v2 = legacyV2.address;
   assert.equal(await publicClient.getCode({ address: v2 }), FLASH_ARB_V2_RUNTIME);
@@ -170,14 +172,14 @@ try {
   assert.equal(conflict.view().mode, 'paper');
   MEV.v2ContractAddress = v2;
   const beforeDeploy = await nonce();
-  const upgrade = new MevSearcher(mevHost);
-  restartedEngine.mev = upgrade;
+  const deploymentSearcher = new MevSearcher(mevHost);
+  restartedEngine.mev = deploymentSearcher;
   const disarmSpot = () => restartedEngine.disarm();
-  assert.equal(upgrade.view().contract, v2);
-  assert.equal(upgrade.view().contractVersion, 'v2');
-  assert.equal(upgrade.view().canDeployV3, true, 'an installed V2 can be upgraded');
+  assert.equal(deploymentSearcher.view().contract, v2);
+  assert.equal(deploymentSearcher.view().contractVersion, 'v2');
+  assert.equal(deploymentSearcher.view().canDeployProxy, true, 'an installed V2 can migrate to the proxy');
   MEV.funding = 'balancer';
-  assert.throws(() => upgrade.arm(), /Balancer V3 funding requires FlashArbV3/);
+  assert.throws(() => deploymentSearcher.arm(), /Balancer V3 funding requires FlashArbV3/);
   MEV.funding = originalFundingMode;
 
   const baseFee = parseGwei('0.05');
@@ -186,81 +188,92 @@ try {
   const head = await publicClient.getBlock({ blockTag: 'latest' });
   assert.equal(head.baseFeePerGas, baseFee);
   assert.equal(head.gasUsed, 0n, 'an empty head makes the latest base fee the higher one');
-  const estimatedGas = await publicClient.estimateGas({ account: account.address, data: FLASH_ARB_V3_BYTECODE });
+  const creationData = proxyCreationData();
+  const estimatedGas = await publicClient.estimateGas({ account: account.address, data: creationData });
   const gasLimit = (estimatedGas * 105n + 99n) / 100n;
   const required = gasLimit * (baseFee + parseGwei('0.03'));
 
   restartedEngine.arm();
-  upgrade.arm();
-  await waitForPreparation(upgrade);
-  assert.equal(upgrade.view().mode, 'live');
+  deploymentSearcher.arm();
+  await waitForPreparation(deploymentSearcher);
+  assert.equal(deploymentSearcher.view().mode, 'live');
   const mevBeforeRejection = fs.readFileSync(mevStateFile, 'utf8');
   await test.setBalance({ address: account.address, value: required - 1n });
-  await assert.rejects(upgrade.deployFromDashboard(required, disarmSpot), DeploymentGasError);
+  await assert.rejects(deploymentSearcher.deployFromDashboard(required, disarmSpot), DeploymentGasError);
   assert.equal(await nonce(), beforeDeploy, 'an unaffordable deploy does not consume a nonce');
   assert.equal(await balance(), required - 1n, 'an unaffordable deploy does not spend gas');
   assert.equal(fs.existsSync(walletJournal), false, 'the affordability error occurs before journaling');
   assert.equal(fs.readFileSync(mevStateFile, 'utf8'), mevBeforeRejection, 'the MEV journal remains unchanged');
-  assert.equal(upgrade.view().deploymentPending, null);
-  assert.equal(upgrade.view().mode, 'live');
+  assert.equal(deploymentSearcher.view().deploymentPending, null);
+  assert.equal(deploymentSearcher.view().mode, 'live');
   assert.equal(restartedEngine.state.armed, true);
 
   const limitedBalance = required + required / 100n;
   const oldRequirement = (estimatedGas * 13n / 10n) * (baseFee * 2n + parseGwei('1.5'));
   assert.ok(limitedBalance < oldRequirement / 10n, 'the old fixed-tip preflight would deny this balance');
   await test.setBalance({ address: account.address, value: limitedBalance });
-  const quote = await exec.quoteDeployment(FLASH_ARB_V3_BYTECODE);
+  const quote = await exec.quoteDeployment(creationData);
   assert.equal(quote.balance, limitedBalance);
   assert.equal(quote.minimumWei, required);
   assert.equal(quote.gas, gasLimit);
   assert.ok(quote.gas * quote.maxFeePerGas <= limitedBalance, 'the quoted fee cap fits available funds');
   assert.equal(await nonce(), beforeDeploy, 'quoting does not consume a nonce');
-  await assert.rejects(upgrade.deployFromDashboard(required - 1n, disarmSpot), /Review the refreshed quote/);
+  await assert.rejects(deploymentSearcher.deployFromDashboard(required - 1n, disarmSpot), /Review the refreshed quote/);
   assert.equal(await nonce(), beforeDeploy, 'a fee cap below the minimum does not consume a nonce');
   assert.equal(await balance(), limitedBalance);
-  assert.equal(upgrade.view().mode, 'live', 'a rejected fee cap leaves MEV armed');
+  assert.equal(deploymentSearcher.view().mode, 'live', 'a rejected fee cap leaves MEV armed');
   assert.equal(restartedEngine.state.armed, true, 'a rejected fee cap leaves spot armed');
   assert.equal(fs.existsSync(walletJournal), false);
   assert.equal(fs.readFileSync(mevStateFile, 'utf8'), mevBeforeRejection);
 
-  const dashboardQuote = await upgrade.deploymentQuote();
+  const dashboardQuote = await deploymentSearcher.deploymentQuote();
   assert.ok(dashboardQuote.maximumWei);
+  assert.equal(dashboardQuote.version, 'proxy');
+  assert.equal(dashboardQuote.release, proxyReleaseHash);
   const quotedMaximum = BigInt(dashboardQuote.maximumWei);
   assert.equal(quotedMaximum, quote.gas * quote.maxFeePerGas);
   const approved = required + (quotedMaximum - required) / 2n;
   assert.ok(approved < quotedMaximum, 'exercise the cap when a confirmed quote is lower than the fresh quote');
+  await assert.rejects(deploymentSearcher.deployFromDashboard(approved, disarmSpot, 'deploy', keccak256(FLASH_ARB_V3_RUNTIME)), /unavailable/);
+  assert.equal(await nonce(), beforeDeploy, 'a stale release approval must not consume a nonce');
+  assert.equal(restartedEngine.state.armed, true, 'a stale release approval leaves spot armed');
   const [deployment, duplicate] = await Promise.allSettled([
-    upgrade.deployFromDashboard(approved, disarmSpot), upgrade.deployFromDashboard(approved, disarmSpot),
+    deploymentSearcher.deployFromDashboard(approved, disarmSpot), deploymentSearcher.deployFromDashboard(approved, disarmSpot),
   ]);
-  assert.equal(deployment.status, 'fulfilled', 'a balance just above the minimum can upgrade to V3');
+  assert.equal(deployment.status, 'fulfilled', 'a balance just above the minimum can deploy the proxy');
   assert.equal(duplicate.status, 'rejected', 'a duplicate deployment request is blocked while the first is pending');
-  const v3 = deployment.value;
-  assert.equal(upgrade.view().contract, v3);
-  assert.equal(upgrade.view().contractVersion, 'v3');
-  assert.equal(upgrade.view().canDeployV3, false);
-  assert.equal(upgrade.view().mode, 'paper', 'deployment leaves MEV in paper mode');
+  const proxy = deployment.value;
+  assert.equal(deploymentSearcher.view().contract, proxy);
+  assert.equal(deploymentSearcher.view().contractVersion, 'proxy');
+  assert.equal(deploymentSearcher.view().canDeployProxy, false);
+  assert.equal(deploymentSearcher.view().canUpgradeProxy, false, 'the current release does not offer a redundant upgrade');
+  assert.equal(deploymentSearcher.view().mode, 'paper', 'deployment leaves MEV in paper mode');
   assert.equal(restartedEngine.state.armed, false, 'deployment leaves spot trading off');
-  assert.equal(upgrade.file.contract, otherExample.address, 'legacy address remains a historical record');
-  assert.equal(upgrade.file.v2Contract, v2, 'previous V2 remains a historical record');
+  assert.equal(deploymentSearcher.file.contract, otherExample.address, 'legacy address remains a historical record');
+  assert.equal(deploymentSearcher.file.v2Contract, v2, 'previous V2 remains a historical record');
   assert.equal(await publicClient.getCode({ address: v2 }), FLASH_ARB_V2_RUNTIME);
-  assert.equal(await publicClient.getCode({ address: v3 }), FLASH_ARB_V3_RUNTIME);
-  assert.equal(await publicClient.readContract({ address: v3, abi: FLASH_ARB_V3_ABI, functionName: 'owner' }), account.address);
-  await assert.rejects(upgrade.deployFromDashboard(approved, disarmSpot));
+  assert.equal(await publicClient.getCode({ address: proxy }), FLASH_ARB_PROXY_RUNTIME);
+  const implementation = await verifyFlashProxy(proxy, account.address, proxyReleaseHash);
+  assert.ok(implementation);
+  assert.equal(deploymentSearcher.view().proxyImplementation, implementation);
+  assert.equal(await verifyFlashProxy(proxy, zeroAddress, proxyReleaseHash), null, 'an unrelated wallet cannot adopt the proxy');
+  await assert.rejects(deploymentSearcher.deployFromDashboard(approved, disarmSpot));
+  await assert.rejects(deploymentSearcher.deploymentQuote('upgrade'), /unavailable/);
   assert.equal(await nonce(), beforeDeploy + 1, 'repeated deployment does not spend gas');
 
-  // Stale V2 configuration remains compatible with the verified V3 selected by the dashboard.
+  // Stale V2 configuration remains compatible with the verified proxy selected by the dashboard.
   MEV.funding = 'balancer';
   const adopted = new MevSearcher(mevHost);
   assert.equal(adopted.view().mode, 'paper');
-  assert.equal(adopted.view().contract, v3);
-  assert.equal(adopted.view().canDeployV3, false);
+  assert.equal(adopted.view().contract, proxy);
+  assert.equal(adopted.view().canDeployProxy, false);
   adopted.arm();
   await waitForPreparation(adopted);
   assert.equal(adopted.view().mode, 'live');
-  assert.equal(await nonce(), beforeDeploy + 1, 'arming reuses the verified V3 without spending gas');
+  assert.equal(await nonce(), beforeDeploy + 1, 'arming reuses the verified proxy without spending gas');
   adopted.disarm();
   assert.equal(new MevSearcher(mevHost).view().mode, 'paper');
-  console.log('✓ Dashboard upgraded FlashArbV2 to V3 once, verified wallet ownership and left both live modes off');
+  console.log('✓ Dashboard migrated FlashArbV2 to a verified proxy in one transaction and left both live modes off');
 
   const afterDeployBalance = await balance();
   const { transactions } = await publicClient.getBlock({ blockTag: 'latest', includeTransactions: true });
@@ -273,42 +286,64 @@ try {
   console.log('✓ Deployment rejects insufficient funds and fee caps before journaling, then signs within the confirmed cap');
 
   const legacyV2Transaction = await publicClient.getTransaction({ hash: legacyV2.hash });
-  const recoveryState = { ...adopted.file, v3Contract: null, v3DeployedAt: null };
+  const recoveryState = {
+    ...adopted.file, proxyContract: undefined, proxyImplementation: undefined, proxyRelease: undefined,
+  };
   fs.writeFileSync(mevStateFile, JSON.stringify({
-    ...recoveryState, deployVersion: 'v3', deployTx: legacyV2.hash,
+    ...recoveryState,
+    deployVersion: 'proxy', deployRelease: proxyReleaseHash,
+    deployTx: creation.hash, deployNonce: creation.nonce, deployStartedAt: Date.now(),
+  }));
+  const recoverProxy = new MevSearcher(mevHost);
+  assert.equal(recoverProxy.view().deploymentPending, creation.hash);
+  assert.equal(recoverProxy.view().contract, v2, 'V2 remains selected until the proxy receipt is verified');
+  await recoverProxy.reconcileWallet();
+  const afterProxyRecovery = new MevSearcher(mevHost);
+  assert.equal(afterProxyRecovery.view().deploymentPending, null);
+  assert.equal(afterProxyRecovery.view().mode, 'paper');
+  assert.equal(afterProxyRecovery.view().contract, proxy);
+  assert.equal(afterProxyRecovery.view().proxyImplementation, implementation);
+  assert.equal(await nonce(), beforeDeploy + 1, 'proxy deployment recovery requires no new sends');
+  assert.equal(await balance(), afterDeployBalance, 'proxy deployment recovery spends no gas');
+
+  // Replay persisted journals for previous deployed versions while preserving the current proxy.
+  await test.setBalance({ address: account.address, value: parseEther('1') });
+  const v3 = await exec.deployContract(FLASH_ARB_V3_BYTECODE, log);
+  const v3Transaction = await publicClient.getTransaction({ hash: v3.hash });
+  const legacyBaselineNonce = await nonce();
+  const legacyBaselineBalance = await balance();
+  fs.writeFileSync(mevStateFile, JSON.stringify({
+    ...afterProxyRecovery.file, deployVersion: 'v3', deployTx: legacyV2.hash,
     deployNonce: legacyV2Transaction.nonce, deployStartedAt: Date.now(),
   }));
   const unexpectedRuntime = new MevSearcher(mevHost);
   await unexpectedRuntime.reconcileWallet();
-  assert.equal(unexpectedRuntime.view().deploymentPending, legacyV2.hash, 'an unverified receipt is retained for recovery');
-  assert.equal(unexpectedRuntime.view().contract, v2, 'a V2 receipt cannot take the V3 slot');
+  assert.equal(unexpectedRuntime.view().deploymentPending, legacyV2.hash, 'an unverified receipt is retained');
+  assert.equal(unexpectedRuntime.view().contract, proxy, 'a mislabeled receipt leaves the proxy selected');
+  assert.equal(unexpectedRuntime.file.v3Contract, undefined, 'a V2 receipt cannot take the V3 slot');
 
-  // Replay persisted intents from each contract generation without broadcasting again.
   fs.writeFileSync(mevStateFile, JSON.stringify({
-    ...recoveryState,
-    deployVersion: 'v3', deployTx: creation.hash, deployNonce: creation.nonce, deployStartedAt: Date.now(),
+    ...afterProxyRecovery.file, deployVersion: 'v3', deployTx: v3.hash,
+    deployNonce: v3Transaction.nonce, deployStartedAt: Date.now(),
   }));
   const recoverV3 = new MevSearcher(mevHost);
-  assert.equal(recoverV3.view().deploymentPending, creation.hash);
-  assert.equal(recoverV3.view().contract, v2, 'V2 remains active until the V3 receipt is verified');
   await recoverV3.reconcileWallet();
   const afterV3Recovery = new MevSearcher(mevHost);
   assert.equal(afterV3Recovery.view().deploymentPending, null);
   assert.equal(afterV3Recovery.view().mode, 'paper');
-  assert.equal(afterV3Recovery.view().contract, v3);
+  assert.equal(afterV3Recovery.view().contract, proxy);
+  assert.equal(afterV3Recovery.file.v3Contract, v3.address);
   assert.equal(afterV3Recovery.file.v2Contract, v2);
-  assert.equal(afterV3Recovery.file.contract, otherExample.address);
 
   fs.writeFileSync(mevStateFile, JSON.stringify({
     ...afterV3Recovery.file, v2Contract: null,
     deployVersion: 'v2', deployTx: legacyV2.hash, deployNonce: legacyV2Transaction.nonce, deployStartedAt: Date.now(),
   }));
   const recoverV2 = new MevSearcher(mevHost);
-  assert.equal(recoverV2.view().deploymentPending, legacyV2.hash);
   await recoverV2.reconcileWallet();
   const afterV2Recovery = new MevSearcher(mevHost);
   assert.equal(afterV2Recovery.view().deploymentPending, null);
-  assert.equal(afterV2Recovery.view().contract, v3);
+  assert.equal(afterV2Recovery.view().contract, proxy);
   assert.equal(afterV2Recovery.file.v2Contract, v2);
 
   fs.writeFileSync(mevStateFile, JSON.stringify({
@@ -316,17 +351,85 @@ try {
     deployTx: example.hash, deployNonce: exampleTx.nonce, deployStartedAt: Date.now(),
   }));
   const recoverLegacy = new MevSearcher(mevHost);
-  assert.equal(recoverLegacy.view().deploymentPending, example.hash);
   await recoverLegacy.reconcileWallet();
   const afterLegacyRecovery = new MevSearcher(mevHost);
   assert.equal(afterLegacyRecovery.view().deploymentPending, null);
   assert.equal(afterLegacyRecovery.view().mode, 'paper');
-  assert.equal(afterLegacyRecovery.view().contract, v3);
-  assert.equal(afterLegacyRecovery.file.v2Contract, v2);
+  assert.equal(afterLegacyRecovery.view().contract, proxy);
   assert.equal(afterLegacyRecovery.file.contract, example.address);
-  assert.equal(await nonce(), beforeDeploy + 1, 'receipt recovery requires no new sends');
-  assert.equal(await balance(), afterDeployBalance, 'receipt recovery spends no gas');
-  console.log('✓ Deployment journal recovery kept V3, V2 and legacy receipts separate without spending gas');
+  assert.equal(await nonce(), legacyBaselineNonce, 'legacy receipt recovery requires no new sends');
+  assert.equal(await balance(), legacyBaselineBalance, 'legacy receipt recovery spends no gas');
+  console.log('✓ Proxy deployment and V3, V2 and legacy journals recover without additional transactions');
+
+  const oldRelease = keccak256(FLASH_ARB_V3_RUNTIME);
+  const oldProxyData = encodeDeployData({
+    abi: FLASH_ARB_PROXY_ABI, bytecode: FLASH_ARB_PROXY_BYTECODE, args: [FLASH_ARB_V3_BYTECODE, oldRelease],
+  });
+  const { address: oldProxy } = await exec.deployContract(oldProxyData, log);
+  const oldImplementation = await verifyFlashProxy(oldProxy, account.address, oldRelease);
+  assert.ok(oldImplementation);
+  const oldProxyState = {
+    ...afterLegacyRecovery.file,
+    proxyContract: oldProxy, proxyImplementation: oldImplementation, proxyRelease: oldRelease,
+  };
+  fs.writeFileSync(mevStateFile, JSON.stringify(oldProxyState));
+  const upgrade = new MevSearcher(mevHost);
+  restartedEngine.mev = upgrade;
+  MEV.funding = 'spark';
+  assert.throws(() => upgrade.arm(), /SparkLend funding requires a compatible FlashArb Proxy release/);
+  MEV.funding = 'balancer';
+  restartedEngine.arm();
+  upgrade.arm();
+  await waitForPreparation(upgrade);
+  assert.equal(upgrade.view().mode, 'live', 'previous reviewed releases can still arm');
+  assert.equal(upgrade.view().canUpgradeProxy, true);
+
+  const beforeUpgrade = await nonce();
+  const upgradeQuote = await upgrade.deploymentQuote('upgrade');
+  assert.ok(upgradeQuote.maximumWei);
+  assert.equal(upgradeQuote.release, proxyReleaseHash);
+  const upgradeMaximum = BigInt(upgradeQuote.maximumWei);
+  await assert.rejects(upgrade.deployFromDashboard(upgradeMaximum, disarmSpot, 'upgrade', oldRelease), /unavailable/);
+  assert.equal(await nonce(), beforeUpgrade, 'an old release approval must not send an upgrade');
+  assert.equal(await upgrade.deployFromDashboard(upgradeMaximum, disarmSpot, 'upgrade', upgradeQuote.release), oldProxy);
+  assert.equal(upgrade.view().contract, oldProxy, 'the upgrade preserves the configured trading address');
+  assert.equal(upgrade.view().mode, 'paper');
+  assert.equal(restartedEngine.state.armed, false);
+  assert.equal(upgrade.view().canUpgradeProxy, false);
+  assert.equal(await publicClient.getCode({ address: oldProxy }), FLASH_ARB_PROXY_RUNTIME);
+  const newImplementation = await verifyFlashProxy(oldProxy, account.address, proxyReleaseHash);
+  assert.ok(newImplementation);
+  assert.notEqual(newImplementation, oldImplementation);
+  assert.equal(upgrade.view().proxyImplementation, newImplementation);
+  assert.equal(await verifyFlashProxy(oldProxy, account.address, oldRelease), null);
+  const { transactions: upgradeTransactions } = await publicClient.getBlock({ blockTag: 'latest', includeTransactions: true });
+  const upgradeTransaction = upgradeTransactions.find((tx) => tx.from.toLowerCase() === account.address.toLowerCase()
+    && tx.nonce === beforeUpgrade && tx.to?.toLowerCase() === oldProxy.toLowerCase());
+  assert.ok(upgradeTransaction);
+  assert.equal(upgradeTransaction.type, 'eip1559');
+  assert.ok(upgradeTransaction.gas * upgradeTransaction.maxFeePerGas <= upgradeMaximum, 'upgrade stays within the approved gas cap');
+  assert.equal(await nonce(), beforeUpgrade + 1, 'installation and activation cost one transaction');
+
+  fs.writeFileSync(mevStateFile, JSON.stringify({
+    ...oldProxyState, deployVersion: 'proxy-upgrade', deployRelease: proxyReleaseHash,
+    deployTx: upgradeTransaction.hash, deployNonce: upgradeTransaction.nonce, deployStartedAt: Date.now(),
+  }));
+  const recoverUpgrade = new MevSearcher(mevHost);
+  assert.equal(recoverUpgrade.view().contract, oldProxy);
+  assert.equal(recoverUpgrade.view().proxyImplementation, oldImplementation);
+  await recoverUpgrade.reconcileWallet();
+  const afterUpgradeRecovery = new MevSearcher(mevHost);
+  assert.equal(afterUpgradeRecovery.view().upgradePending, null);
+  assert.equal(afterUpgradeRecovery.view().contract, oldProxy);
+  assert.equal(afterUpgradeRecovery.view().proxyImplementation, newImplementation);
+  assert.equal(afterUpgradeRecovery.view().mode, 'paper');
+  assert.equal(await nonce(), beforeUpgrade + 1, 'upgrade recovery does not send another transaction');
+  MEV.funding = 'spark';
+  afterUpgradeRecovery.arm();
+  await waitForPreparation(afterUpgradeRecovery);
+  assert.equal(afterUpgradeRecovery.view().mode, 'live', 'new release permits SparkLend funding after verification');
+  afterUpgradeRecovery.disarm();
+  console.log('✓ Dashboard installed and recovered a new implementation at the same address with one approved upgrade transaction');
 } finally {
   MEV.v2ContractAddress = originalV2Address;
   MEV.v3ContractAddress = originalV3Address;

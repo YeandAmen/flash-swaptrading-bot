@@ -3,18 +3,19 @@ import { ADDR, type TokenCfg } from '../config.js';
 import { erc20Abi, factoryAbi, multicall3Abi, poolAbi, v2FactoryAbi, v2PairAbi } from '../chain.js';
 import { bigMulticall, type McResult } from '../market.js';
 import {
-  NextVenueKind, PANCAKE_V3_FACTORY, PANCAKE_V3_FEES, UNISWAP_V4_MANAGER, pancakeV3PoolAbi,
+  NextVenueKind, PANCAKE_V2_FACTORY, PANCAKE_V3_FACTORY, PANCAKE_V3_FEES, UNISWAP_V4_MANAGER, pancakeV3PoolAbi,
   v4Candidates, v4FeeFraction, v4LiquidityRead, v4SlotRead, v4StateReads,
   type V4PoolDescriptor, type V4PoolSeed, type V4Slot0,
 } from './next-pools.js';
 
 const a = (x: string): Address => getAddress(x.toLowerCase());
 
-/** Uniswap-v2-style venues (0.3% fee, same pair/callback interface). */
+/** Legacy Uniswap-v2-style venues (0.3% fee, same pair/callback interface). */
 const V2_VENUES = [
-  { venue: 'Uniswap v2', factory: a('0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f'), kind: NextVenueKind.UniswapV2 },
-  { venue: 'SushiSwap', factory: a('0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac'), kind: NextVenueKind.SushiV2 },
+  { venue: 'Uniswap v2', factory: a('0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f'), kind: NextVenueKind.UniswapV2, fee: 0.003 },
+  { venue: 'SushiSwap', factory: a('0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac'), kind: NextVenueKind.SushiV2, fee: 0.003 },
 ];
+const PANCAKE_V2 = { venue: 'PancakeSwap v2', factory: PANCAKE_V2_FACTORY, kind: NextVenueKind.PancakeV2, fee: 0.0025 };
 const V3_FEES = [100, 500, 3000, 10000];
 /** These factories deploy pools that call FlashArb's existing uniswapV3SwapCallback. */
 const V3_VENUES = [
@@ -23,11 +24,16 @@ const V3_VENUES = [
 ];
 const PANCAKE = { venue: 'PancakeSwap v3', factory: PANCAKE_V3_FACTORY, fees: PANCAKE_V3_FEES, kind: NextVenueKind.PancakeV3 };
 
-/** Liquid tokens worth watching for arbitrage even though the trading strategy skips them (stablecoins). */
+/** Priority tokens for MEV discovery, independent of spot trading's token policy. */
 export const MEV_EXTRA_TOKENS: TokenCfg[] = [
   { symbol: 'USDC', address: ADDR.usdc, decimals: 6, core: true },
   { symbol: 'USDT', address: a('0xdAC17F958D2ee523a2206206994597C13D831ec7'), decimals: 6, core: true },
   { symbol: 'DAI', address: a('0x6B175474E89094C44Da98b954EedeAC495271d0F'), decimals: 18, core: true },
+  { symbol: 'wstETH', address: a('0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0'), decimals: 18, core: true },
+  { symbol: 'rETH', address: a('0xae78736Cd615f374D3085123A210448E74Fc6393'), decimals: 18, core: true },
+  { symbol: 'weETH', address: a('0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee'), decimals: 18, core: true },
+  { symbol: 'cbETH', address: a('0xBe9895146f7AF43049ca1c1AE358B0541Ea49704'), decimals: 18, core: true },
+  { symbol: 'cbBTC', address: a('0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf'), decimals: 8, core: true },
 ];
 
 export interface ArbPool {
@@ -51,12 +57,13 @@ export function poolIdentity(pool: ArbPool): string {
 }
 
 export function toNextVenue(pool: ArbPool) {
-  if (pool.kind === undefined) throw new Error('Unrecognized FlashArbV2 venue');
+  if (pool.kind === undefined) throw new Error('Unrecognized FlashArb venue');
   return { kind: pool.kind, pool: pool.address, fee: pool.v4?.fee ?? Math.round(pool.fee * 1e6),
     tickSpacing: pool.v4?.tickSpacing ?? 0, nativeEth: pool.v4?.nativeEth ?? false };
 }
 
 export interface DiscoverArbOptions {
+  includePancakeV2?: boolean;
   includePancakeV3?: boolean;
   includeUniswapV4?: boolean;
   v4PoolKeys?: readonly V4PoolSeed[];
@@ -99,6 +106,7 @@ export async function discoverArbPools(tokens: TokenCfg[], minWeth: number, opti
     seen.add(k);
     return true;
   });
+  const v2Venues = options.includePancakeV2 ? [...V2_VENUES, PANCAKE_V2] : V2_VENUES;
   const v3Venues = options.includePancakeV3 ? [...V3_VENUES, PANCAKE] : V3_VENUES;
   type Lookup = { ti: number; venue: string; v2: boolean; fee: number; kind: NextVenueKind; call: object };
   const lookups: Lookup[] = [];
@@ -108,8 +116,8 @@ export async function discoverArbPools(tokens: TokenCfg[], minWeth: number, opti
         lookups.push({ ti, venue: `${v.venue} ${fee / 1e4}%`, v2: false, fee: fee / 1e6, kind: v.kind, call: { address: v.factory, abi: factoryAbi, functionName: 'getPool', args: [t.address, ADDR.weth, fee] } });
       }
     }
-    for (const v of V2_VENUES) {
-      lookups.push({ ti, venue: v.venue, v2: true, fee: 0.003, kind: v.kind, call: { address: v.factory, abi: v2FactoryAbi, functionName: 'getPair', args: [t.address, ADDR.weth] } });
+    for (const v of v2Venues) {
+      lookups.push({ ti, venue: v.venue, v2: true, fee: v.fee, kind: v.kind, call: { address: v.factory, abi: v2FactoryAbi, functionName: 'getPair', args: [t.address, ADDR.weth] } });
     }
   });
   const found = await bigMulticall(lookups.map((l) => l.call), 800);

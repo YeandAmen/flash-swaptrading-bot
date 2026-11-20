@@ -3,11 +3,12 @@ import { ADDR, type TokenCfg } from '../config.js';
 
 // Ethereum mainnet deployments from the PancakeSwap and Uniswap developer docs.
 export const PANCAKE_V3_FACTORY = getAddress('0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865');
+export const PANCAKE_V2_FACTORY = getAddress('0x1097053fd2ea711dad45caccc45eff7548fcb362');
 export const UNISWAP_V4_MANAGER = getAddress('0x000000000004444c5dc75cb358380d2e3de08a90');
 export const UNISWAP_V4_STATE_VIEW = getAddress('0x7ffe42c4a5deea5b0fec41c94c136cf115597227');
 export const PANCAKE_V3_FEES = [100, 500, 2500, 10_000];
 
-/** Matches the owner-gated FlashArbV2 venue discriminants. */
+/** Keep discriminants stable for both direct contracts and upgradeable logic. */
 export const enum NextVenueKind {
   UniswapV2 = 0,
   SushiV2 = 1,
@@ -15,6 +16,7 @@ export const enum NextVenueKind {
   SushiV3 = 3,
   PancakeV3 = 4,
   UniswapV4 = 5,
+  PancakeV2 = 6,
 }
 
 // Pancake's protocol-fee field is uint32, not the uint8 used by Uniswap v3.
