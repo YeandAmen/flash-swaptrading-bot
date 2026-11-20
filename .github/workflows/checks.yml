@@ -22,6 +22,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: npm run build
+      - run: node --test dist/ethereum-intent.test.js dist/arbitrum/execution.test.js dist/solana/*.test.js
       - run: node --check public/app.js && node --check scripts/managed-server.mjs && bash -n scripts/service.sh && bash -n scripts/fork-test.sh
       - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1
         with:

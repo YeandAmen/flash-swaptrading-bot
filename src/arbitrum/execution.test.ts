@@ -15,10 +15,11 @@ const profitable: ArbQuote = {
   payout: parseEther('0.001'),
 };
 
-function clientFor({ head = 104n, payout = profitable.payout, feeCap = 100_000_000n } = {}) {
+function clientFor({ head = 104n, preparationBlock = 100n, payout = profitable.payout, feeCap = 100_000_000n } = {}) {
   let finalMinProfit = 0n;
+  let finalDeadline = 0n;
   const client = {
-    getBlock: async () => ({ number: 100n, timestamp: BigInt(Math.floor(Date.now() / 1000)) }),
+    getBlock: async () => ({ number: preparationBlock, timestamp: BigInt(Math.floor(Date.now() / 1000)) }),
     getBlockNumber: async () => head,
     estimateGas: async () => 200_000n,
     estimateFeesPerGas: async () => ({ maxFeePerGas: feeCap, maxPriorityFeePerGas: 1_000_000n }),
@@ -26,11 +27,14 @@ function clientFor({ head = 104n, payout = profitable.payout, feeCap = 100_000_0
       assert.equal(blockTag, 'pending');
       const parsed = decodeFunctionData({ abi: ARBITRUM_FLASH_ARB_ABI, data });
       assert.equal(parsed.functionName, 'execute');
-      if (parsed.functionName === 'execute') finalMinProfit = parsed.args[0].minProfit;
+      if (parsed.functionName === 'execute') {
+        finalMinProfit = parsed.args[0].minProfit;
+        finalDeadline = parsed.args[0].maxBlock;
+      }
       return { data: encodeFunctionResult({ abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', result: payout }) };
     },
   } as unknown as ArbitrumClient;
-  return { client, finalMinProfit: () => finalMinProfit };
+  return { client, finalMinProfit: () => finalMinProfit, finalDeadline: () => finalDeadline };
 }
 
 test('Arbitrum signing gate requires fresh execution to cover padded gas and the net floor', async () => {
@@ -39,6 +43,10 @@ test('Arbitrum signing gate requires fresh execution to cover padded gas and the
   assert.ok(quote);
   assert.equal(quote.worstGasUsd, 0.05);
   assert.equal(ok.finalMinProfit(), quote.gasBudget + parseEther('0.000025'));
+  const delayed = clientFor({ preparationBlock: 117n, head: 119n });
+  const refreshed = await prepareArbitrumOrder(delayed.client, contract, owner, profitable, 2_000, 0.05, 0.50);
+  assert.ok(refreshed);
+  assert.equal(delayed.finalDeadline(), 127n);
   assert.equal(await prepareArbitrumOrder(clientFor({ head: 110n }).client, contract, owner, profitable, 2_000, 0.05, 0.50), null);
   assert.equal(await prepareArbitrumOrder(clientFor({ payout: 1n }).client, contract, owner, profitable, 2_000, 0.05, 0.50), null);
   assert.equal(await prepareArbitrumOrder(clientFor({ feeCap: 2_000_000_000n }).client, contract, owner, profitable, 2_000, 0.05, 0.50), null);

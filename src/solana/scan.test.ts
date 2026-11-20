@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { address, getAddressEncoder, getCompiledTransactionMessageDecoder, getTransactionDecoder } from '@solana/kit';
 import {
-  JUPITER, KAMINO, KAMINO_MARKET, KAMINO_MARKET_LOOKUP, KAMINO_USDC_RESERVE, LOOKUP_PROGRAM, MAINNET_GENESIS,
+  createWalletAta, JUPITER, KAMINO, KAMINO_MARKET, KAMINO_MARKET_LOOKUP, KAMINO_USDC_RESERVE, LOOKUP_PROGRAM, MAINNET_GENESIS,
   USDC, WRAPPED_SOL,
 } from './protocol.js';
+import { LIGHTHOUSE } from './guard.js';
 import { scanSolanaCycle } from './scan.js';
 
 const wallet = address('23g1K6sr2bevNwLYPoB79jzEQtErioYQ8mpUa76xA6yu');
@@ -39,6 +40,19 @@ function lookupFixture() {
 test('Solana paper scanner composes unsigned atomic borrow and repay and gates observed net profit', async (t) => {
   let simulationCount = 0;
   let actualWalletGain = 210_000;
+  let live = false;
+  let reportedFee = fee;
+  const [{ ata: usdcAta }, { ata: solAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
+  const account = (owner: string, data: string, space: number, lamports = 10_000_000) =>
+    ({ owner, data: [data, 'base64'], executable: false, lamports, rentEpoch: 0, space });
+  const walletToken = (mint: string, amount: bigint) => {
+    const data = Buffer.alloc(165);
+    data.set(getAddressEncoder().encode(address(mint)), 0);
+    data.set(getAddressEncoder().encode(wallet), 32);
+    data.writeBigUInt64LE(amount, 64);
+    data[108] = 1;
+    return account(tokenProgram, data.toString('base64'), 165);
+  };
   t.mock.method(globalThis, 'fetch', async (input: URL | RequestInfo, init?: RequestInit) => {
     const url = new URL(String(input));
     if (url.origin === 'https://api.jup.ag') {
@@ -49,17 +63,28 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       const first = inputMint === USDC;
       assert.equal(params.get('wrapAndUnwrapSol'), 'false');
       assert.equal(first ? outputMint : inputMint, WRAPPED_SOL);
-      if (!first) assert.equal(params.get('amount'), '3499000000');
+      if (!first) assert.equal(params.get('amount'), live ? '3498250000' : '3499000000');
+      const outAmount = first ? '3500000000' : '250250000';
+      const bytes = Buffer.alloc(34);
+      Buffer.from('bb64facc31c4af14', 'hex').copy(bytes);
+      bytes.writeBigUInt64LE(BigInt(params.get('amount')!), 8);
+      bytes.writeBigUInt64LE(BigInt(outAmount), 16);
+      bytes.writeUInt16LE(5, 24);
+      const destination = params.get('destinationTokenAccount');
+      const metas = [
+        { pubkey: wallet, isSigner: true, isWritable: false },
+        { pubkey: destination, isSigner: false, isWritable: true },
+      ];
+      const routeMetas = [metas[0], { pubkey: first ? usdcAta : solAta, isSigner: false, isWritable: true }, metas[1],
+        ...[inputMint, outputMint, tokenProgram, tokenProgram, destination, JUPITER, JUPITER]
+          .map((pubkey) => ({ pubkey, isSigner: false, isWritable: false }))];
       return Response.json({
         inputMint, outputMint, inAmount: params.get('amount'),
-        outAmount: first ? '3500000000' : '250250000',
+        outAmount,
         otherAmountThreshold: first ? '3499000000' : '250120000',
         swapMode: 'ExactIn', slippageBps: 5,
         routePlan: [{ swapInfo: { ammKey: first ? USDC : WRAPPED_SOL, label: venue, inputMint, outputMint } }],
-        swapInstruction: { programId: JUPITER, data: 'AA==', accounts: [
-          { pubkey: wallet, isSigner: true, isWritable: false },
-          { pubkey: params.get('destinationTokenAccount'), isSigner: false, isWritable: true },
-        ] },
+        swapInstruction: { programId: JUPITER, data: live ? bytes.toString('base64') : 'AA==', accounts: live ? routeMetas : metas },
         cleanupInstruction: null, tipInstruction: null, otherInstructions: [], addressesByLookupTableAddress: null,
       });
     }
@@ -73,9 +98,13 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       case 'getAccountInfo': return atSlot({ data: [reserveFixture(), 'base64'], executable: false, owner: KAMINO, lamports: 7, rentEpoch: 0, space: 8624 });
       case 'getBalance': return atSlot(10_000_000);
       case 'getMultipleAccounts': {
+        if (live && (request.params[0] as string[])[0] === wallet) {
+          return atSlot([account('11111111111111111111111111111111', '', 0), walletToken(USDC, 1_000_000n), walletToken(WRAPPED_SOL, 0n)]);
+        }
         assert.deepEqual(request.params[0], [KAMINO_MARKET_LOOKUP]);
         return atSlot([{ data: [lookupFixture(), 'base64'], executable: false, owner: LOOKUP_PROGRAM, lamports: 7, rentEpoch: 0, space: 120 }]);
       }
+      case 'getFeeForMessage': return atSlot(fee);
       case 'getLatestBlockhash': return atSlot({ blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 42 });
       case 'simulateTransaction': {
         simulationCount++;
@@ -86,12 +115,18 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
         if (compiled.version !== 0) assert.fail('Expected a v0 transaction');
         assert.equal(compiled.addressTableLookups?.[0]?.lookupTableAddress, KAMINO_MARKET_LOOKUP);
         const sequence = compiled.instructions.map((instruction) => compiled.staticAccounts[instruction.programAddressIndex]);
-        assert.deepEqual(sequence.slice(4), [KAMINO, JUPITER, JUPITER, KAMINO]);
+        if (live) {
+          assert.equal((request.params[1] as { replaceRecentBlockhash: boolean }).replaceRecentBlockhash, false);
+          assert.deepEqual(sequence.slice(2, 8), [LIGHTHOUSE, LIGHTHOUSE, KAMINO, JUPITER, JUPITER, KAMINO]);
+          assert.deepEqual(sequence.slice(8), [LIGHTHOUSE, LIGHTHOUSE, LIGHTHOUSE]);
+        } else {
+          assert.deepEqual(sequence.slice(4), [KAMINO, JUPITER, JUPITER, KAMINO]);
+        }
         assert.equal(compiled.instructions[7].data?.[16], 4);
         const tokenBalance = (amount: number) => ({ accountIndex: 1, mint: USDC, owner: wallet, programId: tokenProgram,
           uiTokenAmount: { amount: String(amount), decimals: 6, uiAmount: amount / 1_000_000, uiAmountString: String(amount / 1_000_000) } });
         return atSlot({
-          err: null, fee, unitsConsumed: 420000,
+          err: null, fee: reportedFee, unitsConsumed: 420000,
           preBalances: [10_000_000], postBalances: [10_000_000 - fee],
           preTokenBalances: [tokenBalance(1_000_000)], postTokenBalances: [tokenBalance(1_000_000 + actualWalletGain)],
         });
@@ -117,4 +152,19 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   actualWalletGain = 210_000;
   const overBudget = await scanSolanaCycle({ ...config, maxFeeLamports: 6000 });
   assert.ok(overBudget.routes.every((route) => route.status === 'simulated' && route.simulatedNetUsdc! > 0.2 && route.qualified === false));
+
+  live = true;
+  let submissions = 0;
+  const guarded = await scanSolanaCycle(config, async (candidate) => {
+    submissions++;
+    assert.equal(candidate.feeLamports, 6400n);
+    assert.equal(candidate.maximumLamportDebit, 6400n);
+    assert.equal(candidate.simulationSlot, 42n);
+    assert.ok(candidate.net >= 50_000n);
+  });
+  for (const route of guarded.routes) assert.equal(route.status, 'simulated', route.detail);
+  assert.equal(submissions, 1, 'submit only the best qualifying guarded route');
+  reportedFee = fee + 1;
+  const inconsistent = await scanSolanaCycle(config, async () => { assert.fail('Fee mismatch authorized a candidate'); });
+  assert.ok(inconsistent.routes.every((route) => route.qualified === false));
 });

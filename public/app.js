@@ -86,12 +86,19 @@ function renderNetworks(networks) {
   if (solana && solana.mode !== 'off') {
     const balance = solana.result?.walletSol;
     const qualified = routes?.filter((route) => route.qualified).length;
-    const status = solana.status !== 'Unsigned scan completed' || qualified === undefined ? solana.status : `${qualified} qualifying unsigned routes`;
-    rows.push(['Solana', solana.mode, solana.result?.slot, routes?.length, Number.isFinite(balance) ? `${balance.toFixed(6)} SOL` : '–', esc(status)]);
+    const order = solana.execution;
+    const completed = ['Unsigned scan completed', 'Guarded live scan completed'].includes(solana.status);
+    const status = completed && qualified !== undefined ? `${qualified} qualifying routes` : solana.status;
+    const outcome = order?.lastOutcome;
+    const settled = outcome ? ` · <a target="_blank" rel="noopener noreferrer" href="https://explorer.solana.com/tx/${esc(outcome.signature)}">${esc(outcome.status)}</a>${Number.isFinite(outcome.netUsdc) ? ` ${usd(outcome.netUsdc)} net` : ''}` : '';
+    rows.push(['Solana', solana.mode, solana.result?.slot, routes?.length, Number.isFinite(balance) ? `${balance.toFixed(6)} SOL` : '–',
+      esc(order?.pending ? 'Waiting for transaction settlement' : status) + settled]);
   }
   $('extraNetworks').hidden = rows.length === 0;
   $('arbitrumModeBtn').hidden = !arb?.canArm;
   $('arbitrumModeBtn').textContent = arb?.mode === 'live' ? 'Disarm Arbitrum' : 'Arm Arbitrum';
+  $('solanaModeBtn').hidden = !solana?.canArm;
+  $('solanaModeBtn').textContent = solana?.mode === 'live' ? 'Disarm Solana' : 'Arm Solana';
   $('extraNetworkRows').innerHTML = rows.map(([name, mode, block, routes, balance, status]) =>
     `<tr><td>${name}</td><td>${esc(mode)}</td><td class="r">${block ? block.toLocaleString() : '–'}</td><td class="r">${routes ?? '–'}</td><td class="r">${balance}</td><td>${status}</td></tr>`).join('');
 }
@@ -489,7 +496,7 @@ $('armConfirm').onclick = async () => {
   try { await api('/api/arm', { confirm: typed }); dlg.close(); refresh(); } catch (e) { alert(e.message); }
 };
 $('disarmBtn').onclick = async () => {
-  if (!confirm('Disarm spot, Ethereum MEV, and Arbitrum? Open positions stay in the wallet. Submitted transactions can still settle.')) return;
+  if (!confirm('Disarm live trading across all networks? Open positions stay in the wallet. Submitted transactions can still settle.')) return;
   try { await api('/api/disarm'); } catch (e) { alert(e.message); }
   refresh();
 };
@@ -501,6 +508,18 @@ $('arbitrumModeBtn').onclick = async () => {
       await api('/api/arbitrum/arm', { confirm: 'ARBITRUM' });
     } else {
       await api('/api/arbitrum/disarm');
+    }
+    refresh();
+  } catch (error) { alert(error.message); }
+};
+$('solanaModeBtn').onclick = async () => {
+  const arm = S?.networks?.solana?.mode !== 'live';
+  try {
+    if (arm) {
+      if (prompt('Type SOLANA to enable live arbitrage and SOL fees.')?.trim() !== 'SOLANA') return;
+      await api('/api/solana/arm', { confirm: 'SOLANA' });
+    } else {
+      await api('/api/solana/disarm');
     }
     refresh();
   } catch (error) { alert(error.message); }

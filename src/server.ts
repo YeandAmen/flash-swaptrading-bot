@@ -3,14 +3,18 @@ import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import QRCode from 'qrcode';
 import { formatUnits, type Hex } from 'viem';
-import { CONFIG, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from './config.js';
+import { CONFIG, DATA_DIR, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from './config.js';
 import { endpointOrigin, redactDiagnostic } from './diagnostics.js';
+import { EthereumIntent } from './ethereum-intent.js';
 import { Engine } from './engine.js';
-import { armArbitrum, disarmArbitrum, expansionView, startExpansion, stopExpansion } from './expansion.js';
+import { armArbitrum, armSolana, disarmArbitrum, disarmSolana, expansionView, startExpansion, stopExpansion } from './expansion.js';
 import { DeploymentFeeLimitError, DeploymentGasError } from './executor.js';
 import type { PortfolioState } from './types.js';
 
 const engine = new Engine();
+const ethereumIntent = new EthereumIntent(path.join(DATA_DIR, 'ethereum-live-intent.json'),
+  CONFIG.allowLiveTrading && !CONFIG.forkMode && process.env.ETHEREUM_AUTO_ARM === 'on',
+  (message) => engine.log(redactDiagnostic(message), 'warn'));
 const app = express();
 const publicDir = path.join(ROOT, 'public');
 const liveTradingAllowed = CONFIG.allowLiveTrading || CONFIG.forkMode;
@@ -237,9 +241,19 @@ function control(operation: (req: Request) => void | Promise<void | { address: s
 
 app.post('/api/arm', (req, res) => {
   if (req.body?.confirm !== 'LIVE') { res.status(400).json({ error: 'Type LIVE to confirm' }); return; }
-  if (allowArming(res)) void control(() => engine.arm())(req, res);
+  if (allowArming(res)) void control(() => { ethereumIntent.set('spot', true); engine.arm(); })(req, res);
 });
-app.post('/api/disarm', control(() => { try { disarmArbitrum(); } finally { engine.disarm(); } }));
+function disarmLiveNetworks() {
+  try { ethereumIntent.set('both', false); }
+  finally { try { disarmArbitrum(); } finally { disarmSolana(); } }
+}
+
+app.post('/api/disarm', control(() => { try { disarmLiveNetworks(); } finally { engine.disarm(); } }));
+app.post('/api/solana/disarm', control(() => disarmSolana()));
+app.post('/api/solana/arm', (req, res) => {
+  if (req.body?.confirm !== 'SOLANA') { res.status(400).json({ error: 'Type SOLANA to arm' }); return; }
+  if (allowLiveControl(res)) void control(() => armSolana())(req, res);
+});
 app.post('/api/arbitrum/disarm', control(() => disarmArbitrum()));
 app.post('/api/arbitrum/arm', (req, res) => {
   if (req.body?.confirm !== 'ARBITRUM') { res.status(400).json({ error: 'Type ARBITRUM to arm' }); return; }
@@ -273,7 +287,7 @@ app.post('/api/mev/arm', (req, res) => {
   if (!allowArming(res)) return;
   const mev = engine.mev;
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
-  void control(() => mev.arm())(req, res);
+  void control(() => { ethereumIntent.set('mev', true); mev.arm(); })(req, res);
 });
 app.post('/api/mev/test-once', (req, res) => {
   const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false, publicFunctional = false, minimumNetUsd } = req.body ?? {};
@@ -291,7 +305,9 @@ app.post('/api/mev/test-once', (req, res) => {
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
   void control(() => mev.queueGasOnlyTest(id, maximumGasUsd, requireGasCoverage, privateSubmission, publicFunctional, minimumNetUsd))(req, res);
 });
-app.post('/api/mev/disarm', control(() => engine.mev?.disarm()));
+app.post('/api/mev/disarm', control(() => {
+  try { ethereumIntent.set('mev', false); } finally { engine.mev?.disarm(); }
+}));
 app.post('/api/pause', (req, res) => {
   const paused = Boolean(req.body?.paused);
   if (paused || !liveTradingAllowed || allowLiveControl(res)) void control(() => engine.setPaused(paused))(req, res);
@@ -304,13 +320,20 @@ app.post('/api/paper/reset', control(() => engine.resetPaper()));
 app.post('/api/backtest', control(() => { void engine.runResearchNow(); }));
 app.post('/api/panic', (req, res) => {
   const kind = kindOf(req);
-  if (kind === 'paper' || allowLiveControl(res)) void control(async () => { try { if (kind === 'live') disarmArbitrum(); } finally { await engine.panic(kind); } })(req, res);
+  if (kind === 'paper' || allowLiveControl(res)) void control(async () => { try { if (kind === 'live') disarmLiveNetworks(); } finally { await engine.panic(kind); } })(req, res);
 });
 
 const server = app.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`Dashboard: http://127.0.0.1:${CONFIG.port}`);
   void engine.start();
   startExpansion();
+  ethereumIntent.restore({
+    ready: () => readiness().ready,
+    spotArmed: () => engine.state.armed,
+    mevMode: () => engine.mev?.view().mode,
+    armSpot: () => engine.arm(),
+    armMev: () => engine.mev?.arm(),
+  });
 });
 
 // Keep the Mac from sleeping while the bot runs (caffeinate exits by itself when this process exits).
@@ -327,6 +350,7 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log('Shutting down: waiting for any in-flight trade, then saving state...');
+  ethereumIntent.stop();
   stopExpansion();
   server.close();
   setTimeout(() => process.exit(0), 28_000).unref();

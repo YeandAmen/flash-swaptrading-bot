@@ -109,7 +109,7 @@ export class ArbitrumWorker {
         this.client.getBalance({ address: account.address }),
         this.client.getBlockNumber({ cacheTime: 0 }),
       ]);
-      if (nonce !== pending || balance < prepared.gasBudget || head >= candidate.order.maxBlock || !this.active || this.halted) return;
+      if (nonce !== pending || balance < prepared.gasBudget || head >= prepared.deadline || !this.active || this.halted) return;
       const serializedTransaction = await account.signTransaction({ ...prepared.tx, type: 'eip1559', chainId: arbitrumChainId, nonce });
       if (!this.active || this.halted) return;
       const hash = keccak256(serializedTransaction);

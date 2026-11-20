@@ -7,9 +7,11 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
   const minNet = parseEther((minimumNetUsd / ethUsd).toFixed(18));
   if (maximumFeeUsd <= 0 || candidate.payout <= minNet) return null;
   const head = await client.getBlock();
-  if (head.number > candidate.order.maxBlock || Math.abs(Date.now() - Number(head.timestamp) * 1000) > 5_000) return null;
+  if (head.number > candidate.order.maxBlock + 50n || Math.abs(Date.now() - Number(head.timestamp) * 1000) > 5_000) return null;
+  // Broad snapshot quotes can take several L2 blocks. Refresh the deadline only for an exact live check.
+  const deadline = head.number + 10n;
   const encode = (minProfit: bigint) => encodeFunctionData({
-    abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', args: [{ ...candidate.order, minProfit }],
+    abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', args: [{ ...candidate.order, maxBlock: deadline, minProfit }],
   });
   const [estimated, fees] = await Promise.all([
     client.estimateGas({ account: owner, to: contract, data: encode(1n) }), client.estimateFeesPerGas(),
@@ -26,8 +28,8 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
     client.call({ ...tx, account: owner, blockTag: 'pending' }),
     client.getBlockNumber({ cacheTime: 0 }),
   ]);
-  if (!finalState.data || exact > gas || currentHead >= candidate.order.maxBlock) return null;
+  if (!finalState.data || exact > gas || currentHead >= deadline) return null;
   const payout = decodeFunctionResult({ abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', data: finalState.data });
   if (payout * 9n / 10n < minimum) return null;
-  return { tx, worstGasUsd, gasBudget, netUsd: Number(formatEther(payout - gasBudget)) * ethUsd };
+  return { tx, deadline, worstGasUsd, gasBudget, netUsd: Number(formatEther(payout - gasBudget)) * ethUsd };
 }

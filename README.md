@@ -2,7 +2,7 @@
 
 A local Ethereum mainnet dashboard for Uniswap v3 spot strategies and two-pool arbitrage. It runs on Node.js on macOS, Linux, or Windows. The spot engine can use momentum rules or a calibrated ML model. The MEV engine scans supported pools using a consistent Ethereum block and simulates candidates before considering a transaction.
 
-`ALLOW_LIVE_TRADING=off` is the default. It disables all mainnet signing from the bot, including trades, gas top-ups, contract deployment, and MEV bundles. Paper spot and MEV scans use public state and leave the wallet unfunded. Both live modes start disarmed after every restart.
+`ALLOW_LIVE_TRADING=off` is the default. It disables all mainnet signing from the bot, including trades, gas top-ups, contract deployment, and MEV bundles. Paper spot and MEV scans use public state and leave the wallet unfunded. Ethereum starts disarmed by default. With `ETHEREUM_AUTO_ARM=on`, the service restores explicitly armed modes after startup readiness checks. An explicit disarm or panic saves the stop across restarts.
 
 ## 1. Install and configure
 
@@ -199,7 +199,7 @@ Use one running bot per wallet. Back up the wallet and its state, including `sta
 
 ## Arbitrum One and Solana
 
-The dashboard can run a separate Arbitrum One scanner and a Solana paper scanner alongside Ethereum. Each flash loan, swap cycle, and repayment happens on one network. Fund gas on the network where the transaction runs.
+The dashboard can run a separate Arbitrum One scanner and a Solana scanner alongside Ethereum. Each flash loan, swap cycle, and repayment happens on one network. Fund gas on the network where the transaction runs.
 
 ### Arbitrum One
 
@@ -227,7 +227,7 @@ FORK_RPC_URL=https://arb1.arbitrum.io/rpc FORK_BLOCK_NUMBER=525952800 node scrip
 
 ### Solana
 
-Create a Solana keypair in private local storage and copy only its public address into `SOLANA_WALLET_ADDRESS`. Never use the Ethereum wallet key as a Solana seed. The scanner uses Kamino USDC and Jupiter Build instructions for two-pool SOL/USDC routes. It checks composed unsigned transactions and reports paper results. Set `SOLANA=on` to include it in the dashboard. A dedicated `SOLANA_RPC_URL` and `JUPITER_API_KEY` are optional.
+Create a Solana keypair in private local storage and copy only its public address into `SOLANA_WALLET_ADDRESS`. Never use the Ethereum wallet key as a Solana seed. The scanner uses Kamino USDC and Jupiter Build instructions for two-pool SOL/USDC routes. It checks composed transactions through simulation and starts in paper mode. Set `SOLANA=on` to include it in the dashboard. A dedicated `SOLANA_RPC_URL` and `JUPITER_API_KEY` are optional.
 
 ```sh
 mkdir -p -m 700 data
@@ -236,3 +236,8 @@ solana-keygen pubkey data/solana-bot.json
 npm run solana:scan
 npm run solana:test
 ```
+
+
+For live Solana, set `ALLOW_LIVE_TRADING=on`, `SOLANA_LIVE=on`, and `SOLANA_WALLET_KEY_FILE` to the absolute path of the owner-only Solana CLI JSON keypair. Restart and arm Solana from the dashboard. The signer must match `SOLANA_WALLET_ADDRESS`. The worker restores the stored arming choice after restart and uses the immutable Lighthouse program to enforce a post-repayment wallet profit floor. It keeps one submitted signature pending until it settles or expires.
+
+The default Solana minimum is 0.05 USDC after transaction fees and any in-transaction token-account rent. The default network fee ceiling is 0.00005 SOL per transaction and 0.002 SOL over 24 hours. The worker maintains a 0.015 SOL gas reserve. A transaction that lands and reverts can still pay its network fee.

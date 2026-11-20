@@ -1,11 +1,12 @@
 import {
   AccountRole, address, appendTransactionMessageInstructions, assertIsTransactionMessageWithinSizeLimit,
   compileTransaction, compressTransactionMessageUsingAddressLookupTables, createSolanaRpc, createTransactionMessage,
-  getBase64EncodedWireTransaction, setTransactionMessageComputeUnitLimit, setTransactionMessageComputeUnitPrice,
+  getBase64Decoder, getBase64EncodedWireTransaction, getAddressDecoder, setTransactionMessageComputeUnitLimit, setTransactionMessageComputeUnitPrice,
   setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash,
-  type Address, type AddressesByLookupTableAddress, type Instruction,
+  type Address, type AddressesByLookupTableAddress, type TransactionMessageBytesBase64, type Instruction, type Transaction,
 } from '@solana/kit';
 import { redactDiagnostic } from '../diagnostics.js';
+import { lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
 import {
   createKaminoFlashInstructions, createWalletAta, decodeKaminoUsdcReserve, decodeLookupTable, kaminoRepayment,
   JUPITER, KAMINO_MARKET_LOOKUP, KAMINO_USDC_RESERVE, MAINNET_GENESIS, SOLANA_PUBLIC_RPC, USDC, WRAPPED_SOL,
@@ -18,6 +19,10 @@ const COMPUTE_UNITS = 1_400_000;
 const PRIORITY_MICROLAMPORTS = 1_000n;
 const USDC_UNITS = 1_000_000n;
 const SOL_UNITS = 1_000_000_000n;
+const legacyToken = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const systemProgram = address('11111111111111111111111111111111');
+const routeV2 = Buffer.from('bb64facc31c4af14', 'hex');
+const addressDecoder = getAddressDecoder();
 const VENUES = ['Whirlpool', 'Raydium CLMM'] as const;
 const JUPITER_BUILD = 'https://api.jup.ag/swap/v2/build';
 
@@ -50,6 +55,18 @@ export interface SolanaScanConfig {
   maxFeeLamports?: number;
 }
 
+export interface PreparedSolanaCycle {
+  transaction: Transaction;
+  lastValidBlockHeight: bigint;
+  simulationSlot: bigint;
+  maximumLamportDebit: bigint;
+  feeLamports: bigint;
+  rentLamports: bigint;
+  firstMinimum: bigint;
+  loan: bigint;
+  net: bigint;
+}
+
 interface SolanaRoute {
   buy: Venue;
   sell: Venue;
@@ -65,7 +82,7 @@ interface SolanaRoute {
 
 export interface SolanaScanResult {
   chain: 'solana';
-  mode: 'paper';
+  mode: 'paper' | 'live';
   checkedAt: string;
   slot: number;
   wallet: Address;
@@ -180,13 +197,62 @@ async function lookupTables(rpc: Rpc, swaps: JupiterBuild[]): Promise<AddressesB
   }));
 }
 
+function routeMinimum(swap: JupiterBuild, wallet: Address, source: Address, destination: Address): bigint {
+  const bytes = Buffer.from(swap.swapInstruction.data, 'base64');
+  const accounts = swap.swapInstruction.accounts;
+  if (bytes.length < 34 || !bytes.subarray(0, 8).equals(routeV2)
+    || bytes.readBigUInt64LE(8) !== rawAmount(swap.inAmount)
+    || bytes.readBigUInt64LE(16) !== rawAmount(swap.outAmount)
+    || bytes.readUInt16LE(24) !== SLIPPAGE_BPS || bytes.readUInt16LE(26) !== 0 || bytes.readUInt16LE(28) !== 0
+    || accounts[0]?.pubkey !== wallet || !accounts[0].isSigner
+    || accounts[1]?.pubkey !== source || !accounts[1].isWritable
+    || accounts[2]?.pubkey !== destination || !accounts[2].isWritable
+    || accounts[3]?.pubkey !== swap.inputMint || accounts[4]?.pubkey !== swap.outputMint
+    || accounts[5]?.pubkey !== legacyToken || accounts[6]?.pubkey !== legacyToken
+    || accounts[7]?.pubkey !== destination || accounts[9]?.pubkey !== JUPITER) {
+    throw new Error('Jupiter RouteV2 account or amount does not match the signed route');
+  }
+  // The integer lower bound also covers a JSON threshold that rounds up by one unit.
+  return bytes.readBigUInt64LE(16) * BigInt(10_000 - SLIPPAGE_BPS) / 10_000n;
+}
+
+async function liveWalletState(rpc: Rpc, wallet: Address, usdAta: Address, solAta: Address, minContextSlot: bigint) {
+  const { value: [payer, usdc, wsol], context } = await rpc.getMultipleAccounts(
+    [wallet, usdAta, solAta], { encoding: 'base64', commitment: COMMITMENT, minContextSlot },
+  ).send(deadline());
+  if (!payer || payer.owner !== systemProgram || payer.executable || payer.data[0] !== '') {
+    throw new Error('The live Solana payer must be a normal System Program account');
+  }
+  const amount = (account: typeof usdc, mint: Address) => {
+    if (!account) return 0n;
+    const data = Buffer.from(account.data[0], 'base64');
+    if (account.owner !== legacyToken || account.executable || data.length !== 165
+      || addressDecoder.decode(data, 0) !== mint || addressDecoder.decode(data, 32) !== wallet
+      || data.readUInt32LE(72) !== 0 || data[108] !== 1 || data.readUInt32LE(129) !== 0) {
+      throw new Error('Solana wallet ATA has unexpected owner, mint, delegate, or close authority');
+    }
+    return data.readBigUInt64LE(64);
+  };
+  const missing = Number(!usdc) + Number(!wsol);
+  const rent = missing ? await rpc.getMinimumBalanceForRentExemption(165n, { commitment: COMMITMENT }).send(deadline()) : 0n;
+  return {
+    lamports: payer.lamports, usdc: amount(usdc, USDC), wsol: amount(wsol, WRAPPED_SOL), slot: context.slot,
+    createUsdc: !usdc, createWsol: !wsol, rent: BigInt(missing) * rent,
+  };
+}
+
+function nativeCostInUsdc(lamports: bigint, loan: bigint, firstMinimum: bigint): bigint {
+  return (lamports * loan + firstMinimum - 1n) / firstMinimum;
+}
+
 function summarizeFailure(error: unknown, apiKey?: string): string {
   const message = error instanceof Error ? error.message : String(error);
   return redactDiagnostic(apiKey ? message.replaceAll(apiKey, '[Jupiter API key]') : message).slice(0, 220);
 }
 
-/** Read-only Solana mainnet paper scan. The transaction is unsigned and never returned or broadcast. */
-export async function scanSolanaCycle(config: SolanaScanConfig): Promise<SolanaScanResult> {
+/** Build and simulate an unsigned mainnet transaction. Only the live worker can authorize a qualified candidate. */
+export async function scanSolanaCycle(config: SolanaScanConfig,
+  execute?: (candidate: PreparedSolanaCycle) => Promise<void>): Promise<SolanaScanResult> {
   if (!config.wallet) throw new Error('Set SOLANA_WALLET_ADDRESS to the public address of your Solana wallet');
   const wallet = address(config.wallet);
   const loan = usdcAmount(config.loanUsdc ?? 250, 1, 100_000, 'Loan size');
@@ -211,7 +277,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig): Promise<SolanaS
   const reserve = decodeKaminoUsdcReserve(account.owner, Buffer.from(account.data[0], 'base64'));
   const repay = reserve.active ? kaminoRepayment(loan, reserve) : null;
   const result: SolanaScanResult = {
-    chain: 'solana', mode: 'paper', checkedAt: new Date().toISOString(),
+    chain: 'solana', mode: execute ? 'live' : 'paper', checkedAt: new Date().toISOString(),
     slot: Number(context.slot), wallet, walletSol: Number(balance) / Number(SOL_UNITS),
     loanUsdc: usdcUnits(loan), flashFeeUsdc: repay === null ? null : usdcUnits(repay - loan),
     availableUsdc: usdcUnits(reserve.available), routes: [], status: 'loan-unavailable',
@@ -219,46 +285,78 @@ export async function scanSolanaCycle(config: SolanaScanConfig): Promise<SolanaS
   if (repay === null || loan > reserve.available) return result;
   result.status = 'scanned';
 
+  const candidates: PreparedSolanaCycle[] = [];
   result.routes = await Promise.all(VENUES.map(async (buy, index): Promise<SolanaRoute> => {
     const sell = VENUES[1 - index];
     let quote: number | undefined;
     try {
       const first = await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy, config.jupiterApiKey);
       if (!first) return { buy, sell, status: 'no-route', detail: 'No direct first-leg route' };
-      const firstMinimum = rawAmount(first.otherAmountThreshold);
+      const firstMinimum = execute ? routeMinimum(first, wallet, usdcAta.ata, solAta.ata) : rawAmount(first.otherAmountThreshold);
+      if (firstMinimum <= 0n) throw new Error('Jupiter did not guarantee any first-leg output');
       const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, sell, config.jupiterApiKey);
       if (!second) return { buy, sell, status: 'no-route', detail: 'No direct return route' };
       const usedPools = new Set(first.routePlan.map(({ swapInfo }) => address(swapInfo.ammKey)));
       if (second.routePlan.some(({ swapInfo }) => usedPools.has(address(swapInfo.ammKey)))) {
         return { buy, sell, status: 'no-route', detail: 'Routes share a liquidity pool' };
       }
-      const beforeNetwork = rawAmount(second.otherAmountThreshold) - repay;
+      const returnMinimum = execute ? routeMinimum(second, wallet, solAta.ata, usdcAta.ata) : rawAmount(second.otherAmountThreshold);
+      const beforeNetwork = returnMinimum - repay;
       quote = usdcUnits(beforeNetwork);
       if (beforeNetwork < minimumNet) return { buy, sell, status: 'below-profit-floor', quotedNetBeforeNetworkUsdc: quote };
       if (balance < 5_000n) throw new Error('The public wallet has no SOL to cover a full transaction simulation');
 
-      const [tables, { value: blockhash }] = await Promise.all([
+      const [tables, blockhashResult, baseline] = await Promise.all([
         lookupTables(rpc, [first, second]),
         rpc.getLatestBlockhash({ commitment: COMMITMENT, minContextSlot: context.slot }).send(deadline()),
+        execute ? liveWalletState(rpc, wallet, usdcAta.ata, solAta.ata, context.slot) : null,
       ]);
-      const prefix = appendTransactionMessageInstructions(
-        [usdcAta.instruction, solAta.instruction],
-        setTransactionMessageComputeUnitPrice(PRIORITY_MICROLAMPORTS, setTransactionMessageComputeUnitLimit(COMPUTE_UNITS,
-          setTransactionMessageLifetimeUsingBlockhash(blockhash, setTransactionMessageFeePayer(wallet,
-            createTransactionMessage({ version: 0 }))),
-        )),
-      );
-      const [borrow, repayment] = await createKaminoFlashInstructions(
-        wallet, usdcAta.ata, loan, prefix.instructions.length, reserve,
-      );
-      const message = compressTransactionMessageUsingAddressLookupTables(
-        appendTransactionMessageInstructions([borrow, swapInstruction(first), swapInstruction(second), repayment], prefix),
-        tables,
-      );
-      assertIsTransactionMessageWithinSizeLimit(message);
-      const unsigned = getBase64EncodedWireTransaction(compileTransaction(message));
+      const blockhash = blockhashResult.value;
+      const requiredSlot = [context.slot, blockhashResult.context.slot, baseline?.slot ?? 0n]
+        .reduce((latest, slot) => slot > latest ? slot : latest);
+      const template = setTransactionMessageComputeUnitPrice(PRIORITY_MICROLAMPORTS, setTransactionMessageComputeUnitLimit(COMPUTE_UNITS,
+        setTransactionMessageLifetimeUsingBlockhash(blockhash, setTransactionMessageFeePayer(wallet,
+          createTransactionMessage({ version: 0 }))),
+      ));
+      const createAccounts = [
+        ...(!baseline || baseline.createUsdc ? [usdcAta.instruction] : []),
+        ...(!baseline || baseline.createWsol ? [solAta.instruction] : []),
+      ];
+      const assemble = async (before: readonly Instruction[], after: readonly Instruction[]) => {
+        const prefix = appendTransactionMessageInstructions(before, template);
+        const [borrow, repayment] = await createKaminoFlashInstructions(wallet, usdcAta.ata, loan, prefix.instructions.length, reserve);
+        const message = compressTransactionMessageUsingAddressLookupTables(
+          appendTransactionMessageInstructions([borrow, swapInstruction(first), swapInstruction(second), repayment, ...after], prefix), tables,
+        );
+        assertIsTransactionMessageWithinSizeLimit(message);
+        return compileTransaction(message);
+      };
+      let transaction = await assemble(createAccounts, []);
+      let maxDebit = 0n;
+      let exactFee: bigint | null = null;
+      if (baseline) {
+        const encoded = getBase64Decoder().decode(transaction.messageBytes) as TransactionMessageBytesBase64;
+        const feeQuote = await rpc.getFeeForMessage(encoded, { commitment: COMMITMENT, minContextSlot: requiredSlot }).send(deadline());
+        exactFee = feeQuote.value;
+        if (exactFee === null || exactFee > BigInt(maxFeeLamports)) throw new Error('Solana fee quote exceeds its cap or is unavailable');
+        maxDebit = exactFee + baseline.rent;
+        if (baseline.lamports <= maxDebit) throw new Error('Solana fee payer cannot cover the fee and required ATA rent');
+        const requiredUsdc = minimumNet + nativeCostInUsdc(maxDebit, loan, firstMinimum);
+        if (beforeNetwork < requiredUsdc) return { buy, sell, status: 'below-profit-floor', quotedNetBeforeNetworkUsdc: quote };
+        transaction = await assemble([
+          lighthouseLamports(wallet, 'equal', baseline.lamports - exactFee),
+          ...createAccounts,
+          lighthouseTokenAmount(usdcAta.ata, 'equal', baseline.usdc),
+        ], [
+          lighthouseAtaFloor(usdcAta.ata, baseline.usdc + requiredUsdc),
+          lighthouseAtaFloor(solAta.ata, baseline.wsol),
+          lighthouseLamports(wallet, 'atLeast', baseline.lamports - maxDebit),
+        ]);
+      }
+      const unsigned = getBase64EncodedWireTransaction(transaction);
       const { value: simulation, context: execution } = await rpc.simulateTransaction(unsigned, {
-        encoding: 'base64', sigVerify: false, replaceRecentBlockhash: true, minContextSlot: context.slot, commitment: COMMITMENT,
+        encoding: 'base64', sigVerify: false, replaceRecentBlockhash: !execute,
+        minContextSlot: execute ? requiredSlot : context.slot, commitment: COMMITMENT,
       }).send(deadline());
       if (simulation.err) {
         const programError = simulation.logs?.find((line) => line.startsWith('Program log: Error: '));
@@ -278,18 +376,26 @@ export async function scanSolanaCycle(config: SolanaScanConfig): Promise<SolanaS
       const debit = preSol - postSol;
       const costLamports = debit > fee ? debit : fee;
       // Use the first-leg guaranteed output to conservatively convert SOL fees into the same USDC units as the gain.
-      const costUsdc = (costLamports * loan + firstMinimum - 1n) / firstMinimum;
+      const costUsdc = nativeCostInUsdc(costLamports, loan, firstMinimum);
       const net = postUsdc - preUsdc - costUsdc;
+      const qualified = fee <= BigInt(maxFeeLamports) && net >= minimumNet && beforeNetwork >= costUsdc + minimumNet
+        && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
+      if (qualified && baseline && exactFee !== null) {
+        candidates.push({ transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight, simulationSlot: execution.slot,
+          maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports: baseline.rent, firstMinimum, loan, net });
+      }
       return {
         buy, sell, status: 'simulated', quotedNetBeforeNetworkUsdc: quote, simulatedNetUsdc: usdcUnits(net),
         simulatedCostLamports: Number(costLamports), unitsConsumed: Number(simulation.unitsConsumed ?? 0),
         slot: Number(execution.slot),
-        qualified: fee <= BigInt(maxFeeLamports) && net >= minimumNet && beforeNetwork >= costUsdc + minimumNet,
+        qualified,
       };
     } catch (error) {
       return { buy, sell, status: quote === undefined ? 'quote-error' : 'simulation-failed', quotedNetBeforeNetworkUsdc: quote,
         detail: summarizeFailure(error, config.jupiterApiKey) };
     }
   }));
+  candidates.sort((left, right) => left.net > right.net ? -1 : left.net < right.net ? 1 : 0);
+  if (execute && candidates[0]) await execute(candidates[0]);
   return result;
 }
