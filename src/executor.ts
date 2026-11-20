@@ -56,6 +56,17 @@ export class DeploymentGasError extends Error {
   }
 }
 
+export class DeploymentFeeLimitError extends Error {
+  constructor(minimum: bigint) {
+    super(`Deployment now needs at least ${formatEther(minimum)} ETH for gas. Review the refreshed quote before confirming.`);
+  }
+}
+
+interface DeploymentOptions {
+  maximumGasWei: bigint;
+  beforeSign?: () => void;
+}
+
 function checkSendAllowed(canSend?: () => boolean) {
   if ((!CONFIG.allowLiveTrading && !CONFIG.forkMode) || (canSend && !canSend())) throw new LiveSendBlocked();
 }
@@ -278,10 +289,19 @@ export class LiveExecutor implements Executor {
     return { balance, minimumWei, estimatedWei, gas, maxFeePerGas, maxPriorityFeePerGas };
   }
 
-  private async transactionFees(to: Address | null, data: Hex) {
+  private async transactionFees(to: Address | null, data: Hex, maximumGasWei?: bigint) {
     if (to === null) {
       const quote = await this.quoteDeployment(data);
       if (quote.balance < quote.minimumWei) throw new DeploymentGasError(quote.balance, quote.minimumWei);
+      if (maximumGasWei !== undefined) {
+        if (maximumGasWei < quote.minimumWei) throw new DeploymentFeeLimitError(quote.minimumWei);
+        const limitPerGas = maximumGasWei / quote.gas;
+        if (limitPerGas < quote.maxFeePerGas) return {
+          ...quote,
+          maxFeePerGas: limitPerGas,
+          maxPriorityFeePerGas: quote.maxPriorityFeePerGas < limitPerGas ? quote.maxPriorityFeePerGas : limitPerGas,
+        };
+      }
       return quote;
     }
     const { base, tip, estimatedGas } = await this.estimateFees(data, to);
@@ -289,11 +309,11 @@ export class LiveExecutor implements Executor {
   }
 
   /** Deploys a contract from the bot wallet (privately, like every transaction). */
-  async deployContract(bytecode: Hex, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean): Promise<{ address: Address; hash: Hex; gasWei: bigint }> {
+  async deployContract(bytecode: Hex, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean, options?: DeploymentOptions): Promise<{ address: Address; hash: Hex; gasWei: bigint; blockNumber: bigint }> {
     return this.exclusive(async () => {
-      const { hash, receipt } = await this.sendTx(null, bytecode, 'deploy', log, onSigned, canSend);
+      const { hash, receipt } = await this.sendTx(null, bytecode, 'deploy', log, onSigned, canSend, options);
       if (!receipt.contractAddress) throw new Error(`deploy ${hash} mined but created no contract`);
-      return { address: receipt.contractAddress, hash, gasWei: receipt.gasUsed * receipt.effectiveGasPrice };
+      return { address: receipt.contractAddress, hash, gasWei: receipt.gasUsed * receipt.effectiveGasPrice, blockNumber: receipt.blockNumber };
     });
   }
 
@@ -378,16 +398,20 @@ export class LiveExecutor implements Executor {
   }
 
   /** `to: null` deploys a contract (`data` = creation code). */
-  private async sendTx(to: Address | null, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean) {
+  private async sendTx(to: Address | null, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean, options?: DeploymentOptions) {
     checkSendAllowed(canSend);
     const from = this.account.address;
     const [chainNonce, { gas, maxFeePerGas, maxPriorityFeePerGas }] = await Promise.all([
       this.chainNonce(),
-      this.transactionFees(to, data),
+      this.transactionFees(to, data, options?.maximumGasWei),
     ]);
     // a lagging RPC node may not know our previous tx yet: never reuse a nonce we already got mined
     const nonce = Math.max(chainNonce, this.nextNonce);
     checkSendAllowed(canSend);
+    if (options?.beforeSign) {
+      options.beforeSign();
+      checkSendAllowed(canSend);
+    }
     const serializedTransaction = await this.account.signTransaction({
       chainId: publicClient.chain.id, type: 'eip1559', to, data, nonce, gas, maxFeePerGas, maxPriorityFeePerGas, value: 0n,
     });

@@ -256,7 +256,6 @@ check(Number.isInteger(GAS_TOPUP.maxPerDay) && GAS_TOPUP.maxPerDay >= 1 && GAS_T
 check(MEV.minPoolWeth >= 0.1, 'MEV_MIN_POOL_WETH must be >= 0.1');
 check(['auto', 'pool', 'aave', 'morpho', 'balancer'].includes(MEV.funding), 'MEV_FUNDING must be auto, pool, aave, morpho or balancer');
 check(!(MEV.v2ContractAddress && MEV.v3ContractAddress), 'Configure only one FlashArb contract address');
-check(MEV.funding !== 'balancer' || MEV.v3ContractAddress !== null, 'MEV_FUNDING=balancer requires MEV_V3_CONTRACT_ADDRESS');
 check(MEV.universe === 'all' || MEV.universe === 'spot', 'MEV_UNIVERSE must be all or spot');
 check(Number.isInteger(MEV.maxTrackedPools) && MEV.maxTrackedPools >= 16 && MEV.maxTrackedPools <= 1000, 'MEV_MAX_TRACKED_POOLS must be 16..1000');
 frac('MEV_BUILDER_TIP_PCT', MEV.builderTipPct);

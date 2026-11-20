@@ -17,6 +17,7 @@ let qrLoaded = false;
 let panicPending = false;
 let mevDeploySubmitting = false;
 let mevDeployQuoteRequest = 0;
+let mevDeployMaximumWei = null;
 
 async function api(path, body) {
   const send = (authorization) => fetch(path, {
@@ -317,24 +318,25 @@ function renderMevControls(X) {
   const contract = X?.contract || X?.configuredContract;
   const contractName = X?.contractVersion === 'v3' ? 'FlashArbV3' : 'FlashArbV2';
   const off = X?.mode === 'off';
+  const canDeploy = X?.canDeployV3 === true && !off;
   let reason = '';
   if (!X) reason = 'Waiting for bot status.';
   else if (off) reason = 'MEV scanning is disabled by MEV=off in .env.';
-  else if (X.deploymentPending) reason = 'Waiting for the FlashArbV2 deployment receipt.';
-  else if (mevDeploySubmitting || X.mode === 'deploying') reason = 'Preparing FlashArbV2 deployment…';
+  else if (X.deploymentPending) reason = 'Waiting for the contract deployment receipt.';
+  else if (mevDeploySubmitting || X.mode === 'deploying') reason = 'Preparing FlashArbV3 deployment…';
   else if (X.mode === 'arming') reason = `Checking ${contractName} before arming…`;
   else if (!S.liveTradingAllowed) reason = 'Set ALLOW_LIVE_TRADING=on in .env and restart to enable deployment and live MEV.';
   else if (!S.health.ready) reason = S.health.reason || 'Waiting for the bot to be ready.';
   else if (X.pending) reason = 'Waiting for a submitted MEV bundle to settle.';
 
-  $('mevDeployBtn').hidden = Boolean(contract || off);
-  $('mevDeployBtn').disabled = Boolean(reason || contract);
+  $('mevDeployBtn').hidden = !canDeploy;
+  $('mevDeployBtn').disabled = Boolean(reason || !canDeploy);
   $('mevArmBtn').hidden = Boolean(X?.armed || off);
   $('mevArmBtn').disabled = Boolean(reason || !contract);
   $('mevDisarmBtn').hidden = !X?.armed;
   $('mevContract').hidden = !contract;
   $('mevContract').textContent = contract ? `${contractName} ${contract}${X.contract ? '' : ' (configured)'}` : '';
-  const status = reason || (contract ? '' : 'Deploy FlashArbV2 to enable MEV arming.');
+  const status = reason || (canDeploy && !contract ? 'Deploy FlashArbV3 to enable MEV arming.' : '');
   const statusNode = $('mevDeploy');
   if (statusNode.textContent !== status) statusNode.textContent = status;
   statusNode.hidden = !status;
@@ -381,37 +383,51 @@ $('disarmBtn').onclick = async () => {
 };
 const mevDeployDlg = $('mevDeployDlg');
 function updateMevDeployConfirm() {
-  $('mevDeployConfirm').disabled = $('mevDeployBtn').disabled || $('mevDeployInput').value.trim() !== 'DEPLOY';
+  $('mevDeployConfirm').disabled = $('mevDeployBtn').disabled || mevDeployMaximumWei === null
+    || $('mevDeployInput').value.trim() !== 'DEPLOY';
 }
-$('mevDeployBtn').onclick = async () => {
-  if ($('mevDeployBtn').disabled) return;
+async function loadMevDeployQuote() {
+  mevDeployMaximumWei = null;
+  updateMevDeployConfirm();
   const fee = S.forkMode
     ? 'Deployment spends test ETH from the bot wallet on this local fork.'
     : 'Deployment sends a mainnet transaction and spends real ETH from the bot wallet.';
   $('mevDeployGas').textContent = fee + ' Checking current gas prices…';
-  $('mevDeployInput').value = '';
-  $('mevDeployError').hidden = true;
-  updateMevDeployConfirm();
-  mevDeployDlg.showModal();
   const request = ++mevDeployQuoteRequest;
   try {
-    const response = await fetch('/api/mev/deploy/quote', { cache: 'no-store' });
+    const response = await fetch('/api/mev/deploy/quote', { cache: 'no-store', signal: AbortSignal.timeout(10_000) });
     if (!response.ok) throw new Error();
     const quote = await response.json();
     if (request !== mevDeployQuoteRequest || !mevDeployDlg.open) return;
-    const eth = (value) => {
+    if (quote.version !== 'v3' || (quote.maximumWei === null) !== (quote.maximumEth === null)
+      || (quote.maximumWei !== null && (typeof quote.maximumWei !== 'string' || !/^[1-9][0-9]*$/.test(quote.maximumWei)))) {
+      throw new Error();
+    }
+    const eth = (value, amount = value.toFixed(8)) => {
       const price = S.chain?.ethUsd;
-      return `${value.toFixed(8)} ETH${price ? ` (about ${usd(value * price)})` : ''}`;
+      return `${amount} ETH${price ? ` (about ${usd(value * price)})` : ''}`;
     };
+    const wei = quote.maximumWei?.padStart(19, '0');
+    const fraction = wei?.slice(-18).replace(/0+$/, '');
+    const exactCap = wei && (wei.slice(0, -18) + (fraction ? '.' + fraction : ''));
     const cost = quote.maximumEth === null
       ? `Wallet balance is ${eth(quote.balanceEth)}. At current gas prices the wallet needs at least ${eth(quote.minimumEth)}.`
-      : `Estimated fee is ${eth(quote.estimatedEth)}. The transaction gas cap is ${eth(quote.maximumEth)}.`;
+      : `Estimated fee is ${eth(quote.estimatedEth)}. The transaction gas cap is ${eth(quote.maximumEth, exactCap)}.`;
     $('mevDeployGas').textContent = `${fee} ${cost} Gas is rechecked when you confirm.`;
+    mevDeployMaximumWei = quote.maximumWei;
+    updateMevDeployConfirm();
   } catch {
     if (request === mevDeployQuoteRequest && mevDeployDlg.open) {
-      $('mevDeployGas').textContent = fee + ' Gas quote unavailable. Gas is rechecked when you confirm.';
+      $('mevDeployGas').textContent = fee + ' Gas quote unavailable. Reopen this dialog to request a fresh quote.';
     }
   }
+}
+$('mevDeployBtn').onclick = async () => {
+  if ($('mevDeployBtn').disabled) return;
+  $('mevDeployInput').value = '';
+  $('mevDeployError').hidden = true;
+  mevDeployDlg.showModal();
+  await loadMevDeployQuote();
 };
 $('mevDeployInput').oninput = updateMevDeployConfirm;
 $('mevDeployCancel').onclick = () => mevDeployDlg.close();
@@ -423,12 +439,16 @@ $('mevDeployConfirm').onclick = async () => {
   $('mevDeployInput').disabled = true;
   $('mevDeployError').hidden = true;
   renderMevControls(S.mev);
+  let retryQuote = false;
   try {
-    await api('/api/mev/deploy', { confirm: 'DEPLOY' });
+    await api('/api/mev/deploy', { confirm: 'DEPLOY', version: 'v3', maximumWei: mevDeployMaximumWei });
     mevDeployDlg.close();
   } catch (error) {
+    mevDeployMaximumWei = null;
+    $('mevDeployInput').value = '';
     $('mevDeployError').textContent = error.message;
     $('mevDeployError').hidden = false;
+    retryQuote = true;
   } finally {
     await refresh();
     mevDeploySubmitting = false;
@@ -436,6 +456,7 @@ $('mevDeployConfirm').onclick = async () => {
     $('mevDeployInput').disabled = false;
     renderMevControls(S?.mev);
   }
+  if (retryQuote && mevDeployDlg.open && !$('mevDeployBtn').disabled) await loadMevDeployQuote();
 };
 const mevDlg = $('mevDlg');
 $('mevArmBtn').onclick = () => {

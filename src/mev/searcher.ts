@@ -8,8 +8,8 @@ import { redactDiagnostic } from '../diagnostics.js';
 import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../executor.js';
 import type { McResult } from '../market.js';
 import { writeJson } from '../persistence.js';
-import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_BYTECODE, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
-import { FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
+import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
+import { FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
 import { bundleTraceRequests, requestBuilderTrace } from './builder-trace.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
 import { sendBundle, type BuilderResult } from './bundles.js';
@@ -114,9 +114,12 @@ interface MevFile {
   v2Contract?: Address | null;
   v2DeployedAt?: number;
   v2DeployGasUsd?: number;
+  v3Contract?: Address | null;
+  v3DeployedAt?: number;
+  v3DeployGasUsd?: number;
   deployedAt: number | null;
   deployTx: Hex | null;
-  deployVersion?: 'v2' | null;
+  deployVersion?: 'v2' | 'v3' | null;
   deployNonce: number | null;
   deployStartedAt: number | null;
   deployGasUsd: number;
@@ -267,11 +270,13 @@ export class MevSearcher {
     });
   }
 
-  private get isV3() { return MEV.v3ContractAddress !== null; }
+  private get v3Address() { return this.file.v3Contract ?? MEV.v3ContractAddress; }
+  private get isV3() { return this.v3Address !== null; }
   private get contractLabel() { return this.isV3 ? 'FlashArbV3' : 'FlashArbV2'; }
   private get contractRuntime() { return this.isV3 ? FLASH_ARB_V3_RUNTIME : FLASH_ARB_V2_RUNTIME; }
-  private get selectedContract() { return MEV.v3ContractAddress ?? this.file.v2Contract ?? null; }
-  private get configuredContract() { return MEV.v3ContractAddress ?? MEV.v2ContractAddress; }
+  private get selectedContract() { return this.v3Address ?? this.file.v2Contract ?? null; }
+  private get configuredContract() { return this.isV3 ? MEV.v3ContractAddress : MEV.v2ContractAddress; }
+  private get canDeployV3() { return MEV.enabled && this.persist && !this.stopping && !this.stateReadError && !this.isV3; }
 
   private get pending() { return this.file.pending; }
 
@@ -282,9 +287,10 @@ export class MevSearcher {
       const f = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as MevFile;
       if (f.version !== 1 || !f.stats || !Array.isArray(f.recent)) throw new Error('invalid MEV state');
       if ((f.deployTx != null && !/^0x[0-9a-f]{64}$/i.test(f.deployTx))
-        || (f.deployVersion != null && f.deployVersion !== 'v2')
+        || (f.deployVersion != null && f.deployVersion !== 'v2' && f.deployVersion !== 'v3')
         || (f.contract != null && !/^0x[0-9a-f]{40}$/i.test(f.contract))
-        || (f.v2Contract != null && !/^0x[0-9a-f]{40}$/i.test(f.v2Contract))) throw new Error('invalid MEV contract state');
+        || (f.v2Contract != null && !/^0x[0-9a-f]{40}$/i.test(f.v2Contract))
+        || (f.v3Contract != null && !/^0x[0-9a-f]{40}$/i.test(f.v3Contract))) throw new Error('invalid MEV contract state');
       f.best = Array.isArray(f.best) ? f.best.filter((x) => x && typeof x === 'object' && !Array.isArray(x)) : [];
       f.deployStartedAt ??= null;
       f.deployNonce ??= null;
@@ -337,10 +343,11 @@ export class MevSearcher {
   private modeText(): string {
     if (this.stateReadError) return this.stateReadError;
     if (!MEV.enabled) return 'Off (MEV=off in .env)';
-    if (this.deploying) return 'Deploying FlashArbV2…';
+    if (this.deploying) return 'Deploying FlashArbV3…';
     if (this.file.deployTx) return 'Waiting for the deployment transaction to settle';
     if (this.file.armed && !this.contractReady) return `Verifying the ${this.contractLabel} contract…`;
     if (this.file.armed) return 'Live mode: eligible bundles go to the configured builders';
+    if (MEV.funding === 'balancer' && !this.isV3) return 'Deploy FlashArbV3 to simulate routes funded by Balancer V3';
     return 'Paper mode: every block is scanned and simulated, nothing is sent';
   }
 
@@ -1041,13 +1048,14 @@ export class MevSearcher {
     if (!CONFIG.forkMode && MEV.builders.length === 0) throw new Error('MEV requires at least one configured builder.');
     if (this.stateReadError) throw new Error(this.stateReadError);
     if (!this.persist || this.stopping || this.walletPending()) throw new Error('MEV cannot arm while wallet recovery or contract preparation is in progress.');
+    if (MEV.funding === 'balancer' && !this.isV3) throw new Error('Balancer V3 funding requires FlashArbV3.');
     const existing = this.selectedContract;
     const configured = this.configuredContract;
     if (existing && configured && existing.toLowerCase() !== configured.toLowerCase()) {
-      throw new Error('MEV_V2_CONTRACT_ADDRESS conflicts with the saved deployment. Review both addresses before arming.');
+      throw new Error(`The configured ${this.contractLabel} address conflicts with the saved deployment. Review both addresses before arming.`);
     }
     const address = existing ?? configured;
-    if (!address) throw new Error('Deploy FlashArbV2 from the dashboard before arming MEV.');
+    if (!address) throw new Error('Deploy FlashArbV3 from the dashboard before arming MEV.');
     if (this.file.armed) return;
     const generation = ++this.armGeneration;
     this.contractReady = false;
@@ -1069,10 +1077,10 @@ export class MevSearcher {
     if (wasArmed) this.host.log(`MEV arbitrage disarmed ${reason}. Scanning continues in paper mode.`, 'warn');
   }
 
-  private async contractOk(addr: Address, runtime: Hex = this.contractRuntime): Promise<boolean> {
+  private async contractOk(addr: Address, runtime: Hex = this.contractRuntime, blockNumber?: bigint): Promise<boolean> {
     const [code, owner] = await Promise.all([
-      publicClient.getCode({ address: addr }).catch(() => undefined),
-      publicClient.readContract({ address: addr, abi: FLASH_ARB_V2_ABI, functionName: 'owner' }).catch(() => null),
+      publicClient.getCode({ address: addr, blockNumber }).catch(() => undefined),
+      publicClient.readContract({ address: addr, abi: FLASH_ARB_V2_ABI, functionName: 'owner', blockNumber }).catch(() => null),
     ]);
     return code?.toLowerCase() === runtime.toLowerCase() && owner?.toLowerCase() === this.host.account.address.toLowerCase();
   }
@@ -1082,11 +1090,16 @@ export class MevSearcher {
     const previous = {
       contract: f.contract, deployedAt: f.deployedAt, deployGasUsd: f.deployGasUsd,
       v2Contract: f.v2Contract, v2DeployedAt: f.v2DeployedAt, v2DeployGasUsd: f.v2DeployGasUsd,
+      v3Contract: f.v3Contract, v3DeployedAt: f.v3DeployedAt, v3DeployGasUsd: f.v3DeployGasUsd,
       deployTx: f.deployTx, deployVersion: f.deployVersion, deployNonce: f.deployNonce, deployStartedAt: f.deployStartedAt,
     };
     if (deployment) {
       const cost = eth(deployment.gasWei) * (this.host.ethUsd() ?? 0);
-      if (f.deployVersion === 'v2') {
+      if (f.deployVersion === 'v3') {
+        f.v3Contract = deployment.address;
+        f.v3DeployedAt = Date.now();
+        f.v3DeployGasUsd = cost;
+      } else if (f.deployVersion === 'v2') {
         f.v2Contract = deployment.address;
         f.v2DeployedAt = Date.now();
         f.v2DeployGasUsd = cost;
@@ -1123,8 +1136,9 @@ export class MevSearcher {
     const receipt = result.receipt;
     if (f.deployNonce !== null) this.host.exec.noteNonceUsed(f.deployNonce);
     if (receipt.status === 'success') {
+      const expectedRuntime = f.deployVersion === 'v3' ? FLASH_ARB_V3_RUNTIME : f.deployVersion === 'v2' ? FLASH_ARB_V2_RUNTIME : null;
       if (!receipt.contractAddress || receipt.from.toLowerCase() !== this.host.account.address.toLowerCase()
-        || (f.deployVersion === 'v2' && !await this.contractOk(receipt.contractAddress, FLASH_ARB_V2_RUNTIME))) {
+        || (expectedRuntime && !await this.contractOk(receipt.contractAddress, expectedRuntime, receipt.blockNumber))) {
         throw new Error('Confirmed deployment could not be verified');
       }
       this.clearDeployment({ address: receipt.contractAddress, gasWei: receipt.gasUsed * receipt.effectiveGasPrice });
@@ -1161,38 +1175,41 @@ export class MevSearcher {
   }
 
   async deploymentQuote() {
-    const { balance, minimumWei, estimatedWei, gas, maxFeePerGas } = await this.host.exec.quoteDeployment(FLASH_ARB_V2_BYTECODE);
+    if (!this.canDeployV3 || this.walletPending()) throw new Error('FlashArbV3 deployment quote is unavailable.');
+    const { balance, minimumWei, estimatedWei, gas, maxFeePerGas } = await this.host.exec.quoteDeployment(FLASH_ARB_V3_BYTECODE);
+    const maximumWei = estimatedWei === null ? null : gas * maxFeePerGas;
     return {
+      version: 'v3' as const,
+      maximumWei: maximumWei?.toString() ?? null,
       balanceEth: eth(balance),
       minimumEth: eth(minimumWei),
       estimatedEth: estimatedWei === null ? null : eth(estimatedWei),
-      maximumEth: estimatedWei === null ? null : eth(gas * maxFeePerGas),
+      maximumEth: maximumWei === null ? null : eth(maximumWei),
     };
   }
 
   /** This action authorizes one deployment. Live trading stays separately controlled. */
-  async deployFromDashboard(): Promise<Address> {
+  async deployFromDashboard(maximumGasWei: bigint, disarmSpot?: () => void): Promise<Address> {
     if (!MEV.enabled) throw new Error('MEV is turned off in .env (MEV=off).');
     if (!CONFIG.allowLiveTrading && !CONFIG.forkMode) throw new Error('Live execution is disabled (ALLOW_LIVE_TRADING=off).');
     if (this.stateReadError) throw new Error(this.stateReadError);
-    if (!this.persist || this.stopping || this.file.armed || this.walletPending() || this.host.tradePending()) {
-      throw new Error('Disarm MEV and wait for pending wallet operations to settle before deploying.');
+    if (!this.canDeployV3 || this.walletPending() || this.host.tradePending()) {
+      throw new Error('FlashArbV3 is already selected or the wallet is unavailable for a deployment.');
     }
-    if (this.selectedContract || this.configuredContract) throw new Error('A FlashArbV2 address is already saved or configured.');
 
-    const generation = this.armGeneration;
+    let generation = this.armGeneration;
     this.deploying = true;
     this.status = this.modeText();
     const f = this.file;
     const canSend = () => this.deploying && this.armGeneration === generation && !this.stopping
-      && !f.armed && !this.stateReadError && !this.pending && !this.host.tradePending();
+      && !this.stateReadError && !this.pending && !this.host.tradePending();
     try {
       const r = await this.host.exec.deployContract(
-        FLASH_ARB_V2_BYTECODE,
+        FLASH_ARB_V3_BYTECODE,
         (message) => this.host.log('[mev] ' + message),
         (hash, nonce) => {
           f.deployTx = hash;
-          f.deployVersion = 'v2';
+          f.deployVersion = 'v3';
           f.deployNonce = nonce;
           f.deployStartedAt = Date.now();
           try {
@@ -1206,10 +1223,18 @@ export class MevSearcher {
           }
         },
         canSend,
+        {
+          maximumGasWei,
+          beforeSign: () => {
+            disarmSpot?.();
+            if (f.armed) this.disarm('for the FlashArbV3 deployment');
+            generation = this.armGeneration;
+          },
+        },
       );
-      if (!await this.contractOk(r.address)) throw new Error('Confirmed deployment could not be verified');
+      if (!await this.contractOk(r.address, FLASH_ARB_V3_RUNTIME, r.blockNumber)) throw new Error('Confirmed FlashArbV3 deployment could not be verified');
       this.clearDeployment({ address: r.address, gasWei: r.gasWei });
-      this.host.log('[mev] Verified FlashArbV2 deployment at ' + r.address, 'trade');
+      this.host.log('[mev] Verified FlashArbV3 deployment at ' + r.address, 'trade');
       return r.address;
     } catch (error) {
       if (error instanceof UncertainTxError) throw new Error('The deployment transaction is awaiting confirmation. Recovery continues in paper mode.');
@@ -1238,10 +1263,11 @@ export class MevSearcher {
       armed: f.armed,
       contract: this.selectedContract,
       configuredContract: this.configuredContract,
+      canDeployV3: this.canDeployV3,
       contractVersion: this.isV3 ? 'v3' : 'v2',
       fundingMode: MEV.funding,
-      deployedAt: this.isV3 ? null : f.v2DeployedAt ?? null,
-      deployGasUsd: this.isV3 ? 0 : f.v2DeployGasUsd ?? 0,
+      deployedAt: (this.isV3 ? f.v3DeployedAt : f.v2DeployedAt) ?? null,
+      deployGasUsd: (this.isV3 ? f.v3DeployGasUsd : f.v2DeployGasUsd) ?? 0,
       tokens: this.tokens.length,
       pools: this.tokens.reduce((s, t) => s + t.pools.length, 0),
       venues,

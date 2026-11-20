@@ -39,6 +39,12 @@ export interface V4PoolSeed {
   nativeEth: boolean;
 }
 
+// Nonstandard hook-free PoolManager keys verified through StateView on Ethereum at block 26454925.
+const VERIFIED_V4_KEYS: readonly V4PoolSeed[] = [
+  { token: '0xdAC17F958D2ee523a2206206994597C13D831ec7', fee: 9000, tickSpacing: 90, nativeEth: true }, // ETH / USDT
+  { token: '0x50327c6c5a14DCaDE707ABad2E27eB517df87AB5', fee: 2500, tickSpacing: 25, nativeEth: true }, // ETH / WTRX
+];
+
 export interface V4PoolDescriptor extends V4PoolSeed {
   id: Hex;
   quoteIs0: boolean;
@@ -70,6 +76,7 @@ export function v4Candidates(tokens: readonly TokenCfg[], extra: readonly V4Pool
       add({ token: token.address, fee, tickSpacing, nativeEth: false });
     }
   }
+  for (const seed of VERIFIED_V4_KEYS) add(seed);
   for (const seed of extra) add(seed);
   return [...out.values()];
 }

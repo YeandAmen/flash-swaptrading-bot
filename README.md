@@ -137,18 +137,18 @@ Remove-Item Env:FORK_BLOCK_NUMBER
 
 Ethereum block `26451239` contains the canonical PancakeSwap v3 and Uniswap v4 pools used by the V2 fixture. Choose another archive snapshot by setting `FORK_BLOCK_NUMBER`. Use the `ANVIL` environment variable for a locally installed executable outside your `PATH`.
 
-## 6. Deploy FlashArbV2 from the dashboard
+## 6. Deploy FlashArbV3 from the dashboard
 
 Paper scanning is available after startup. If the live controls are disabled, check `ALLOW_LIVE_TRADING` in `.env`. The default `off` blocks every broadcast, including contract deployment. Both live modes start disarmed on every restart.
 
 1. To allow a real mainnet deployment, set `ALLOW_LIVE_TRADING=on` in `.env` and restart the bot. Use `npm run service:restart` for the installed macOS service, or stop and restart `npm start` for a foreground run.
-2. Open [the local dashboard](http://127.0.0.1:7777), wait for the bot to be ready, and select **Deploy FlashArbV2**. The dialog shows the estimated fee and the maximum gas charge the transaction authorizes. If the wallet balance is too low, the dialog shows the minimum ETH needed at the quoted gas price. The bot rechecks pricing before signing.
-3. Type `DEPLOY` and authorize the action with the password from `npm run --silent dashboard:password`. The bot waits for the receipt and verifies the deployed bytecode and wallet ownership.
+2. Open [the local dashboard](http://127.0.0.1:7777), wait for the wallet to be ready, and select **Deploy FlashArbV3**. The dialog shows the estimated fee and the maximum gas charge you authorize. If the balance is low, it shows the minimum ETH needed at current gas prices.
+3. Type `DEPLOY` and authorize the action with the password from `npm run --silent dashboard:password`. The bot rechecks the gas cap and disarms both modes before signing. It selects V3 after verifying the deployed bytecode and wallet ownership at the confirmed receipt block. An existing V2 stays in the local deployment history.
 4. **Arm MEV** separately when you want live arbitrage. Spot trading has its own arming control. To return to paper-only operation, set `ALLOW_LIVE_TRADING=off` and restart.
 
 The dashboard reuses a verified V2 deployment. To adopt a manually deployed copy, set `MEV_V2_CONTRACT_ADDRESS` to the FlashArbV2 address owned by the bot wallet and restart. The bot verifies its runtime and owner before use.
 
-### Optional FlashArbV3 with Balancer V3 funding
+### Manual FlashArbV3 deployment and fork tests
 
 FlashArbV3 adds Balancer V3 WETH funding to the existing swap routes and lending options. It executes the two swaps, repays the lender and returns the contract's proceeds to its deploying wallet in the same transaction. The owner and runtime checks apply to the configured V3 address. [Balancer V3 flash loans](https://docs.balancer.fi/concepts/vault/flash-loans.html)
 

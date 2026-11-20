@@ -195,7 +195,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
       <tbody id="mevBody"></tbody>
     </table></div>
     <div class="row">
-      <button id="mevDeployBtn" aria-describedby="mevDeploy" disabled>Deploy FlashArbV2</button>
+      <button id="mevDeployBtn" aria-describedby="mevDeploy" hidden disabled>Deploy FlashArbV3</button>
       <button id="mevArmBtn" class="primary" aria-describedby="mevDeploy" disabled>Arm MEV (live bundles)</button>
       <button id="mevDisarmBtn" class="danger" hidden>Disarm MEV</button>
     </div>
@@ -271,23 +271,23 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
   </div>
 </dialog>
 
-<dialog id="mevDeployDlg" aria-labelledby="mevDeployTitle">
-  <h3 id="mevDeployTitle">Deploy FlashArbV2?</h3>
+<dialog id="mevDeployDlg" aria-labelledby="mevDeployTitle" aria-describedby="mevDeployGas mevDeployImpact">
+  <h3 id="mevDeployTitle">Deploy FlashArbV3?</h3>
   <p id="mevDeployGas"></p>
-  <p>The bot wallet will own the contract. Arming live MEV is a separate action.</p>
+  <p id="mevDeployImpact">The bot wallet will own V3. Deployment disarms spot and MEV. The bot switches to V3 after it verifies deployment. Re-arm the live modes you want when deployment is complete.</p>
   <label class="sub" for="mevDeployInput">Type <b>DEPLOY</b> to confirm</label>
   <input id="mevDeployInput" autocomplete="off" spellcheck="false">
   <p id="mevDeployError" class="neg" role="alert" hidden></p>
   <div class="row" style="justify-content:flex-end">
     <button id="mevDeployCancel" class="ghost">Cancel</button>
-    <button id="mevDeployConfirm" class="primary" disabled>Deploy FlashArbV2</button>
+    <button id="mevDeployConfirm" class="primary" disabled>Deploy FlashArbV3</button>
   </div>
 </dialog>
 
 <dialog id="mevDlg">
   <h3>Arm MEV arbitrage?</h3>
   <ul>
-    <li>Arming checks the FlashArbV2 bytecode and confirms that the bot wallet owns the contract.</li>
+    <li>Arming checks the selected FlashArb bytecode and confirms that the bot wallet owns the contract.</li>
     <li>When a qualifying gap appears, the bot submits a bundle to configured builders. Flash funding supplies the principal, and the bot wallet receives any realized contract profit in <b>ETH</b>.</li>
     <li>The contract enforces a profit floor. Gas is still at risk if a builder includes a transaction that reverts.</li>
     <li>The builder tip is set by MEV_BUILDER_TIP_PCT in .env.</li>

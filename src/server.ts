@@ -7,7 +7,7 @@ import { CONFIG, GAS_TOPUP, RISK, ROOT, STRATEGY, TOKENS, USDC_DECIMALS } from '
 import { createDashboardCredentialCheck } from './dashboard-auth.js';
 import { endpointOrigin, redactDiagnostic } from './diagnostics.js';
 import { Engine } from './engine.js';
-import { DeploymentGasError } from './executor.js';
+import { DeploymentFeeLimitError, DeploymentGasError } from './executor.js';
 import type { PortfolioState } from './types.js';
 
 const engine = new Engine();
@@ -233,7 +233,8 @@ function control(operation: (req: Request) => void | Promise<void | { address: s
     } catch (error) {
       const message = redactDiagnostic(String((error as Error)?.message ?? error).split('\n')[0]);
       engine.log(`${req.path}: ${message}`, 'warn');
-      res.status(409).json({ error: error instanceof DeploymentGasError ? message : 'The request could not complete. See the activity log.' });
+      res.status(409).json({ error: error instanceof DeploymentGasError || error instanceof DeploymentFeeLimitError
+        ? message : 'The request could not complete. See the activity log.' });
     }
   };
 }
@@ -250,11 +251,15 @@ app.get('/api/mev/deploy/quote', async (_req, res) => {
   res.status(503).json({ error: 'The deployment gas quote is currently unavailable.' });
 });
 app.post('/api/mev/deploy', (req, res) => {
-  if (req.body?.confirm !== 'DEPLOY') { res.status(400).json({ error: 'Type DEPLOY to confirm' }); return; }
+  const { confirm, version, maximumWei } = req.body ?? {};
+  if (confirm !== 'DEPLOY' || version !== 'v3' || typeof maximumWei !== 'string' || !/^[1-9][0-9]{0,77}$/.test(maximumWei)) {
+    res.status(400).json({ error: 'Refresh the dashboard and confirm a FlashArbV3 gas quote.' });
+    return;
+  }
   if (!allowArming(req, res)) return;
   const mev = engine.mev;
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
-  void control(async () => ({ address: await mev.deployFromDashboard() }))(req, res);
+  void control(async () => ({ address: await mev.deployFromDashboard(BigInt(maximumWei), () => engine.disarm()) }))(req, res);
 });
 app.post('/api/mev/arm', (req, res) => {
   if (req.body?.confirm !== 'MEV') { res.status(400).json({ error: 'Type MEV to confirm' }); return; }
