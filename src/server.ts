@@ -269,18 +269,20 @@ app.post('/api/mev/arm', (req, res) => {
   void control(() => mev.arm())(req, res);
 });
 app.post('/api/mev/test-once', (req, res) => {
-  const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false, publicFunctional = false } = req.body ?? {};
+  const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false, publicFunctional = false, minimumNetUsd } = req.body ?? {};
   if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)
     || typeof maximumGasUsd !== 'number' || !Number.isFinite(maximumGasUsd) || maximumGasUsd <= 0
     || typeof requireGasCoverage !== 'boolean' || typeof privateSubmission !== 'boolean' || typeof publicFunctional !== 'boolean'
-    || (publicFunctional && (privateSubmission || requireGasCoverage))) {
+    || (publicFunctional && (privateSubmission || (requireGasCoverage && minimumNetUsd === undefined)))
+    || (minimumNetUsd !== undefined && (typeof minimumNetUsd !== 'number' || !Number.isFinite(minimumNetUsd)
+      || minimumNetUsd <= 0 || !requireGasCoverage || (!privateSubmission && !publicFunctional)))) {
     res.status(400).json({ error: 'Confirm TEST with a request ID, maximum gas cost, and optional gas coverage requirement.' });
     return;
   }
   if (!allowArming(res)) return;
   const mev = engine.mev;
   if (!mev) { res.status(503).json({ error: 'MEV is still starting' }); return; }
-  void control(() => mev.queueGasOnlyTest(id, maximumGasUsd, requireGasCoverage, privateSubmission, publicFunctional))(req, res);
+  void control(() => mev.queueGasOnlyTest(id, maximumGasUsd, requireGasCoverage, privateSubmission, publicFunctional, minimumNetUsd))(req, res);
 });
 app.post('/api/mev/disarm', control(() => engine.mev?.disarm()));
 app.post('/api/pause', (req, res) => {
