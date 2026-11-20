@@ -1038,8 +1038,9 @@ export class MevSearcher {
     let premium = false;
     const direct = MEV.submission === 'direct';
     const privateSubmission = direct && (test?.privateSubmission ?? MEV.directProtected) ? true : undefined;
-    const horizon = privateSubmission ? PRIVATE_DIRECT_WINDOW : DIRECT_WINDOW;
-    const target = r.blockNumber + BigInt(horizon);
+    const privateGasOnly = privateSubmission && gasOnly;
+    let horizon = privateSubmission ? PRIVATE_DIRECT_WINDOW : DIRECT_WINDOW;
+    let target = r.blockNumber + BigInt(horizon);
     const reserve = direct && !gasOnly ? directExecutionReserve(offer.profit) : 0n;
     const spendableProceeds = offer.profit - reserve;
     const encode = (tip: bigint, minProfit: bigint) => this.liveData(encodeArbitrage(offer.funding, {
@@ -1054,7 +1055,8 @@ export class MevSearcher {
         mevReadClient.estimateGas({ account: this.host.account, to: contract, data: encode(direct ? 0n : 1n, 1n), blockNumber: r.blockNumber }),
         direct ? directPriorityFee(premiumAvailable ? PREMIUM_QUOTE_CAP_WEI : priorityCap, true) : 0n,
       ]);
-      const paddedBps = 10_000n + BigInt(Math.round(policy.gasPaddingPct * 10_000));
+      const padding = privateGasOnly ? Math.min(policy.gasPaddingPct, 0.15) : policy.gasPaddingPct;
+      const paddedBps = 10_000n + BigInt(Math.round(padding * 10_000));
       const gas = (estimate * paddedBps + 9_999n) / 10_000n;
       let fees = directFees(r.nextBaseFee, 0n, horizon);
       if (direct) {
@@ -1064,8 +1066,13 @@ export class MevSearcher {
         const minimumTip = priorityCap < MIN_PRIORITY_FEE_WEI ? priorityCap : MIN_PRIORITY_FEE_WEI;
         const maxGasUsd = Math.min(this.availableDirectGasUsd(now), test?.maximumGasUsd ?? Infinity);
         const maxGasWei = loanLimitWei(maxGasUsd, ethUsd);
-        const budgetFees = maxGasWei !== null
+        let budgetFees = maxGasWei !== null
           ? affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, horizon) : null;
+        if (!budgetFees && privateGasOnly && maxGasWei !== null) {
+          horizon = DIRECT_WINDOW;
+          target = r.blockNumber + BigInt(horizon);
+          budgetFees = affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, horizon);
+        }
         let affordableFees = gasOnly || !budgetFees ? budgetFees : affordableDirectFees(
           r.nextBaseFee, gas, budgetFees.maxPriorityFeePerGas, minimumTip, spendableProceeds - minimumNet, horizon,
         );
