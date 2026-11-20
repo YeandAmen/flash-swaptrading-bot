@@ -21,11 +21,16 @@ const STATE_FILE = path.join(DATA_DIR, 'mev.json');
 const SIM_ADDR: Address = '0x00000000000000000000000000000000000ab1e5';
 const HOUR = 3_600_000;
 const IDLE_BID_AFTER_MS = 30 * 60_000;
+const NORMAL_GAS_PADDING_PCT = 0.25;
 const SLOT_MS = 12_000;
 const FALLBACK_LEAD_MS = 5_000;
 const HEAD_RETRY_MS = 400;
 const POOL_READS_PER_CHUNK = 160;
 const RECEIPT_CONFIRMATIONS = 2n;
+const RECENT_LIMIT = 60;
+const RECENT_BUNDLE_LIMIT = 10;
+const DASHBOARD_RECENT_LIMIT = 15;
+const DASHBOARD_BUNDLE_LIMIT = 5;
 const MAX_STARTUP_TRACE_BUNDLES = 6;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String(e)).split('\n')[0]).slice(0, 200);
@@ -67,6 +72,13 @@ export interface MevOpp {
   funding?: (typeof FUNDING_NAMES)[number];
   lenderFeeEth?: number;
   submission?: BundleSubmission;
+}
+
+/** Preserve submission details through busy stretches of simulation results. */
+function retainRecent(rows: MevOpp[], limit: number, bundleLimit: number): MevOpp[] {
+  let bundlesLeft = Math.min(bundleLimit, rows.filter((row) => row.submission).length);
+  let otherRowsLeft = limit - bundlesLeft;
+  return rows.filter((row) => row.submission ? bundlesLeft-- > 0 : otherRowsLeft-- > 0);
 }
 
 interface BundleSubmission {
@@ -193,6 +205,7 @@ interface ProfitPolicy {
   idle: boolean;
   minNetUsd: number;
   builderTipPct: number;
+  gasPaddingPct: number;
 }
 
 interface RouteCooldown {
@@ -696,13 +709,15 @@ export class MevSearcher {
     const { stats, armedAt } = this.file;
     // Old journals with no landed bundles already record how long the scanner has been running.
     const since = stats.lastLandedAt ?? (stats.landed === 0 ? stats.since : armedAt);
-    const configured = MEV.idleBuilderTipPct !== MEV.builderTipPct || MEV.idleMinNetUsd !== MEV.minNetUsd;
+    const configured = MEV.idleBuilderTipPct !== MEV.builderTipPct || MEV.idleMinNetUsd !== MEV.minNetUsd
+      || MEV.idleGasPaddingPct !== NORMAL_GAS_PADDING_PCT;
     const idle = configured && this.liveArmed(this.armGeneration) && this.contractReady
       && since !== null && Number.isFinite(since) && since > 0 && now - since >= IDLE_BID_AFTER_MS;
     return {
       idle,
       minNetUsd: idle ? MEV.idleMinNetUsd : MEV.minNetUsd,
       builderTipPct: idle ? MEV.idleBuilderTipPct : MEV.builderTipPct,
+      gasPaddingPct: idle ? MEV.idleGasPaddingPct : NORMAL_GAS_PADDING_PCT,
     };
   }
 
@@ -743,7 +758,8 @@ export class MevSearcher {
       // Estimate with the builder payment path enabled, then simulate the exact calldata and gas limit.
       this.file.stats.rpcCalls++;
       const estimate = await mevReadClient.estimateGas({ account: this.host.account, to: contract, data: encode(1n, 1n), blockNumber: r.blockNumber });
-      const gas = (estimate * 125n + 99n) / 100n;
+      const paddedBps = 10_000n + BigInt(Math.round(policy.gasPaddingPct * 10_000));
+      const gas = (estimate * paddedBps + 9_999n) / 10_000n;
       const gasBudget = gas * r.nextBaseFee;
       const afterGas = offer.profit - gasBudget;
       if (afterGas < minimumNet) return this.skipOpportunity(opp, 'below configured profit floor with padded gas');
@@ -959,7 +975,7 @@ export class MevSearcher {
     const f = this.file;
     const previous = { pending: f.pending, recent: f.recent, stats: f.stats };
     f.pending = null;
-    f.recent = [outcome, ...f.recent.filter((item) => item.hash !== outcome.hash)].slice(0, 60);
+    f.recent = retainRecent([outcome, ...f.recent.filter((item) => item.hash !== outcome.hash)], RECENT_LIMIT, RECENT_BUNDLE_LIMIT);
     if (included) {
       const landed = outcome.status === 'landed';
       f.stats = {
@@ -1000,18 +1016,18 @@ export class MevSearcher {
     return scheduled;
   }
 
-  /** Keeps the newest 60 results; repeats of the same route and outcome within 10 minutes are merged. */
+  /** Keeps a bounded journal. Repeated simulations of the same route and outcome are merged. */
   private record(o: MevOpp, merge = true) {
     const rec = this.file.recent;
-    if (merge) {
-      const i = rec.findIndex((x) => x.symbol === o.symbol && x.buy === o.buy && x.sell === o.sell && x.status === o.status && o.t - x.t < 10 * 60_000);
+    if (merge && !o.submission) {
+      const i = rec.findIndex((x) => !x.submission && x.symbol === o.symbol && x.buy === o.buy && x.sell === o.sell && x.status === o.status && o.t - x.t < 10 * 60_000);
       if (i !== -1) {
         o.count = (rec[i].count ?? 1) + 1;
         rec.splice(i, 1);
       }
     }
     rec.unshift(o);
-    if (rec.length > 60) rec.length = 60;
+    this.file.recent = retainRecent(rec, RECENT_LIMIT, RECENT_BUNDLE_LIMIT);
   }
 
   // ------------------------------------------------------------------ arming & the contract
@@ -1241,7 +1257,7 @@ export class MevSearcher {
       stats: f.stats,
       pending: this.pending ? { hash: this.pending.hash, target: Number(this.pending.target) } : null,
       deploymentPending: f.deployTx,
-      recent: f.recent.slice(0, 15),
+      recent: retainRecent(f.recent, DASHBOARD_RECENT_LIMIT, DASHBOARD_BUNDLE_LIMIT),
       settings: {
         tipPct: MEV.builderTipPct, minNetUsd: MEV.minNetUsd, minPoolWeth: MEV.minPoolWeth,
         activeProfitPolicy: this.profitPolicy(Date.now()),

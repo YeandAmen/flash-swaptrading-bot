@@ -211,6 +211,7 @@ export const MEV = {
   minNetUsd: mevMinNetUsd, // smallest after-gas, after-tip profit worth a bundle
   idleBuilderTipPct: num('MEV_IDLE_BUILDER_TIP_PCT', mevBuilderTipPct),
   idleMinNetUsd: num('MEV_IDLE_MIN_NET_USD', mevMinNetUsd),
+  idleGasPaddingPct: num('MEV_IDLE_GAS_PADDING_PCT', 0.25),
   maxSimsPerBlock: num('MEV_MAX_SIMS_PER_BLOCK', 3),
   builders: str('MEV_BUILDERS', 'https://relay.flashbots.net,https://rpc.titanbuilder.xyz,https://rpc.beaverbuild.org,https://rpc.quasar.win')
     .split(',').map((s) => s.trim()).filter(Boolean),
@@ -259,5 +260,6 @@ check(MEV.minNetUsd >= 0.01, 'MEV_MIN_NET_USD must be >= 0.01');
 frac('MEV_IDLE_BUILDER_TIP_PCT', MEV.idleBuilderTipPct);
 check(MEV.idleBuilderTipPct >= MEV.builderTipPct, 'MEV_IDLE_BUILDER_TIP_PCT must be at least MEV_BUILDER_TIP_PCT');
 check(MEV.idleMinNetUsd >= 0.01 && MEV.idleMinNetUsd <= MEV.minNetUsd, 'MEV_IDLE_MIN_NET_USD must be between 0.01 and MEV_MIN_NET_USD');
+check(MEV.idleGasPaddingPct >= 0.10 && MEV.idleGasPaddingPct <= 0.25, 'MEV_IDLE_GAS_PADDING_PCT must be between 0.10 and 0.25');
 check(Number.isInteger(MEV.maxSimsPerBlock) && MEV.maxSimsPerBlock >= 1 && MEV.maxSimsPerBlock <= 10, 'MEV_MAX_SIMS_PER_BLOCK must be 1..10');
 check(MEV.builders.every((u) => /^https:\/\//.test(u)), 'MEV_BUILDERS must be https URLs separated by commas');
