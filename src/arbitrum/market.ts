@@ -1,10 +1,11 @@
 import {
-  createPublicClient, encodeAbiParameters, formatEther, http, keccak256, parseAbi, parseAbiParameters,
+  createPublicClient, encodeAbiParameters, fallback, formatEther, http, keccak256, parseAbi, parseAbiParameters,
   parseEther, zeroAddress, type Address,
 } from 'viem';
 import { arbitrum } from 'viem/chains';
 
 export const defaultArbitrumRpc = 'https://arb1.arbitrum.io/rpc';
+const alternateArbitrumHeadRpc = 'https://arbitrum-one-rpc.publicnode.com';
 export const arbitrumChainId = 42161;
 const weth: Address = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
 const factory: Address = '0x1f98431c8ad98523631ae4a59f267346ea31f984';
@@ -40,9 +41,15 @@ const oracleAbi = parseAbi(['function latestRoundData() view returns (uint80,int
 const quoteV3Abi = parseAbi(['function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160,uint32,uint256 gasEstimate)']);
 const quoteV4Abi = parseAbi(['function quoteExactInputSingle(((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) poolKey,bool zeroForOne,uint128 exactAmount,bytes hookData)) returns (uint256 amountOut,uint256 gasEstimate)']);
 
-export const arbitrumClient = (rpc = defaultArbitrumRpc) => createPublicClient({
-  chain: arbitrum, transport: http(rpc, { timeout: 6000, retryCount: 0 }),
-});
+export const arbitrumClient = (rpc = defaultArbitrumRpc) => {
+  const primary = http(rpc, { timeout: 6000, retryCount: 0 });
+  const transport = rpc.replace(/\/$/, '') === defaultArbitrumRpc
+    ? fallback([primary, http(alternateArbitrumHeadRpc, {
+      timeout: 2000, retryCount: 0, methods: { include: ['eth_blockNumber', 'eth_getBlockByNumber'] },
+    })], { retryCount: 0 })
+    : primary;
+  return createPublicClient({ chain: arbitrum, transport });
+};
 export type ArbitrumClient = ReturnType<typeof arbitrumClient>;
 type Pool = { kind: 2 | 5; pool: Address; fee: number; tickSpacing: number; nativeEth: boolean };
 type Market = { symbol: string; token: Address; pools: Pool[] };
