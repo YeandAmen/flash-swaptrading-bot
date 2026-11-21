@@ -7,10 +7,11 @@ import { NetworkActivity } from '../network-activity.js';
 import { writeJson } from '../persistence.js';
 import { loadOrCreateWallet } from '../wallet.js';
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
+import { broadcastArbitrum, type ArbitrumBroadcast } from './broadcast.js';
 import { verifyArbitrumExecutor, type ArbitrumExecutor } from './proxy.js';
 import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
 import { arbitrumTestLeads } from './test-leads.js';
-import { arbitrumChainId, arbitrumClient, arbitrumEthUsd, discoverArbitrumPools, scanArbitrum, type ArbQuote } from './market.js';
+import { arbitrumChainId, arbitrumClient, arbitrumEthUsd, defaultArbitrumRpc, discoverArbitrumPools, scanArbitrum, type ArbQuote } from './market.js';
 
 const journalFile = path.join(DATA_DIR, 'arbitrum-trades.json');
 const haltedFile = path.join(DATA_DIR, 'arbitrum-disarmed.json');
@@ -32,12 +33,33 @@ const preparationStatus: Record<ArbitrumOrderRejection, string> = {
   'fee-rpc': 'Arbitrum RPC failed during fee estimation',
   'simulation-rpc': 'Arbitrum RPC failed during pending simulation',
 };
-type Pending = { hash: Hash; nonce: number; ethUsd: number; budgetUsd: number };
+type Pending = { hash: Hash; nonce: number; ethUsd: number; budgetUsd: number; broadcast?: ArbitrumBroadcast };
 type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'replaced'; gasUsd: number; netUsd: number; at: number; loanUsd?: number };
 type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest };
 
+function receiptStatus(broadcast?: ArbitrumBroadcast): string {
+  const alternate = broadcast?.via === 'alternate';
+  switch (broadcast?.status) {
+    case 'acknowledged':
+      return alternate ? 'Alternate RPC acknowledged the Arbitrum transaction after a primary rate limit'
+        : 'Primary RPC acknowledged the Arbitrum transaction. Waiting for receipt';
+    case 'quota-rejected':
+      return alternate ? 'Both Arbitrum RPCs refused the write due to rate limits. Waiting for reconciliation'
+        : 'Primary RPC write was rate limited. Waiting for reconciliation';
+    case 'hash-mismatch':
+      return `${alternate ? 'Alternate' : 'Primary'} RPC returned a different hash. Waiting for reconciliation`;
+    case 'unknown':
+      return `${alternate ? 'Alternate' : 'Primary'} RPC send outcome is unknown. Waiting for reconciliation`;
+    default:
+      return 'Waiting for transaction receipt';
+  }
+}
+
 export class ArbitrumWorker {
-  private readonly client = arbitrumClient(process.env.ARBITRUM_RPC_URL);
+  private readonly rpcUrl = process.env.ARBITRUM_RPC_URL ?? defaultArbitrumRpc;
+  private readonly client = arbitrumClient(this.rpcUrl);
+  private readonly alternateWriter = this.rpcUrl.replace(/\/$/, '') === defaultArbitrumRpc
+    ? arbitrumClient('https://arbitrum-one-rpc.publicnode.com') : null;
   private readonly executionEnabled = process.env.ARBITRUM_LIVE === 'on' && CONFIG.allowLiveTrading;
   private markets: Awaited<ReturnType<typeof discoverArbitrumPools>> = [];
   private refreshAfter = 0;
@@ -46,6 +68,7 @@ export class ArbitrumWorker {
   private executorCheckAt = 0;
   private journal: Journal | null = null;
   private active = false;
+  private sendGeneration = 0;
   private halted = fs.existsSync(haltedFile);
   readonly contract = (process.env.ARBITRUM_EXECUTOR_ADDRESS ?? '') as Address;
   readonly owner = (process.env.ARBITRUM_OWNER_ADDRESS ?? '') as Address;
@@ -113,11 +136,15 @@ export class ArbitrumWorker {
     }
   }
 
-  stop() { this.active = false; }
+  stop() {
+    this.active = false;
+    this.sendGeneration++;
+  }
 
   disarm() {
     if (!this.enabled || !this.executionEnabled) return;
     this.halted = true;
+    this.sendGeneration++;
     this.summary.mode = 'paper';
     this.activity.record('warn', 'Live signing disarmed');
     writeJson(haltedFile, true);
@@ -190,7 +217,7 @@ export class ArbitrumWorker {
     this.summary.routes = result.quotedRoutes;
     this.summary.updatedAt = Date.now();
     this.activity.recordScan(result.quotedRoutes, this.summary.updatedAt);
-    if (this.journal?.pending) this.summary.status = 'Waiting for transaction receipt';
+    if (this.journal?.pending) this.summary.status = receiptStatus(this.journal.pending.broadcast);
     else if (!result.best) this.summary.status = 'No positive payout after loan fees';
     else if (!this.summary.executor) this.summary.status = 'Flash payout quoted. Deploy executor to check full fees';
     else {
@@ -201,6 +228,7 @@ export class ArbitrumWorker {
   }
 
   private async tryOrders(candidates: ArbQuote[], ethUsd: number, test: FlashTest | null): Promise<boolean> {
+    const generation = this.sendGeneration;
     const canTest = () => !test || (this.journal?.test === test && activeFlashTest(test));
     const available = this.journal ? Math.min(txLimitUsd, dailyLimitUsd
       - this.journal.recent.filter((row) => row.at > Date.now() - dayMs).reduce((sum, row) => sum + row.gasUsd, 0)) : txLimitUsd;
@@ -248,9 +276,31 @@ export class ArbitrumWorker {
       this.save({ ...this.journal, pending: { hash, nonce, ethUsd, budgetUsd: prepared.worstGasUsd },
         ...(test ? { test: { ...test, status: 'submitted', hash, note: 'Waiting for the Arbitrum receipt.' } } : {}),
       });
-      this.summary.status = 'Waiting for transaction receipt';
-      this.activity.record('info', test ? 'Mainnet test submitted' : 'Arbitrum route submitted', `https://arbiscan.io/tx/${hash}`);
-      await this.client.sendRawTransaction({ serializedTransaction });
+      this.summary.status = 'Journaled Arbitrum transaction. Waiting for RPC acknowledgement';
+      const alternate = this.alternateWriter;
+      const broadcast = await broadcastArbitrum(
+        (transaction) => this.client.sendRawTransaction({ serializedTransaction: transaction }), serializedTransaction, hash,
+        alternate ? {
+          send: (transaction) => alternate.sendRawTransaction({ serializedTransaction: transaction }),
+          canSend: () => this.active && !this.halted && this.sendGeneration === generation && this.summary.mode === 'live'
+            && this.deployment.verified && this.journal?.pending?.hash === hash
+            && (!test || Date.now() < test.expiresAt),
+          verifyFresh: async () => {
+            const [id, primaryHead, alternateHead] = await Promise.all([
+              alternate.getChainId(), this.client.getBlockNumber({ cacheTime: 0 }), alternate.getBlockNumber({ cacheTime: 0 }),
+            ]);
+            return id === arbitrumChainId && primaryHead >= head && alternateHead >= head
+              && primaryHead < prepared.deadline && alternateHead < prepared.deadline;
+          },
+        } : undefined,
+      );
+      const journal = this.journal;
+      if (journal?.pending?.hash === hash) {
+        this.summary.status = receiptStatus(broadcast);
+        this.save({ ...journal, pending: { ...journal.pending, broadcast } });
+        this.activity.record(broadcast.status === 'acknowledged' ? 'info' : 'warn',
+          this.summary.status, `https://arbiscan.io/tx/${hash}`);
+      }
       return true;
     }
     if (available <= 0) this.summary.status = preparationStatus['daily-budget'];
