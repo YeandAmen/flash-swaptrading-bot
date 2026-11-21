@@ -61,6 +61,7 @@ const GAS_LEDGER_HOURS = 24;
 const hourOf = (time: number) => Math.floor(time / HOUR);
 const directBudgetConfigured = () => MEV.directMaxGasUsd > 0;
 const directPriorityCap = () => BigInt(Math.floor(MEV.directMaxPriorityGwei * 1e9));
+const minimumDirectPriority = (cap: bigint) => cap < MIN_PRIORITY_FEE_WEI ? cap : MIN_PRIORITY_FEE_WEI;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const errMsg = (e: unknown) => redactDiagnostic(((e as Error)?.message ?? String(e)).split('\n')[0]).slice(0, 200);
 const eth = (wei: bigint) => Number(wei) / 1e18;
@@ -286,7 +287,7 @@ interface RouteCooldown {
   est: number;
   grow: number;
   revertStreak?: number;
-  gasRetry?: { profit: bigint; gasUnits: number; cadenceAt?: number };
+  gasRetry?: { profit: bigint; gasUnits: number; pricedAt?: bigint; cadenceAt?: number };
 }
 
 const STRUCTURAL_REVERTS = new Set(['v2 factory', 'v3 factory', 'v4 key', 'pool parameters', 'same pool']);
@@ -298,6 +299,10 @@ const MAX_REVERT_STREAK = 5;
 function estimateChanged(estimate: number, cooldown: RouteCooldown): boolean {
   return estimate >= cooldown.est * cooldown.grow
     || (cooldown.revertStreak !== undefined && estimate <= cooldown.est / cooldown.grow);
+}
+
+function minimumScreeningFee(nextBaseFee: bigint, estimatedFee: bigint): bigint {
+  return MEV.submission === 'direct' ? nextBaseFee + minimumDirectPriority(directPriorityCap()) : estimatedFee;
 }
 
 /** Short revert reason from a viem error ("unprofitable", "transfer", ...). */
@@ -647,6 +652,8 @@ export class MevSearcher {
       nextMaxBase = directFees(r.nextBaseFee, priority, DIRECT_WINDOW).maxFeePerGas;
     }
     const gasPriceEth = Number(nextMaxBase) / 1e18;
+    const screeningFee = historical ? nextMaxBase : minimumScreeningFee(r.nextBaseFee, nextMaxBase);
+    const screeningGasPriceEth = Number(screeningFee) / 1e18;
     const cands: Candidate[] = [];
     const test = historical ? null : this.activeGasOnlyTest();
     const testCandidates: Candidate[] = [];
@@ -673,13 +680,14 @@ export class MevSearcher {
         if (test && cycle.profit > 0 && (t.token.core || (test.minimumNetUsd !== undefined && estimatedNet > 0))) {
           testCandidates.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet, gasUnits });
         }
-        if (cycle.profit <= gasEth * (broadenSizes ? 0.65 : 0.8)) continue;
+        if (cycle.profit <= gasUnits * screeningGasPriceEth * (broadenSizes ? 0.65 : 0.8)) continue;
         const key = `${poolIdentity(A)}|${poolIdentity(B)}`;
         const cd = this.cooldown.get(key);
         if (cd && now < cd.until && !estimateChanged(cycle.profit, cd)) {
           const retry = cd.gasRetry;
           const cadenceRetry = broadenSizes && retry?.cadenceAt !== undefined && now >= retry.cadenceAt;
-          if (!cadenceRetry && (!retry || retry.profit - BigInt(retry.gasUnits) * nextMaxBase <= minimumNet)) continue;
+          if (!cadenceRetry && (!retry || (retry.pricedAt !== undefined && screeningFee >= retry.pricedAt)
+            || retry.profit - BigInt(retry.gasUnits) * screeningFee < minimumNet)) continue;
         }
         const rank = rankRouteNet(cycle.profit, cycle.dx, gasUnits, gasPriceEth,
           historical ? undefined : this.routeQuotes.get(key), now);
@@ -959,20 +967,27 @@ export class MevSearcher {
       return { primary, fallback: alternate ? makeOffer(alternate) : undefined };
     }
     if (validPrice(ethUsd)) observedNet?.(primary.opp.netUsd);
+    const screeningFee = minimumScreeningFee(r.nextBaseFee, nextMaxBase);
+    const canCheckExactGas = (trial: SimulatedSize) => {
+      const screeningGas = BigInt(trial.gasUnits) * screeningFee;
+      return trial.profit - (screeningGas - screeningGas / 5n) >= minNetWei;
+    };
     if (net < minNetWei) {
       // estimate far above reality = an illusion of the quick math: back off for longer
       const illusion = Number(b.profit) / 1e18 < c.est * 0.1;
+      const screeningGas = BigInt(b.gasUnits) * screeningFee;
       this.cooldown.set(key, {
         until: Date.now() + (illusion ? HOUR : 5 * 60_000), est: c.est, grow: illusion ? 3 : 1.5,
-        gasRetry: { profit: b.profit, gasUnits: b.gasUnits,
-          cadenceAt: !illusion && b.profit * 4n >= gasWei * 3n ? Date.now() + CADENCE_RECHECK_MS : undefined },
+        gasRetry: { profit: b.profit, gasUnits: b.gasUnits, pricedAt: MEV.submission === 'direct' ? screeningFee : undefined,
+          cadenceAt: !illusion && b.profit * 4n >= screeningGas * 3n ? Date.now() + CADENCE_RECHECK_MS : undefined },
       });
       if (b.profit * 4n >= gasWei) { // only list near misses (gross at least a quarter of the gas), not dust
         this.record({ ...primary.opp, status: 'below gas', note: 'below configured net profit floor' });
       }
-      // The size simulation is pinned, but its rough gas cost can overstate the padded execution cost.
-      return allowFallback && validPrice(ethUsd) && net + gasWei / 5n >= minNetWei
-        ? { primary: null, fallback: primary } : null;
+      // Permit one exact check using the lowest permitted priority when ordinary gas estimates look too high.
+      if (!allowFallback || !validPrice(ethUsd)) return null;
+      const trial = successful.find(canCheckExactGas);
+      return trial ? { primary: null, fallback: trial === b ? primary : makeOffer(trial) } : null;
     }
     this.cooldown.delete(key);
     st.profitable++;
@@ -983,8 +998,7 @@ export class MevSearcher {
       const distinct = alternatives.find((trial) => trial.funding !== b.funding && trial.net >= minNetWei
         && trial.net * 5n >= runnerUp.net * 4n);
       const trial = distinct ?? runnerUp;
-      const trialGas = BigInt(trial.gasUnits) * nextMaxBase;
-      if (trial.net + trialGas / 5n >= minNetWei) fallback = makeOffer(trial);
+      if (canCheckExactGas(trial)) fallback = makeOffer(trial);
     }
     return { primary, fallback };
   }
@@ -1117,7 +1131,7 @@ export class MevSearcher {
         const now = Date.now();
         // A deadline-protected test bids as high as its padded gas and profit limits allow.
         const ordinaryTip = test?.publicFunctional || (test?.privateSubmission && !gasOnly && !profitTest) ? priorityCap : preferredTip < priorityCap ? preferredTip : priorityCap;
-        const minimumTip = priorityCap < MIN_PRIORITY_FEE_WEI ? priorityCap : MIN_PRIORITY_FEE_WEI;
+        const minimumTip = minimumDirectPriority(priorityCap);
         const maxGasUsd = this.availableDirectGasUsd(now, false, test);
         const maxGasWei = loanLimitWei(maxGasUsd, ethUsd);
         let budgetFees = maxGasWei !== null

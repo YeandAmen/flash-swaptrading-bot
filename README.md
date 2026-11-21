@@ -93,7 +93,7 @@ MEV pool reads use bounded batches pinned to the same block. If a batch fails va
 
 When the target block has enough time left, the live search can use one extra exact gas check for an alternate simulated amount or funding source, or for a route close to covering its estimated costs. The selected bundle still has to pass a final simulation with the signed gas limit and profit floor.
 
-Ethereum ranks routes using fresh pool state and recent execution simulations when comparable. A successful sample can carry a tested loan size and lender into the next scan. Repeated consistent swap failures are retried less often so other routes get simulation time.
+Ethereum ranks routes using fresh pool state and recent execution simulations when comparable. A successful sample can carry a tested loan size and lender into the next scan. Repeated consistent swap failures are retried less often so other routes get simulation time. Direct submission can admit a near miss for exact gas estimation using the minimum allowed priority fee. It still checks the full gas budget and profit floor before signing.
 
 Live MEV can use a different bid after 30 minutes without a confirmed landing. Set `MEV_IDLE_MIN_NET_USD` to a positive floor such as `0.01` and `MEV_IDLE_BUILDER_TIP_PCT` to an after-gas share such as `0.80`. The bid is capped to leave the configured net minimum after gas. A confirmed settlement returns the bot to its normal policy. The idle settings default to the normal values.
 
@@ -232,7 +232,7 @@ The upgrade deploys the new implementation and activates it in one transaction a
 
 With `ARBITRUM_LIVE=on` and global signing enabled, the worker submits qualifying routes after a pending-state simulation. Default limits are $0.50 per transaction, $2 over 24 hours and at least $0.05 modeled net after padded fees. An included revert still costs gas.
 
-Arbitrum uses same-block quotes at several loan sizes. Its additional size probe alternates between exploring a broader range up to 64 WETH and refining around a recent competitive quote. Quotes respect the configured USD loan cap and Aave's available liquidity. The dashboard reports the best quoted return after the lender fee and before gas, including losses.
+Arbitrum uses same-block quotes at several loan sizes. It skips paths whose starting pool prices and LP fees bound the return below a positive payout after repayment. It checks the complete market periodically and falls back to exact quoting when pool prices are unavailable. Its additional size probe explores up to 64 WETH and refines around recent competitive quotes. Quotes respect the configured USD loan cap and Aave's available liquidity. The dashboard reports the best completed quote after the lender fee and before gas.
 
 To test with fake funds, use an Arbitrum archive endpoint with state access at the selected L2 block.
 

@@ -119,7 +119,7 @@ try {
   const testId = 'cadence-gas-test';
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
-    submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false }) {
+    submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -157,7 +157,7 @@ try {
     };
     mevReadClient.estimateGas = async ({ blockNumber }) => {
       assert.equal(blockNumber, 100n);
-      return 150_000n;
+      return estimatedGas;
     };
     mevReadClient.call = async ({ blockNumber, blockTag, to, data, gas }) => {
       const call = { to, data, gas };
@@ -223,6 +223,21 @@ try {
     to: fresh.signed[0].to, data: fresh.signed[0].data, gas: fresh.signed[0].gas,
   }, 'both final checks use the exact transaction sent to the signer');
   assert.ok(fresh.seenAtSign.length <= baseLimit, 'an executable first-wave route should not wait on scan expansion');
+
+  // The round trip pays 170e12 wei. The former 170k-gas model at 1.1 gwei, even with a
+  // 20% discount, requires 174.6e12 wei including the floor. Exact padded gas makes it executable.
+  const affordableProceeds = 170_000_000_000_000n;
+  const affordable = await scan({ age: 24 * minute, profit: affordableProceeds, finalProfit: affordableProceeds, estimatedGas: 90_000n });
+  assert.equal(affordable.submitted.length, 1, 'a conservative estimate may reach the exact gas check at the minimum priority');
+  assert.deepEqual([...affordable.finalStates.keys()].sort(), ['pending', 'pinned']);
+  const affordableTx = affordable.signed[0];
+  const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: affordableTx.data }).args[0];
+  assert.equal(affordableTx.gas, 112_500n, 'the final gas estimate retains 25% padding');
+  assert.equal(order.minProfit, affordableTx.gas * affordableTx.maxFeePerGas + 25_000_000_000_000n);
+  const moved = await scan({
+    age: 24 * minute, profit: affordableProceeds, finalProfit: affordableProceeds, pendingProfit: underGas, estimatedGas: 90_000n,
+  });
+  assert.equal(moved.signed.length, 0, 'an admitted alternate must pass the same exact pending-state profit check');
 
   const late = await scan({
     age: 31 * minute,

@@ -178,7 +178,9 @@ function renderNetworkSettlement(network, pending, outcome) {
   if (submission) links.push(submission);
   if (outcome) {
     const status = networkOutcome(outcome.status);
-    const receipt = networkLink(network, 'tx', outcome.hash ?? outcome.signature, `${status} ↗`) || esc(status);
+    const settledHash = outcome.status === 'expired' ? null
+      : outcome.status === 'replaced' ? outcome.replacementHash : outcome.hash ?? outcome.signature;
+    const receipt = networkLink(network, 'tx', settledHash, `${status} ↗`) || esc(status);
     const profit = network === 'arbitrum' ? outcome.netUsd : outcome.netUsdc;
     const fee = network === 'arbitrum'
       ? (Number.isFinite(outcome.gasUsd) ? networkUsd(outcome.gasUsd) : '')
@@ -201,7 +203,9 @@ function renderArbitrum(arb) {
   const largestLoan = arb?.largestQuote?.loanUsd;
   const depth = Number.isFinite(largestLoan) && largestLoan > (quote?.loanUsd ?? 0)
     ? ` · Quoted loans up to ${usd(largestLoan, 0)}` : '';
-  $('arbitrumStatus').textContent = status + quoteDetail + depth + (scanned ? networkAge(arb.updatedAt) : '');
+  const screened = Number.isSafeInteger(arb?.prunedRoutes) && arb.prunedRoutes > 0
+    ? ` · ${networkNumber(arb.prunedRoutes)} quotes screened out` : '';
+  $('arbitrumStatus').textContent = status + quoteDetail + depth + screened + (scanned ? networkAge(arb.updatedAt) : '');
   $('arbitrumBlock').textContent = scanned ? networkNumber(arb.block) : '–';
   $('arbitrumRoutes').textContent = scanned ? networkNumber(arb.routes) : '–';
   $('arbitrumGas').textContent = networkGas(arb?.balanceEth, 'ETH');

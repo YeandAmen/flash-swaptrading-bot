@@ -10,6 +10,7 @@ import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
 import { broadcastArbitrum, type ArbitrumBroadcast } from './broadcast.js';
 import { verifyArbitrumExecutor, type ArbitrumExecutor } from './proxy.js';
 import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
+import { reconcileArbitrumIntent, type ArbitrumIntent } from './settlement.js';
 import { arbitrumTestLeads } from './test-leads.js';
 import {
   arbitrumChainId, arbitrumClient, arbitrumEthUsd, arbitrumProbeSize, defaultArbitrumRpc,
@@ -22,6 +23,7 @@ const dayMs = 86400_000;
 const txLimitUsd = 0.50;
 const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
+const fullMarketAuditInterval = 10;
 const preparationStatus: Record<ArbitrumOrderRejection, string> = {
   'daily-budget': 'Daily gas budget used',
   'net-floor': 'Prepared route did not meet the net profit floor',
@@ -35,8 +37,9 @@ const preparationStatus: Record<ArbitrumOrderRejection, string> = {
   'fee-rpc': 'Arbitrum RPC failed during fee estimation',
   'simulation-rpc': 'Arbitrum RPC failed during pending simulation',
 };
-type Pending = { hash: Hash; nonce: number; ethUsd: number; budgetUsd: number; broadcast?: ArbitrumBroadcast };
-type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'replaced'; gasUsd: number; netUsd: number; at: number; loanUsd?: number };
+type Pending = ArbitrumIntent & { ethUsd: number; budgetUsd: number; executor?: Address; owner?: Address };
+type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'replaced' | 'expired'; gasUsd: number; netUsd: number; at: number;
+  loanUsd?: number; replacementHash?: Hash };
 type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest };
 
 function receiptStatus(broadcast?: ArbitrumBroadcast): string {
@@ -96,6 +99,7 @@ export class ArbitrumWorker {
     canArm: this.enabled && this.executionEnabled,
     status: this.enabled ? 'Starting' : 'Disabled',
     block: 0, pools: 0, routes: 0, simulated: 0, updatedAt: 0, netEstimateUsd: null as number | null,
+    prunedRoutes: 0,
     bestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['bestQuote'],
     largestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['largestQuote'],
     preparationRejections: {} as Partial<Record<ArbitrumOrderRejection, number>>,
@@ -214,14 +218,18 @@ export class ArbitrumWorker {
         if (await this.tryOrders(leads, ethUsd, test)) return;
       }
     }
-    const extraSize = test ? undefined : arbitrumProbeSize(this.regularScans++, this.sizingLead, Date.now());
+    const regularScan = test ? undefined : this.regularScans++;
+    const extraSize = regularScan === undefined ? undefined : arbitrumProbeSize(regularScan, this.sizingLead, Date.now());
+    // Audit the complete book regularly, while ordinary scans can skip paths that cannot repay at marginal prices.
+    const screenRoundTrips = regularScan !== undefined && regularScan % fullMarketAuditInterval !== 0;
     const result = await scanArbitrum(this.client, block, this.markets,
-      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize, MEV.maxLoanUsd);
+      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize, MEV.maxLoanUsd, screenRoundTrips);
     if (test) test.checked += result.quotedRoutes;
     else this.sizingLead = result.sizingAmount === undefined ? null : { amount: result.sizingAmount, at: quoteAt };
     this.summary.block = Number(block);
     this.summary.pools = this.markets.reduce((sum, market) => sum + market.pools.length, 0);
     this.summary.routes = result.quotedRoutes;
+    this.summary.prunedRoutes = result.prunedRoutes;
     this.summary.updatedAt = Date.now();
     this.summary.bestQuote = result.bestQuote;
     this.summary.largestQuote = result.largestQuote;
@@ -229,15 +237,17 @@ export class ArbitrumWorker {
     if (this.journal?.pending) this.summary.status = receiptStatus(this.journal.pending.broadcast);
     else if (!result.best) {
       const best = result.bestQuote;
+      const quoteType = result.prunedRoutes ? 'screened quote' : 'quote';
       this.summary.status = best
-        ? `Best ${best.symbol} quote on a $${best.loanUsd.toFixed(2)} loan was ${best.payoutUsd < 0 ? '-' : ''}$${Math.abs(best.payoutUsd).toFixed(4)} after lender fee, before gas`
-        : 'No complete round-trip quote';
+        ? `Best ${best.symbol} ${quoteType} on a $${best.loanUsd.toFixed(2)} loan was ${best.payoutUsd < 0 ? '-' : ''}$${Math.abs(best.payoutUsd).toFixed(4)} after lender fee, before gas`
+        : result.prunedRoutes ? 'No complete quote from routes that could repay at marginal prices' : 'No complete round-trip quote';
     } else if (!this.summary.executor) this.summary.status = 'Flash payout quoted. Deploy executor to check full fees';
     else {
       this.summary.status = 'No fresh route passed padded gas and payout floor';
       await this.tryOrders(result.opportunities.slice(0, 3), result.ethUsd, test);
     }
-    this.activity.record('info', `Block ${block}: ${result.quotedRoutes} routes across ${this.summary.pools} pools. ${this.summary.status}.`, undefined, this.summary.updatedAt);
+    const screened = result.prunedRoutes ? ` ${result.prunedRoutes} size and route combinations below the marginal repayment bound.` : '';
+    this.activity.record('info', `Block ${block}: ${result.quotedRoutes} routes across ${this.summary.pools} pools.${screened} ${this.summary.status}.`, undefined, this.summary.updatedAt);
   }
 
   private async tryOrders(candidates: ArbQuote[], ethUsd: number, test: FlashTest | null): Promise<boolean> {
@@ -286,7 +296,9 @@ export class ArbitrumWorker {
       const serializedTransaction = await account.signTransaction({ ...prepared.tx, type: 'eip1559', chainId: arbitrumChainId, nonce });
       if (!this.active || this.halted || !canTest()) return true;
       const hash = keccak256(serializedTransaction);
-      this.save({ ...this.journal, pending: { hash, nonce, ethUsd, budgetUsd: prepared.worstGasUsd },
+      this.save({ ...this.journal, pending: { hash, nonce, ethUsd, budgetUsd: prepared.worstGasUsd,
+        owner: account.address, executor: this.contract,
+        signedAtBlock: head.toString(), deadline: prepared.deadline.toString() },
         ...(test ? { test: { ...test, status: 'submitted', hash, note: 'Waiting for the Arbitrum receipt.' } } : {}),
       });
       this.summary.status = 'Journaled Arbitrum transaction. Waiting for RPC acknowledgement';
@@ -335,9 +347,13 @@ export class ArbitrumWorker {
   }
 
   private logSettlement(outcome: Settlement) {
+    if (outcome.status === 'expired') {
+      this.activity.record('warn', 'Arbitrum transaction expired after RPC rate limits. Its nonce remained unused and no gas was charged.', undefined, outcome.at);
+      return;
+    }
     this.activity.record(outcome.status === 'landed' ? 'trade' : 'warn',
       `Arbitrum transaction ${outcome.status}. Gas $${outcome.gasUsd.toFixed(4)}, net $${outcome.netUsd.toFixed(4)}.`,
-      `https://arbiscan.io/tx/${outcome.hash}`, outcome.at);
+      `https://arbiscan.io/tx/${outcome.replacementHash ?? outcome.hash}`, outcome.at);
   }
 
   private save(next: Journal) {
@@ -347,8 +363,9 @@ export class ArbitrumWorker {
       const meetsLoan = next.test.minimumLoanUsd === undefined || (outcome.loanUsd ?? 0) >= next.test.minimumLoanUsd;
       const passed = outcome.status === 'landed' && meetsProfit && meetsLoan;
       const belowFloor = outcome.status === 'landed' && !passed ? ' The receipt did not meet the requested loan or profit floor.' : '';
-      next = { ...next, test: { ...next.test, status: passed ? 'landed' : 'failed',
-        note: `Confirmed ${outcome.status}. Gas $${outcome.gasUsd.toFixed(4)}, net $${outcome.netUsd.toFixed(4)}.${belowFloor}` } };
+      const note = outcome.status === 'expired' ? 'RPC rate limits prevented submission. The nonce remained unused and no gas was charged.'
+        : `Confirmed ${outcome.status}. Gas $${outcome.gasUsd.toFixed(4)}, net $${outcome.netUsd.toFixed(4)}.${belowFloor}`;
+      next = { ...next, test: { ...next.test, status: passed ? 'landed' : 'failed', note } };
     }
     writeJson(journalFile, next);
     if (outcome && this.journal?.recent[0]?.hash !== outcome.hash) this.logSettlement(outcome);
@@ -358,18 +375,22 @@ export class ArbitrumWorker {
   }
 
   private async reconcile() {
-    const journal = this.journal!;
-    const pending = journal.pending!;
-    const receipt = await this.client.getTransactionReceipt({ hash: pending.hash }).catch(() => null);
-    if (!receipt) {
-      const nonce = await this.client.getTransactionCount({ address: this.owner });
-      if (nonce <= pending.nonce) return;
+    const pending = this.journal!.pending!;
+    const executor = pending.executor ?? this.contract;
+    const resolution = await reconcileArbitrumIntent(this.client, pending, pending.owner ?? this.owner, executor);
+    const journal = this.journal;
+    if (!journal || journal.pending?.hash !== pending.hash || resolution.status === 'pending') return;
+    const now = Date.now();
+    const recent = journal.recent.filter((row) => row.at > now - dayMs);
+    if (resolution.status !== 'receipt') {
+      const replacementHash = resolution.status === 'replaced' ? resolution.replacementHash : undefined;
       this.save({ ...journal, pending: null, recent: [{
-        hash: pending.hash, status: 'replaced', gasUsd: pending.budgetUsd, netUsd: 0, at: Date.now(),
-      }, ...journal.recent.filter((row) => row.at > Date.now() - dayMs)] });
+        hash: pending.hash, status: resolution.status, replacementHash, gasUsd: 0, netUsd: 0, at: now,
+      }, ...recent] });
       return;
     }
-    const logs = receipt.logs.filter((log) => isAddressEqual(log.address, this.contract));
+    const { receipt } = resolution;
+    const logs = receipt.logs.filter((log) => isAddressEqual(log.address, executor));
     const [event] = parseEventLogs({ abi: ARBITRUM_FLASH_ARB_ABI, eventName: 'Arbitrage', logs });
     const [funding] = parseEventLogs({ abi: ARBITRUM_FLASH_ARB_ABI, eventName: 'FundedBy', logs });
     const fee = receipt.gasUsed * receipt.effectiveGasPrice;
@@ -377,8 +398,8 @@ export class ArbitrumWorker {
     const proceeds = landed ? event.args.profit - event.args.tip : 0n;
     this.save({ ...journal, pending: null, recent: [{
       hash: pending.hash, status: landed ? 'landed' : 'reverted', gasUsd: Number(formatEther(fee)) * pending.ethUsd,
-      netUsd: Number(formatEther(proceeds - fee)) * pending.ethUsd, at: Date.now(),
+      netUsd: Number(formatEther(proceeds - fee)) * pending.ethUsd, at: now,
       loanUsd: landed && funding ? Number(formatEther(funding.args.amount)) * pending.ethUsd : undefined,
-    }, ...journal.recent.filter((row) => row.at > Date.now() - dayMs)] });
+    }, ...recent] });
   }
 }
