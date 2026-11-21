@@ -278,7 +278,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   if (!config.wallet) throw new Error('Set SOLANA_WALLET_ADDRESS to the public address of your Solana wallet');
   const wallet = address(config.wallet);
   const test = execute && requestedTest ? (typeof requestedTest === 'string' ? { id: requestedTest } : requestedTest) : null;
-  const venues = !test && config.venuePair ? config.venuePair : solanaVenuePairs[0];
+  const venues = config.venuePair ?? solanaVenuePairs[0];
   const limits = solanaTestMinimums(test);
   const configuredLoan = usdcAmount(config.loanUsdc ?? defaultLoanUsdc, 1, 100_000, 'Loan size');
   const loan = limits.minimumLoan !== undefined && limits.minimumLoan > configuredLoan ? limits.minimumLoan : configuredLoan;
@@ -314,7 +314,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   if (repay === null || loan > reserve.available) return result;
   result.status = 'scanned';
 
-  const candidates: PreparedSolanaCycle[] = [];
+  let submission: Promise<void> | undefined;
   result.routes = await Promise.all(venues.map(async (buy, index): Promise<SolanaRoute> => {
     const sell = venues[1 - index];
     let quote: number | undefined;
@@ -412,9 +412,13 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       const protectedCost = nativeCostInUsdc(protectedLamports, loan, firstMinimum);
       const qualified = fee <= maxFeeLamports && postUsdc - preUsdc >= protectedCost + minimumNet
         && beforeNetwork >= protectedCost + minimumNet && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
-      if (qualified && baseline && exactFee !== null) {
-        candidates.push({ ...(test ? { testId: test.id } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight, simulationSlot: execution.slot,
-          maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports: baseline.rent, firstMinimum, loan, net });
+      if (qualified && execute && !submission && baseline && exactFee !== null) {
+        const candidate = { ...(test ? { testId: test.id } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight,
+          simulationSlot: execution.slot, maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports: baseline.rent,
+          firstMinimum, loan, net };
+        // Give the first qualifying route to the signer while the opposite direction finishes.
+        submission = Promise.resolve().then(() => execute(candidate));
+        void submission.catch(() => undefined); // Observe early failures during the remaining quote.
       }
       return {
         buy, sell, status: 'simulated', quotedNetBeforeNetworkUsdc: quote, simulatedNetUsdc: usdcUnits(net),
@@ -427,7 +431,6 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         detail: summarizeFailure(error, config.jupiterApiKey) };
     }
   }));
-  candidates.sort((left, right) => left.net > right.net ? -1 : left.net < right.net ? 1 : 0);
-  if (execute && candidates[0]) await execute(candidates[0]);
+  await submission;
   return result;
 }

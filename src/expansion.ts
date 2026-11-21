@@ -20,8 +20,8 @@ const solanaActivity = new NetworkActivity();
 let verifiedGuardLogged = false;
 let loggedSignature: string | null = null;
 let loggedOutcome: string | null = null;
-const solanaTestSizes = [50, 250, 1000, 10] as const;
-const solanaProfitTestMultipliers = [1, 2, 5, 10] as const;
+const solanaTestSizes = [1, 5, 10, 25, 50, 250, 1000] as const;
+const solanaProfitTestMultipliers = [1, 2, 3, 5, 10] as const;
 // Coprime rotation lengths ensure each venue pair sees every loan size.
 const solanaLoanFractions = [1, 0.5, 1, 0.2, 1] as const;
 const solanaVenueRotation = [0, 1, 0, 2] as const;
@@ -68,10 +68,11 @@ export function startExpansion() {
     const execution = !liveError && worker?.summary.armed && worker.summary.ready && !worker.summary.pending ? worker : null;
     const test = execution?.activeTest();
     if (test) {
-      config.loanUsdc = test.minimumNetUsd === undefined
-        ? solanaTestSizes[solanaTestScans % solanaTestSizes.length]
-        : Math.min(100_000, (test.minimumLoanUsd ?? 500) * solanaProfitTestMultipliers[solanaTestScans % solanaProfitTestMultipliers.length]);
-      solanaTestScans += 1;
+      const scan = solanaTestScans++;
+      config.venuePair = solanaVenuePairs[solanaVenueRotation[scan % solanaVenueRotation.length]];
+      config.loanUsdc = test.minimumLoanUsd === undefined
+        ? solanaTestSizes[scan % solanaTestSizes.length]
+        : Math.min(100_000, test.minimumLoanUsd * solanaProfitTestMultipliers[scan % solanaProfitTestMultipliers.length]);
     } else if (config.loanUsdc !== undefined && config.loanUsdc >= 1 && config.loanUsdc <= 100_000) {
       const scan = solanaRegularScans++;
       config.venuePair = solanaVenuePairs[solanaVenueRotation[scan % solanaVenueRotation.length]];

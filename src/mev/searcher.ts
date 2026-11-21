@@ -706,7 +706,8 @@ export class MevSearcher {
     const shortlistNet: number[] = [];
     const observedNet = (netUsd: number) => shortlistNet.push(netUsd);
     const canTest = () => !this.pending && this.activeGasOnlyTest() === test && this.canMeetSendDeadline(r);
-    if (test && (test.publicFunctional || (test.privateSubmission && !MEV.directProtected)) && canTest()) {
+    const prioritizeTest = test?.publicFunctional || test?.privateSubmission;
+    if (test && prioritizeTest && canTest()) {
       await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
     }
     const signed = await this.scanShortlist(selected, r, nextMaxBase, policy, generation, observedNet,
@@ -715,7 +716,7 @@ export class MevSearcher {
     if (!signed && !this.stopping && !this.pending && additions.length && enoughTime) {
       await this.scanShortlist(additions, r, nextMaxBase, policy, generation, observedNet, true);
     }
-    if (test && !test.publicFunctional && (test.privateSubmission ? MEV.directProtected : enoughTime) && canTest()) {
+    if (test && !prioritizeTest && enoughTime && canTest()) {
       await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
     }
     block.decisionMs = Math.round(performance.now() - started);
@@ -781,14 +782,16 @@ export class MevSearcher {
       ? extraRoutes(candidates, [], GAS_ONLY_TEST_ROUTES + 2, (candidate) => candidate.t.token.address.toLowerCase())
       : candidates.slice(0, GAS_ONLY_TEST_ROUTES);
     test.routesChecked += top.length;
-    const routes = await Promise.all(top.map((candidate) => this.evaluate(candidate, r, nextMaxBase, policy, false, undefined, true, test)));
     const canTry = () => this.liveArmed(generation) && !this.walletPending()
       && this.activeGasOnlyTest() === test && this.canMeetSendDeadline(r);
-    if (!canTry()) return;
+    const quotes = top.map((candidate) => this.evaluate(candidate, r, nextMaxBase, policy, false, undefined, true, test));
     if (diversified) {
-      const offers = routes.flatMap((route) => route?.primary
-        ? route.fallback ? [route.primary, route.fallback] : [route.primary] : []);
-      const prepared = await Promise.all(offers.map((offer) => this.prepareLive(offer, r, policy, test)));
+      const prepared = (await Promise.all(quotes.map(async (quote) => {
+        const route = await quote;
+        if (!canTry() || !route?.primary) return [];
+        const offers = route.fallback ? [route.primary, route.fallback] : [route.primary];
+        return Promise.all(offers.map((offer) => this.prepareLive(offer, r, policy, test)));
+      }))).flat();
       const ranked = prepared.filter((offer) => offer !== null).sort((a, b) => {
         const left = test.requireGasCoverage ? a.net : a.offer.profit;
         const right = test.requireGasCoverage ? b.net : b.offer.profit;
@@ -800,6 +803,8 @@ export class MevSearcher {
       }
       return;
     }
+    const routes = await Promise.all(quotes);
+    if (!canTry()) return;
     const offers = routes.flatMap((route) => route?.primary ? [route.primary] : [])
       .sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
     for (const offer of offers) {

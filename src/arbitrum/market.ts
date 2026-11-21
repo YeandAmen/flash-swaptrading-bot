@@ -28,7 +28,7 @@ const tokens = [
 ] as const;
 const tiers = [[100, 1], [500, 10], [3000, 60], [10000, 200]] as const;
 const amounts = ['0.05', '0.25', '1', '4', '16'].map((size) => parseEther(size));
-const profitTestAmounts = ['0.25', '1', '4', '8', '16', '32', '64'].map((size) => parseEther(size));
+const profitTestAmounts = ['0.015', '0.05', '0.1', '0.25', '1', '4', '8', '16', '32', '64'].map((size) => parseEther(size));
 const testAmounts = ['0.0002', '0.0006', '0.0018', '0.005', '0.015', '0.05', '0.1', '0.25', '1', '4', '16'].map((size) => parseEther(size));
 const keyAbi = parseAbiParameters('address,address,uint24,int24,address');
 const factoryAbi = parseAbi(['function getPool(address,address,uint24) view returns (address)']);

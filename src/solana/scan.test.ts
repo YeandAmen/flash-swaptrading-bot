@@ -43,6 +43,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   let live = false;
   let reportedFee = fee;
   let jupiterRequests = 0;
+  let slowQuote: Promise<void> | undefined;
   const [{ ata: usdcAta }, { ata: solAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
   const account = (owner: string, data: string, space: number, lamports = 10_000_000) =>
     ({ owner, data: [data, 'base64'], executable: false, lamports, rentEpoch: 0, space });
@@ -63,6 +64,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       const outputMint = params.get('outputMint');
       const venue = params.get('dexes');
       const first = inputMint === USDC;
+      if (first && venue === 'Meteora DLMM') await slowQuote;
       assert.equal(params.get('wrapAndUnwrapSol'), 'false');
       assert.equal(first ? outputMint : inputMint, WRAPPED_SOL);
       if (!first) assert.equal(params.get('amount'), live ? '3498250000' : '3499000000');
@@ -156,26 +158,49 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   assert.ok(overBudget.routes.every((route) => route.status === 'simulated' && route.simulatedNetUsdc! > 0.2 && route.qualified === false));
 
   live = true;
-  jupiterRequests = 0;
-  let submissions = 0;
-  const guarded = await scanSolanaCycle({ ...config, venuePair: solanaVenuePairs[1] }, async (candidate) => {
-    submissions++;
-    assert.equal(candidate.feeLamports, 6400n);
-    assert.equal(candidate.maximumLamportDebit, 6400n);
-    assert.equal(candidate.simulationSlot, 42n);
-    assert.ok(candidate.net >= 50_000n);
+  await t.test('submits a qualifying route before the opposite quote finishes', async () => {
+    jupiterRequests = 0;
+    let submissions = 0;
+    let releaseQuote!: () => void;
+    slowQuote = new Promise<void>((resolve) => { releaseQuote = resolve; });
+    let markSubmission!: () => void;
+    const submissionStarted = new Promise<void>((resolve) => { markSubmission = resolve; });
+    const pending = scanSolanaCycle({ ...config, venuePair: solanaVenuePairs[1] }, async (candidate) => {
+      submissions++;
+      assert.equal(candidate.feeLamports, 6400n);
+      assert.equal(candidate.maximumLamportDebit, 6400n);
+      assert.equal(candidate.simulationSlot, 42n);
+      assert.ok(candidate.net >= 50_000n);
+      markSubmission();
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        submissionStarted,
+        pending.then(() => assert.fail('Scan finished before the delayed quote was released')),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('Submission waited for the delayed quote')), 1000);
+        }),
+      ]);
+      assert.equal(submissions, 1);
+    } finally {
+      clearTimeout(timeout);
+      releaseQuote();
+      slowQuote = undefined;
+    }
+    const guarded = await pending;
+    assert.deepEqual(guarded.routes.map(({ buy, sell }) => [buy, sell]), [
+      ['Whirlpool', 'Meteora DLMM'], ['Meteora DLMM', 'Whirlpool'],
+    ]);
+    assert.equal(jupiterRequests, 4, 'query two legs in each direction for the selected venue pair');
+    for (const route of guarded.routes) assert.equal(route.status, 'simulated', route.detail);
+    assert.equal(submissions, 1, 'submit only the first qualifying guarded route');
   });
-  assert.deepEqual(guarded.routes.map(({ buy, sell }) => [buy, sell]), [
-    ['Whirlpool', 'Meteora DLMM'], ['Meteora DLMM', 'Whirlpool'],
-  ]);
-  assert.equal(jupiterRequests, 4, 'query two legs in each direction for the selected venue pair');
-  for (const route of guarded.routes) assert.equal(route.status, 'simulated', route.detail);
-  assert.equal(submissions, 1, 'submit only the best qualifying guarded route');
   reportedFee = fee + 1;
   const inconsistent = await scanSolanaCycle({ ...config, venuePair: solanaVenuePairs[2] },
     async () => { assert.fail('Fee mismatch authorized a candidate'); }, 'guarded-test');
   assert.deepEqual(inconsistent.routes.map(({ buy, sell }) => [buy, sell]), [
-    ['Whirlpool', 'Raydium CLMM'], ['Raydium CLMM', 'Whirlpool'],
+    ['Raydium CLMM', 'Meteora DLMM'], ['Meteora DLMM', 'Raydium CLMM'],
   ]);
   assert.ok(inconsistent.routes.every((route) => route.qualified === false));
 });
