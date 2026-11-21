@@ -31,9 +31,10 @@ let solanaTestScans = 0;
 let stopping = false;
 const schedule = new Set<ReturnType<typeof setTimeout>>();
 
-async function poll(task: () => Promise<void>, delay: number, reportError: (text: string) => void) {
+async function poll(task: () => Promise<number | void>, delay: number, reportError: (text: string) => void) {
   if (stopping) return;
-  try { await task(); }
+  let nextDelay = delay;
+  try { nextDelay = (await task()) ?? delay; }
   catch (error) {
     reportError(redactDiagnostic(error instanceof Error ? error.message.split('\n')[0] : String(error)));
   }
@@ -41,12 +42,15 @@ async function poll(task: () => Promise<void>, delay: number, reportError: (text
   const timeout = setTimeout(() => {
     schedule.delete(timeout);
     void poll(task, delay, reportError);
-  }, delay);
+  }, nextDelay);
   schedule.add(timeout);
 }
 
 export function startExpansion() {
-  if (arbitrum.enabled) void poll(() => arbitrum.scan(), 6_000, (error) => arbitrum.scanError(error));
+  if (arbitrum.enabled) void poll(async () => {
+    await arbitrum.scan();
+    return arbitrum.summary.prunedRoutes > 0 && !arbitrum.summary.pending ? 4_000 : undefined;
+  }, 6_000, (error) => arbitrum.scanError(error));
   if (solanaEnabled) void poll(async () => {
     const { scanSolanaCycle, solanaScanConfig, solanaVenuePairs } = await import('./solana/scan.js');
     const config = solanaScanConfig();

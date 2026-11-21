@@ -1149,15 +1149,17 @@ export class MevSearcher {
           r.nextBaseFee, gas, budgetFees.maxPriorityFeePerGas, minimumTip, spendableProceeds - minimumNet, horizon,
         );
         if (!affordableFees && privateLive && maxGasWei !== null) {
-          const shorterBudget = affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, PRIVATE_DIRECT_WINDOW);
-          budgetFees ??= shorterBudget;
-          if (shorterBudget) {
+          // Extra blocks consume base-fee headroom even when the next block is affordable.
+          for (const shorter of [PRIVATE_DIRECT_WINDOW, DIRECT_WINDOW]) {
+            const shorterBudget = affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, shorter);
+            if (!shorterBudget) continue;
+            budgetFees ??= shorterBudget;
             affordableFees = affordableDirectFees(r.nextBaseFee, gas, shorterBudget.maxPriorityFeePerGas,
-              minimumTip, spendableProceeds - minimumNet, PRIVATE_DIRECT_WINDOW);
-            if (affordableFees) {
-              horizon = PRIVATE_DIRECT_WINDOW;
-              target = r.blockNumber + BigInt(horizon);
-            }
+              minimumTip, spendableProceeds - minimumNet, shorter);
+            if (!affordableFees) continue;
+            horizon = shorter;
+            target = r.blockNumber + BigInt(horizon);
+            break;
           }
         }
         if (!affordableFees && profitTest && privateSubmission && maxGasWei !== null) {

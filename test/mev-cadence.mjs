@@ -119,7 +119,8 @@ try {
   const testId = 'cadence-gas-test';
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
-    submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n }) {
+    submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
+    protectedDirect = false }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -173,7 +174,7 @@ try {
     };
     mevReadClient.getBalance = async () => oneEth;
 
-    const original = { funding: MEV.funding, submission: MEV.submission, directMaxGasUsd: MEV.directMaxGasUsd };
+    const original = { funding: MEV.funding, submission: MEV.submission, directMaxGasUsd: MEV.directMaxGasUsd, directProtected: MEV.directProtected };
     const originalConfig = { allowLiveTrading: CONFIG.allowLiveTrading, forkMode: CONFIG.forkMode };
     const originalNow = Date.now;
     try {
@@ -185,6 +186,7 @@ try {
       }
       MEV.submission = submission;
       MEV.directMaxGasUsd = maximumDirectGasUsd;
+      MEV.directProtected = protectedDirect;
       if (maximumTestGasUsd !== undefined) {
         MEV.funding = 'aave';
         searcher.file.proxyContract = address(2);
@@ -238,6 +240,28 @@ try {
     age: 24 * minute, profit: affordableProceeds, finalProfit: affordableProceeds, pendingProfit: underGas, estimatedGas: 90_000n,
   });
   assert.equal(moved.signed.length, 0, 'an admitted alternate must pass the same exact pending-state profit check');
+
+  // At this payout only the next block can cover padded max-fee gas while reserving 10% and retaining $0.05.
+  const oneBlockOnly = 250_000_000_000_000n;
+  const protectedInput = { age: 24 * minute, profit: oneBlockOnly, finalProfit: oneBlockOnly, protectedDirect: true };
+  const protectedTrade = await scan(protectedInput);
+  assert.equal(protectedTrade.signed.length, 1);
+  assert.equal(protectedTrade.submitted.length, 1);
+  assert.equal(protectedTrade.journaled.length, 1);
+  assert.equal(protectedTrade.submitted[0], protectedTrade.journaled[0]);
+  assert.equal(protectedTrade.journaled[0].privateSubmission, true);
+  assert.equal(protectedTrade.journaled[0].target, '101');
+  const protectedTx = protectedTrade.signed[0];
+  const protectedOrder = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: protectedTx.data }).args[0];
+  assert.equal(protectedOrder.maxBlock, 101n);
+  assert.equal(protectedOrder.minProfit, protectedTx.gas * protectedTx.maxFeePerGas + 25_000_000_000_000n);
+  assert.deepEqual([...protectedTrade.finalStates.keys()].sort(), ['pending', 'pinned']);
+  assert.deepEqual(protectedTrade.finalStates.get('pending'), protectedTrade.finalStates.get('pinned'));
+  const lostProtectedSpread = await scan({ ...protectedInput, pendingProfit: underGas });
+  assert.ok(lostProtectedSpread.finalStates.has('pending'));
+  assert.equal(lostProtectedSpread.signed.length, 0);
+  assert.equal(lostProtectedSpread.journaled.length, 0);
+  assert.equal(lostProtectedSpread.submitted.length, 0);
 
   const late = await scan({
     age: 31 * minute,
