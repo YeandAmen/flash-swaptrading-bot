@@ -5,7 +5,12 @@ import {
 import { arbitrum } from 'viem/chains';
 
 export const defaultArbitrumRpc = 'https://arb1.arbitrum.io/rpc';
-const alternateArbitrumHeadRpc = 'https://arbitrum-one-rpc.publicnode.com';
+const alternateArbitrumReadRpc = 'https://arbitrum-one-rpc.publicnode.com';
+const arbReadMethods = [
+  'eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getCode', 'eth_getStorageAt',
+  'eth_getBalance', 'eth_getTransactionCount', 'eth_getTransactionReceipt', 'eth_call',
+  'eth_estimateGas', 'eth_gasPrice', 'eth_maxPriorityFeePerGas', 'eth_feeHistory',
+];
 export const arbitrumChainId = 42161;
 const weth: Address = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
 const factory: Address = '0x1f98431c8ad98523631ae4a59f267346ea31f984';
@@ -44,8 +49,8 @@ const quoteV4Abi = parseAbi(['function quoteExactInputSingle(((address currency0
 export const arbitrumClient = (rpc = defaultArbitrumRpc) => {
   const primary = http(rpc, { timeout: 6000, retryCount: 0 });
   const transport = rpc.replace(/\/$/, '') === defaultArbitrumRpc
-    ? fallback([primary, http(alternateArbitrumHeadRpc, {
-      timeout: 2000, retryCount: 0, methods: { include: ['eth_blockNumber', 'eth_getBlockByNumber'] },
+    ? fallback([primary, http(alternateArbitrumReadRpc, {
+      timeout: 2000, retryCount: 0, methods: { include: arbReadMethods },
     })], { retryCount: 0 })
     : primary;
   return createPublicClient({ chain: arbitrum, transport });
