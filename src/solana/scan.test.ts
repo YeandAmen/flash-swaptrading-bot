@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { address, getAddressEncoder, getCompiledTransactionMessageDecoder, getTransactionDecoder } from '@solana/kit';
+import { address, getAddressEncoder, getCompiledTransactionMessageDecoder, getTransactionDecoder, type ReadonlyUint8Array } from '@solana/kit';
 import {
   createWalletAta, JUPITER, KAMINO, KAMINO_MARKET, KAMINO_MARKET_LOOKUP, KAMINO_USDC_RESERVE, LOOKUP_PROGRAM, MAINNET_GENESIS,
   USDC, WRAPPED_SOL,
 } from './protocol.js';
-import { LIGHTHOUSE } from './guard.js';
+import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
+import { queueFlashTest, validSolanaSwapLossUsdc } from '../network-test.js';
 import { scanSolanaCycle, solanaVenuePairs } from './scan.js';
 
 const wallet = address('23g1K6sr2bevNwLYPoB79jzEQtErioYQ8mpUa76xA6yu');
@@ -42,6 +43,13 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   let actualWalletGain = 210_000;
   let live = false;
   let reportedFee = fee;
+  let returnOut = '250250000';
+  let usdcBalance = 1_000_000;
+  let wsolBalance = 20_000;
+  let wsolDrop = 0;
+  let usdcAccountExists = true;
+  let reportedNativeDebit = fee;
+  let checkLossGuards = false;
   let jupiterRequests = 0;
   let slowQuote: Promise<void> | undefined;
   const [{ ata: usdcAta }, { ata: solAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
@@ -68,7 +76,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       assert.equal(params.get('wrapAndUnwrapSol'), 'false');
       assert.equal(first ? outputMint : inputMint, WRAPPED_SOL);
       if (!first) assert.equal(params.get('amount'), live ? '3498250000' : '3499000000');
-      const outAmount = first ? '3500000000' : '250250000';
+      const outAmount = first ? '3500000000' : returnOut;
       const bytes = Buffer.alloc(34);
       Buffer.from('bb64facc31c4af14', 'hex').copy(bytes);
       bytes.writeBigUInt64LE(BigInt(params.get('amount')!), 8);
@@ -103,12 +111,14 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       case 'getBalance': return atSlot(10_000_000);
       case 'getMultipleAccounts': {
         if (live && (request.params[0] as string[])[0] === wallet) {
-          return atSlot([account('11111111111111111111111111111111', '', 0), walletToken(USDC, 1_000_000n), walletToken(WRAPPED_SOL, 0n)]);
+          return atSlot([account('11111111111111111111111111111111', '', 0),
+            usdcAccountExists ? walletToken(USDC, BigInt(usdcBalance)) : null, walletToken(WRAPPED_SOL, BigInt(wsolBalance))]);
         }
         assert.deepEqual(request.params[0], [KAMINO_MARKET_LOOKUP]);
         return atSlot([{ data: [lookupFixture(), 'base64'], executable: false, owner: LOOKUP_PROGRAM, lamports: 7, rentEpoch: 0, space: 120 }]);
       }
       case 'getFeeForMessage': return atSlot(fee);
+      case 'getMinimumBalanceForRentExemption': return response(1_488_440);
       case 'getLatestBlockhash': return atSlot({ blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 42 });
       case 'simulateTransaction': {
         simulationCount++;
@@ -126,13 +136,30 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
         } else {
           assert.deepEqual(sequence.slice(4), [KAMINO, JUPITER, JUPITER, KAMINO]);
         }
+        if (checkLossGuards) {
+          for (const [position, expected] of [
+            [2, lighthouseLamports(wallet, 'equal', BigInt(10_000_000 - fee))],
+            [3, lighthouseTokenAmount(usdcAta, 'equal', BigInt(usdcBalance))],
+            [8, lighthouseAtaFloor(usdcAta, BigInt(usdcBalance - 20_000))],
+            [9, lighthouseAtaFloor(solAta, BigInt(wsolBalance))],
+            [10, lighthouseLamports(wallet, 'atLeast', BigInt(10_000_000 - fee))],
+          ] as const) {
+            const instruction: { data?: ReadonlyUint8Array; accountIndices?: readonly number[] } = compiled.instructions[position];
+            assert.deepEqual(Buffer.from(instruction.data!), Buffer.from(expected.data!));
+            assert.equal(compiled.staticAccounts[instruction.accountIndices![0]], expected.accounts![0].address);
+          }
+        }
         assert.equal(compiled.instructions[7].data?.[16], 4);
-        const tokenBalance = (amount: number) => ({ accountIndex: 1, mint: USDC, owner: wallet, programId: tokenProgram,
-          uiTokenAmount: { amount: String(amount), decimals: 6, uiAmount: amount / 1_000_000, uiAmountString: String(amount / 1_000_000) } });
+        const tokenBalance = (mint: string, ata: string, amount: number, decimals: number) => ({
+          accountIndex: compiled.staticAccounts.findIndex((key) => key === ata), mint, owner: wallet, programId: tokenProgram,
+          uiTokenAmount: { amount: String(amount), decimals, uiAmount: amount / 10 ** decimals, uiAmountString: String(amount / 10 ** decimals) },
+        });
         return atSlot({
           err: null, fee: reportedFee, unitsConsumed: 420000,
-          preBalances: [10_000_000], postBalances: [10_000_000 - fee],
-          preTokenBalances: [tokenBalance(1_000_000)], postTokenBalances: [tokenBalance(1_000_000 + actualWalletGain)],
+          preBalances: [10_000_000], postBalances: [10_000_000 - reportedNativeDebit],
+          preTokenBalances: [tokenBalance(USDC, usdcAta, usdcBalance, 6), tokenBalance(WRAPPED_SOL, solAta, wsolBalance, 9)],
+          postTokenBalances: [tokenBalance(USDC, usdcAta, usdcBalance + actualWalletGain, 6),
+            tokenBalance(WRAPPED_SOL, solAta, wsolBalance - wsolDrop, 9)],
         });
       }
       default: assert.fail(`Unexpected RPC method ${request.method}`);
@@ -203,4 +230,52 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     ['Raydium CLMM', 'Meteora DLMM'], ['Meteora DLMM', 'Raydium CLMM'],
   ]);
   assert.ok(inconsistent.routes.every((route) => route.qualified === false));
+
+  await t.test('capped test accepts the exact loss boundary with existing funded ATAs only', async () => {
+    reportedFee = fee;
+    returnOut = '250122500';
+    actualWalletGain = -20_000;
+    checkLossGuards = true;
+    const testRequest = { id: 'bounded-test', maximumSwapLossUsdc: 0.02 };
+    let submissions = 0;
+    const attempted = await scanSolanaCycle(config, async (candidate) => {
+      submissions++;
+      assert.equal(candidate.testId, testRequest.id);
+      assert.equal(candidate.rentLamports, 0n);
+      assert.equal(candidate.maximumLamportDebit, BigInt(fee));
+      assert.deepEqual(candidate.swapLossGuard, {
+        cap: 20_000n, baselineUsdc: 1_000_000n, baselineWsol: 20_000n, baselineLamports: 10_000_000n,
+      });
+    }, testRequest);
+    assert.equal(submissions, 1);
+    assert.ok(attempted.routes.every((route) => route.qualified), JSON.stringify(attempted.routes));
+
+    const neverSubmit = async () => { assert.fail('Capped test accepted a wallet invariant violation'); };
+    actualWalletGain = -20_001;
+    assert.ok((await scanSolanaCycle(config, neverSubmit, testRequest)).routes.every((route) => route.qualified === false));
+    actualWalletGain = -20_000;
+    wsolDrop = 1;
+    assert.ok((await scanSolanaCycle(config, neverSubmit, testRequest)).routes.every((route) => route.qualified === false));
+    wsolDrop = 0;
+    reportedNativeDebit = fee + 1;
+    assert.ok((await scanSolanaCycle(config, neverSubmit, testRequest)).routes.every((route) => route.qualified === false));
+    reportedNativeDebit = fee;
+    const simulationsBefore = simulationCount;
+    usdcBalance = 19_999;
+    assert.ok((await scanSolanaCycle(config, neverSubmit, testRequest)).routes.every((route) => route.status === 'simulation-failed'));
+    usdcBalance = 1_000_000;
+    usdcAccountExists = false;
+    assert.ok((await scanSolanaCycle(config, neverSubmit, testRequest)).routes.every((route) => route.status === 'simulation-failed'));
+    assert.equal(simulationCount, simulationsBefore);
+  });
+});
+
+test('only Solana can queue exact micro-USDC swap loss limits without conflicting floors', () => {
+  for (const value of [0, 0.0000009, 0.0000011, 0.02 + 0.000001, 0.021, '0.02', Infinity, NaN, null]) {
+    assert.equal(validSolanaSwapLossUsdc(value), false);
+  }
+  for (const value of [0.000001, 0.001001, 0.019999, 0.02]) assert.equal(validSolanaSwapLossUsdc(value), true);
+  assert.throws(() => queueFlashTest(null, 'arbitrum', 0, { maximumSwapLossUsdc: 0.02 }), /Only Solana/);
+  assert.throws(() => queueFlashTest(null, 'solana', 0, { maximumSwapLossUsdc: 0.02, minimumNetUsd: 1 }, 'solana'), /without profit/);
+  assert.throws(() => queueFlashTest(null, 'solana', 0, { maximumSwapLossUsdc: 0.02, minimumLoanUsd: 1 }, 'solana'), /without profit/);
 });

@@ -5,13 +5,13 @@ import path from 'node:path';
 import { test } from 'node:test';
 import {
   appendTransactionMessageInstructions, assertIsBlockhash, compileTransaction, createKeyPairSignerFromPrivateKeyBytes,
-  createTransactionMessage, getSignatureFromTransaction, getTransactionDecoder,
-  setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash,
+  createTransactionMessage, getBase58Decoder, getCompiledTransactionMessageDecoder, getSignatureFromTransaction, getTransactionDecoder,
+  setTransactionMessageComputeUnitLimit, setTransactionMessageComputeUnitPrice, setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash,
   type Address,
 } from '@solana/kit';
 import { writePrivateFile } from '../private-file.js';
-import { LIGHTHOUSE } from './guard.js';
-import { JUPITER, KAMINO, MAINNET_GENESIS, USDC, WRAPPED_SOL } from './protocol.js';
+import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
+import { createWalletAta, JUPITER, KAMINO, MAINNET_GENESIS, USDC, WRAPPED_SOL } from './protocol.js';
 import type { PreparedSolanaCycle } from './scan.js';
 import { SolanaLiveWorker } from './worker.js';
 
@@ -34,6 +34,32 @@ function testCandidate(wallet: Address, blockhash = '111111111111111111111111111
   };
 }
 
+async function testLossCandidate(wallet: Address, id: string, blockhash: string, floorAdjustment = 0n): Promise<PreparedSolanaCycle> {
+  const base = testCandidate(wallet, blockhash);
+  const [{ ata: usdcAta }, { ata: wsolAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
+  assertIsBlockhash(blockhash);
+  const swapLossGuard = { cap: 20_000n, baselineUsdc: 1_000_000n, baselineWsol: 90_000_000n, baselineLamports: BigInt(walletBalance) };
+  const nativeFloor = swapLossGuard.baselineLamports - BigInt(fee);
+  const borrow = Buffer.alloc(16);
+  const repay = Buffer.alloc(17);
+  Buffer.from('87e734a70734d4c1', 'hex').copy(borrow);
+  Buffer.from('b97500cb60f5b4ba', 'hex').copy(repay);
+  borrow.writeBigUInt64LE(base.loan, 8);
+  repay.writeBigUInt64LE(base.loan, 8);
+  repay[16] = 4;
+  const template = setTransactionMessageComputeUnitPrice(1_000n, setTransactionMessageComputeUnitLimit(1_400_000,
+    setTransactionMessageLifetimeUsingBlockhash({ blockhash, lastValidBlockHeight: expires },
+      setTransactionMessageFeePayer(wallet, createTransactionMessage({ version: 0 })))));
+  const message = appendTransactionMessageInstructions([
+    lighthouseLamports(wallet, 'equal', nativeFloor), lighthouseTokenAmount(usdcAta, 'equal', swapLossGuard.baselineUsdc),
+    { programAddress: KAMINO, data: borrow }, { programAddress: JUPITER }, { programAddress: JUPITER },
+    { programAddress: KAMINO, data: repay }, lighthouseAtaFloor(usdcAta, swapLossGuard.baselineUsdc - swapLossGuard.cap + floorAdjustment),
+    lighthouseAtaFloor(wsolAta, swapLossGuard.baselineWsol), lighthouseLamports(wallet, 'atLeast', nativeFloor),
+  ], template);
+  return { ...base, testId: id, transaction: compileTransaction(message), rentLamports: 0n,
+    maximumLamportDebit: BigInt(fee), net: -20_458n, swapLossGuard };
+}
+
 test('Solana journals before raw send and restores one pending signature across restart', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'solana-worker-test-'));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
@@ -53,8 +79,8 @@ test('Solana journals before raw send and restores one pending signature across 
   let pendingSignature: string | null = null;
   let holdSimulation: Promise<void> | null = null;
   let reachedSimulation: (() => void) | undefined;
-  const token = (mint: Address, amount: string, decimals: number) => ({
-    accountIndex: 1, mint, owner: wallet, programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  const token = (mint: Address, amount: string, decimals: number, accountIndex = 1) => ({
+    accountIndex, mint, owner: wallet, programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
     uiTokenAmount: { amount, decimals },
   });
   const preTokens = [token(USDC, '1000000', 6), token(WRAPPED_SOL, '90000000', 9)];
@@ -109,15 +135,20 @@ test('Solana journals before raw send and restores one pending signature across 
         assert.equal(params[1].searchTransactionHistory, true);
         return context([finalizedReceipt === 'none' ? null : { confirmationStatus: 'finalized', confirmations: null,
           slot, err: finalizedReceipt === 'success' ? null : 'AccountNotFound' }]);
-      case 'getTransaction':
+      case 'getTransaction': {
         // Kit omits the protocol's default commitment from the getTransaction request.
         assert.equal(params[1].commitment ?? 'finalized', 'finalized');
         if (finalizedReceipt === 'none') return reply(null);
+        const compiled = getCompiledTransactionMessageDecoder().decode(candidate.transaction.messageBytes);
+        assert.equal(compiled.version, 0);
+        const instructions = compiled.instructions.map((ix) => ({ programIdIndex: ix.programAddressIndex,
+          accounts: ix.accountIndices ?? [], data: getBase58Decoder().decode(ix.data ?? new Uint8Array()) }));
         return reply({
-          version: 0, slot, transaction: { signatures: [pendingSignature], message: { accountKeys: [wallet] } },
+          version: 0, slot, transaction: { signatures: [pendingSignature], message: { accountKeys: compiled.staticAccounts, instructions } },
           meta: finalizedReceipt === 'success' ? simulationMeta
             : { ...simulationMeta, err: 'AccountNotFound', postBalances: [walletBalance - fee], postTokenBalances: preTokens },
         });
+      }
       default: assert.fail(`Unexpected JSON-RPC method ${method}`);
     }
   });
@@ -236,4 +267,76 @@ test('Solana journals before raw send and restores one pending signature across 
   assert.equal(afterDisarm.summary.spentFeeLamports, 2 * fee);
   assert.equal(afterDisarm.summary.test?.status, 'landed');
   afterDisarm.stop();
+
+  await t.test('capped test verifies the exact authorization, simulation, restart, and receipt', async () => {
+    const worker = makeWorker();
+    await worker.initialize();
+    worker.arm();
+    const cappedId = 'capped-solana-test';
+    candidate = await testLossCandidate(wallet, cappedId, KAMINO);
+    const exactCandidate = candidate;
+    await worker.submit(candidate);
+    assert.equal(rawSendCount, 3);
+    assert.equal(worker.queueTest(cappedId, { maximumSwapLossUsdc: 0.02 }).maximumSwapLossUsdc, 0.02);
+    assert.throws(() => worker.queueTest(cappedId, { maximumSwapLossUsdc: 0.019999 }), /different swap loss terms/);
+    const compiled = getCompiledTransactionMessageDecoder().decode(candidate.transaction.messageBytes);
+    const [{ ata: usdcAta }, { ata: wsolAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
+    const usdcIndex = compiled.staticAccounts.indexOf(usdcAta);
+    const wsolIndex = compiled.staticAccounts.indexOf(wsolAta);
+    const usdc = (amount: string) => token(USDC, amount, 6, usdcIndex);
+    const wsol = token(WRAPPED_SOL, '90000000', 9, wsolIndex);
+    simulationMeta.preTokenBalances = [usdc('1000000'), wsol];
+    simulationMeta.postBalances = [walletBalance - fee];
+    simulationMeta.postTokenBalances = [usdc('980000'), wsol];
+
+    const simulationStart = simulationCount;
+    await worker.submit({ ...candidate, swapLossGuard: { ...candidate.swapLossGuard!, cap: 19_999n } });
+    candidate = await testLossCandidate(wallet, cappedId, KAMINO, -1n);
+    await worker.submit(candidate);
+    assert.equal(simulationCount, simulationStart);
+    candidate = exactCandidate;
+    simulationMeta.postTokenBalances = [usdc('979999'), wsol];
+    await worker.submit(candidate);
+    assert.equal(simulationCount, simulationStart + 1);
+    assert.equal(rawSendCount, 3);
+    simulationMeta.postTokenBalances = [usdc('980000'), wsol];
+    await worker.submit(candidate);
+    assert.equal(rawSendCount, 4);
+    assert.equal(worker.summary.test?.status, 'submitted');
+    const saved = fs.readFileSync(journal, 'utf8');
+    const state = JSON.parse(saved);
+    assert.equal(state.pending.swapLossGuard.cap, '20000');
+    assert.equal(state.pending.minimumNet, '0');
+    assert.equal(state.test.maximumSwapLossUsdc, 0.02);
+    worker.stop();
+
+    fs.writeFileSync(journal, JSON.stringify({ ...state, test: { ...state.test, maximumSwapLossUsdc: 0.019999 } }));
+    const mismatched = makeWorker();
+    await assert.rejects(() => mismatched.initialize(), /journal must be valid/);
+    fs.writeFileSync(journal, saved);
+
+    const recovered = makeWorker();
+    await recovered.initialize();
+    assert.equal(recovered.summary.test?.maximumSwapLossUsdc, 0.02);
+    assert.equal(recovered.summary.pending, pendingSignature);
+    finalizedReceipt = 'success';
+    await recovered.reconcile();
+    assert.equal(recovered.summary.test?.status, 'landed');
+    assert.equal(recovered.summary.lastOutcome?.netUsdc, -0.020458);
+    assert.equal(recovered.summary.lastOutcome?.walletDebitLamports, fee);
+    await recovered.submit(candidate);
+    assert.equal(rawSendCount, 4);
+
+    const overCapId = 'bad-finalized-balance';
+    recovered.queueTest(overCapId, { maximumSwapLossUsdc: 0.02 });
+    candidate = await testLossCandidate(wallet, overCapId, WRAPPED_SOL);
+    await recovered.submit(candidate);
+    assert.equal(rawSendCount, 5);
+    simulationMeta.postTokenBalances = [usdc('979999'), wsol];
+    await recovered.reconcile();
+    assert.equal(recovered.summary.lastOutcome?.status, 'invariant-breach');
+    assert.equal(recovered.summary.test?.status, 'failed');
+    assert.equal(recovered.summary.armed, false);
+    recovered.stop();
+  });
 });

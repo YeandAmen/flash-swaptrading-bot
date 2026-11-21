@@ -10,9 +10,12 @@ import {
 import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest, type FlashTestOptions } from '../network-test.js';
 import { writeJson } from '../persistence.js';
 import { readPrivateFile, writePrivateFile } from '../private-file.js';
-import { LIGHTHOUSE, verifyLighthouseDeployment } from './guard.js';
-import { JUPITER, KAMINO, MAINNET_GENESIS, SOLANA_PUBLIC_RPC, USDC, WRAPPED_SOL } from './protocol.js';
-import { solanaTestMinimums, SOLANA_TEST_MAX_FEE_LAMPORTS, type PreparedSolanaCycle, type SolanaScanConfig } from './scan.js';
+import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount, verifyLighthouseDeployment } from './guard.js';
+import { createWalletAta, JUPITER, KAMINO, MAINNET_GENESIS, SOLANA_PUBLIC_RPC, USDC, WRAPPED_SOL } from './protocol.js';
+import {
+  matchesSolanaSwapLossBalances, solanaTestMinimums, SOLANA_TEST_MAX_FEE_LAMPORTS,
+  type PreparedSolanaCycle, type SolanaScanConfig, type SolanaSwapLossGuard,
+} from './scan.js';
 
 const DAILY_FEE_CAP = 2_000_000n;
 const NATIVE_RESERVE = 15_000_000n;
@@ -23,16 +26,16 @@ const MIN_BLOCKS_TO_EXPIRY = 5n;
 const MAX_BLOCKS_TO_EXPIRY = 160n;
 const DAY_MS = 86_400_000;
 const LIVE_COMMITMENT = 'confirmed';
+const COMPUTE_BUDGET = address('ComputeBudget111111111111111111111111111111');
 const LIVE_PROGRAMS = new Set<Address>([
-  KAMINO, JUPITER, LIGHTHOUSE,
+  KAMINO, JUPITER, LIGHTHOUSE, COMPUTE_BUDGET,
   address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'),
-  address('ComputeBudget111111111111111111111111111111'),
 ]);
 const KAMINO_FLASH_BORROW_TAG = Buffer.from('87e734a70734d4c1', 'hex');
 const KAMINO_FLASH_REPAY_TAG = Buffer.from('b97500cb60f5b4ba', 'hex');
 
 type Rpc = ReturnType<typeof createSolanaRpc>;
-type AssetBalances = readonly { mint: Address; owner?: Address; uiTokenAmount: { amount: string } }[] | null | undefined;
+type AssetBalances = readonly { accountIndex: number; mint: Address; owner?: Address; uiTokenAmount: { amount: string } }[] | null | undefined;
 type Balances = {
   fee: bigint | null;
   preBalances?: readonly bigint[] | null;
@@ -54,6 +57,7 @@ interface Pending {
   testId?: string;
   profitOnly?: true;
   minimumLoan?: string;
+  swapLossGuard?: Record<keyof SolanaSwapLossGuard, string>;
 }
 interface Outcome {
   signature: Signature;
@@ -93,6 +97,14 @@ function naturalInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+function decodeLossGuard(value: Pending['swapLossGuard']): SolanaSwapLossGuard | undefined {
+  if (value === undefined) return undefined;
+  const guard = { cap: uint(value.cap), baselineUsdc: uint(value.baselineUsdc),
+    baselineWsol: uint(value.baselineWsol), baselineLamports: uint(value.baselineLamports) };
+  if (guard.cap === 0n || guard.baselineUsdc < guard.cap) throw new Error('Invalid Solana swap loss guard');
+  return guard;
+}
+
 function decodeJournal(text: string, wallet: Address): Journal {
   const state = JSON.parse(text) as Journal;
   if (!state || state.version !== 1 || state.wallet !== wallet || typeof state.armed !== 'boolean' || !Array.isArray(state.fees)
@@ -102,9 +114,13 @@ function decodeJournal(text: string, wallet: Address): Journal {
     const p = state.pending;
     signature(p.signature);
     assertIsBlockhash(p.blockhash);
-    if (uint(p.feeLamports) === 0n || uint(p.maximumLamportDebit) < uint(p.feeLamports)
+    const swapLoss = decodeLossGuard(p.swapLossGuard);
+    const fee = uint(p.feeLamports);
+    const maximumDebit = uint(p.maximumLamportDebit);
+    if (fee === 0n || maximumDebit < fee
       || uint(p.lastValidBlockHeight) === 0n || uint(p.minContextSlot) === 0n
-      || uint(p.firstMinimum) === 0n || uint(p.loan) === 0n || uint(p.minimumNet) === 0n) {
+      || uint(p.firstMinimum) === 0n || uint(p.loan) === 0n || (uint(p.minimumNet) === 0n) !== !!swapLoss
+      || (swapLoss && (maximumDebit !== fee || fee > SOLANA_TEST_MAX_FEE_LAMPORTS || swapLoss.baselineLamports < NATIVE_RESERVE + fee))) {
       throw new Error('Invalid Solana pending transaction journal');
     }
   }
@@ -138,6 +154,7 @@ function decodeJournal(text: string, wallet: Address): Journal {
     const limits = solanaTestMinimums(pending.testId ? state.test : undefined);
     if (pending.profitOnly !== (limits.minimumNet === undefined ? undefined : true)
       || pending.minimumLoan !== limits.minimumLoan?.toString()
+      || decodeLossGuard(pending.swapLossGuard)?.cap !== limits.maximumSwapLoss
       || (limits.minimumLoan !== undefined && uint(pending.loan) < limits.minimumLoan)
       || (limits.minimumNet !== undefined && uint(pending.minimumNet) !== limits.minimumNet)) {
       throw new Error('Solana pending test does not preserve the requested profit and loan floors');
@@ -210,6 +227,29 @@ function matchesKaminoLoan(accounts: readonly Address[], instructions: readonly 
     && repay.data.subarray(0, 8).equals(KAMINO_FLASH_REPAY_TAG)
     && borrow.data.readBigUInt64LE(8) === loan && repay.data.readBigUInt64LE(8) === loan
     && repay.data[16] === borrow.index;
+}
+
+function matchesSwapLossGuards(accounts: readonly Address[], instructions: readonly {
+  programAddressIndex: number; accountIndices?: readonly number[]; data?: ReadonlyUint8Array;
+}[], wallet: Address, usdcAta: Address, wsolAta: Address, guard: SolanaSwapLossGuard, fee: bigint): boolean {
+  const sequence = [COMPUTE_BUDGET, COMPUTE_BUDGET, LIGHTHOUSE, LIGHTHOUSE, KAMINO, JUPITER, JUPITER, KAMINO,
+    LIGHTHOUSE, LIGHTHOUSE, LIGHTHOUSE];
+  if (instructions.length !== sequence.length
+    || instructions.some((ix, index) => accounts[ix.programAddressIndex] !== sequence[index])) return false;
+  const nativeFloor = guard.baselineLamports - fee;
+  const expected = [lighthouseLamports(wallet, 'equal', nativeFloor), lighthouseTokenAmount(usdcAta, 'equal', guard.baselineUsdc),
+    lighthouseAtaFloor(usdcAta, guard.baselineUsdc - guard.cap), lighthouseAtaFloor(wsolAta, guard.baselineWsol),
+    lighthouseLamports(wallet, 'atLeast', nativeFloor)];
+  return expected.every((ix, index) => {
+    const actual = instructions[[2, 3, 8, 9, 10][index]];
+    return actual.accountIndices?.length === 1 && accounts[actual.accountIndices[0]] === ix.accounts?.[0].address
+      && actual.data !== undefined && Buffer.from(actual.data).equals(Buffer.from(ix.data!));
+  });
+}
+
+async function walletAtas(wallet: Address): Promise<[Address, Address]> {
+  const [usdc, wsol] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
+  return [usdc.ata, wsol.ata];
 }
 
 function running(pid: number): boolean {
@@ -327,10 +367,11 @@ export class SolanaLiveWorker {
   queueTest(id: string, options?: FlashTestOptions): FlashTest {
     if (typeof id !== 'string' || !id.length || id.length > 128) throw new Error('Invalid Solana flash test request');
     if (!this.signer || !this.journal?.armed || this.stopped) throw new Error('Solana live worker must be ready and armed');
-    if (this.journal.test?.id === id) return flashTestView(this.journal.test)!;
-    if (this.journal.pending) throw new Error('A Solana transaction is already pending');
-    const test = queueFlashTest(this.journal.test, id, Date.now(), options);
+    const previous = this.journal.test;
+    if (this.journal.pending && previous?.id !== id) throw new Error('A Solana transaction is already pending');
+    const test = queueFlashTest(previous, id, Date.now(), options, 'solana');
     solanaTestMinimums(test);
+    if (test === previous) return flashTestView(test)!;
     this.save({ ...this.journal, test });
     return test;
   }
@@ -394,7 +435,9 @@ export class SolanaLiveWorker {
     if (candidate.testId !== undefined && test?.id !== candidate.testId) return;
     const limits = solanaTestMinimums(test);
     const gasOnlyTest = !!test && limits.minimumNet === undefined;
-    const minimum = gasOnlyTest ? MIN_TEST_RETAINED_USDC : limits.minimumNet ?? this.minimumNet;
+    const lossGuard = candidate.swapLossGuard;
+    const minimum = limits.maximumSwapLoss !== undefined ? -limits.maximumSwapLoss
+      : gasOnlyTest ? MIN_TEST_RETAINED_USDC : limits.minimumNet ?? this.minimumNet;
     this.busy = true;
     const generation = this.generation;
     const canSend = () => !this.stopped && generation === this.generation && this.journal?.armed && !this.journal.pending
@@ -404,6 +447,9 @@ export class SolanaLiveWorker {
         || candidate.rentLamports < 0n || candidate.rentLamports > MAX_ATA_RENT || candidate.firstMinimum <= 0n || candidate.loan <= 0n
         || candidate.maximumLamportDebit !== candidate.feeLamports + candidate.rentLamports
         || (limits.minimumLoan !== undefined && candidate.loan < limits.minimumLoan)
+        || lossGuard?.cap !== limits.maximumSwapLoss
+        || (lossGuard && (candidate.rentLamports !== 0n || lossGuard.baselineUsdc < lossGuard.cap
+          || lossGuard.baselineLamports < NATIVE_RESERVE + candidate.feeLamports))
         || this.spentFees() + candidate.feeLamports > DAILY_FEE_CAP) {
         this.status = 'Solana candidate skipped by profit or fee budget';
         return;
@@ -425,10 +471,13 @@ export class SolanaLiveWorker {
       }
       const programs = compiled.instructions.map((ix) => compiled.staticAccounts[ix.programAddressIndex]);
       const cycle = programs.filter((program) => program === KAMINO || program === JUPITER);
+      const atas = lossGuard ? await walletAtas(this.wallet) : null;
       if (programs.some((program) => !LIVE_PROGRAMS.has(program)) || cycle.length !== 4
         || cycle[0] !== KAMINO || cycle[1] !== JUPITER || cycle[2] !== JUPITER || cycle[3] !== KAMINO
         || programs.filter((program) => program === LIGHTHOUSE).length < 4 || programs.at(-1) !== LIGHTHOUSE
-        || (limits.minimumNet !== undefined && !matchesKaminoLoan(compiled.staticAccounts, compiled.instructions, candidate.loan))) {
+        || ((limits.minimumNet !== undefined || lossGuard) && !matchesKaminoLoan(compiled.staticAccounts, compiled.instructions, candidate.loan))
+        || (lossGuard && atas && !matchesSwapLossGuards(compiled.staticAccounts, compiled.instructions,
+          this.wallet, ...atas, lossGuard, candidate.feeLamports))) {
         this.status = 'Solana candidate is missing complete swap or profit assertions';
         return;
       }
@@ -456,7 +505,9 @@ export class SolanaLiveWorker {
       if (context.slot < head.absoluteSlot || context.slot - candidate.simulationSlot > MAX_CANDIDATE_AGE_SLOTS
         || !measured || measured.fee !== candidate.feeLamports || measured.cost > candidate.maximumLamportDebit
         || (simulation.postBalances?.[0] ?? 0n) < NATIVE_RESERVE
-        || !meetsOutcomeFloor(measured, minimum, gasOnlyTest)) {
+        || !meetsOutcomeFloor(measured, minimum, gasOnlyTest)
+        || (lossGuard && atas && !matchesSolanaSwapLossBalances(simulation, compiled.staticAccounts,
+          this.wallet, ...atas, lossGuard, measured.fee))) {
         this.status = 'Solana final simulation did not satisfy the profit and cost guards';
         return;
       }
@@ -474,9 +525,11 @@ export class SolanaLiveWorker {
         signature: sig, blockhash, lastValidBlockHeight: candidate.lastValidBlockHeight.toString(),
         minContextSlot: context.slot.toString(), feeLamports: candidate.feeLamports.toString(),
         maximumLamportDebit: candidate.maximumLamportDebit.toString(),
-        firstMinimum: candidate.firstMinimum.toString(), loan: candidate.loan.toString(), minimumNet: minimum.toString(),
+        firstMinimum: candidate.firstMinimum.toString(), loan: candidate.loan.toString(), minimumNet: lossGuard ? '0' : minimum.toString(),
         testId: test?.id, profitOnly: limits.minimumNet === undefined ? undefined : true,
         minimumLoan: limits.minimumLoan?.toString(),
+        ...(lossGuard ? { swapLossGuard: { cap: lossGuard.cap.toString(), baselineUsdc: lossGuard.baselineUsdc.toString(),
+          baselineWsol: lossGuard.baselineWsol.toString(), baselineLamports: lossGuard.baselineLamports.toString() } } : {}),
       };
       // Persist the exact signature before contacting a sender. Uncertain sends stay pending.
       this.save({ ...this.journal, pending, test: submitted });
@@ -505,7 +558,7 @@ export class SolanaLiveWorker {
       const first = await this.signatureStatus(pending.signature);
       if (first.value[0]?.confirmationStatus === 'finalized') {
         const receipt = await this.finalizedReceipt(pending.signature);
-        if (receipt) this.settleReceipt(pending, receipt);
+        if (receipt) await this.settleReceipt(pending, receipt);
         return;
       }
       const finalized = await this.rpc.getEpochInfo({ commitment: 'finalized', minContextSlot }).send(rpcDeadline());
@@ -516,7 +569,7 @@ export class SolanaLiveWorker {
         this.finalizedReceipt(pending.signature),
       ]);
       if (receipt) {
-        this.settleReceipt(pending, receipt);
+        await this.settleReceipt(pending, receipt);
       } else if (history.value[0] === null && !validity.value
         && history.context.slot >= finalized.absoluteSlot && validity.context.slot >= finalized.absoluteSlot) {
         this.finish(pending, { signature: pending.signature, status: 'expired', at: Date.now(), slot: null,
@@ -537,7 +590,7 @@ export class SolanaLiveWorker {
     return this.rpc.getTransaction(sig, { commitment: 'finalized', encoding: 'json', maxSupportedTransactionVersion: 0 }).send(rpcDeadline());
   }
 
-  private settleReceipt(pending: Pending, receipt: NonNullable<Awaited<ReturnType<SolanaLiveWorker['finalizedReceipt']>>>): void {
+  private async settleReceipt(pending: Pending, receipt: NonNullable<Awaited<ReturnType<SolanaLiveWorker['finalizedReceipt']>>>): Promise<void> {
     const meta = receipt.meta;
     if (!meta || receipt.version !== 0 || receipt.slot < uint(pending.minContextSlot)
       || receipt.transaction.signatures[0] !== pending.signature || receipt.transaction.message.accountKeys[0] !== this.wallet) {
@@ -547,10 +600,14 @@ export class SolanaLiveWorker {
     if (!measured || (!meta.err && measured.net === null)) throw new Error('Solana finalized receipt omitted wallet changes');
     const loan = uint(pending.loan);
     const message = receipt.transaction.message;
-    const wrongLoan = pending.profitOnly && !matchesKaminoLoan(message.accountKeys,
+    const lossGuard = decodeLossGuard(pending.swapLossGuard);
+    const minimum = lossGuard ? -lossGuard.cap : uint(pending.minimumNet);
+    const wrongLoan = (pending.profitOnly || lossGuard) && !matchesKaminoLoan(message.accountKeys,
       message.instructions.map((ix) => ({ data: ix.data, programAddressIndex: Number(ix.programIdIndex) })), loan);
-    const breached = wrongLoan || measured.fee !== uint(pending.feeLamports) || measured.cost > uint(pending.maximumLamportDebit)
-      || (!meta.err && !meetsOutcomeFloor(measured, uint(pending.minimumNet), pending.testId !== undefined && !pending.profitOnly));
+    const wrongBalance = lossGuard && !meta.err && !matchesSolanaSwapLossBalances(meta, message.accountKeys,
+      this.wallet, ...await walletAtas(this.wallet), lossGuard, measured.fee);
+    const breached = wrongLoan || wrongBalance || measured.fee !== uint(pending.feeLamports) || measured.cost > uint(pending.maximumLamportDebit)
+      || (!meta.err && !meetsOutcomeFloor(measured, minimum, pending.testId !== undefined && !pending.profitOnly));
     const status = breached ? 'invariant-breach' : meta.err ? 'failed' : 'finalized';
     this.finish(pending, { signature: pending.signature, status, at: Date.now(), slot: Number(receipt.slot),
       feeLamports: Number(measured.fee), walletDebitLamports: Number(measured.cost),
@@ -565,7 +622,8 @@ export class SolanaLiveWorker {
       const status = outcome.status === 'finalized' ? 'landed' : outcome.status === 'expired' ? 'expired' : 'failed';
       const note = status === 'landed' ? (pending.profitOnly
         ? 'Finalized. The requested after-fee profit and loan size were verified.'
-        : 'Finalized. The flash loan and rent were covered by the swaps.')
+        : pending.swapLossGuard ? 'Finalized. Flash loan repayment and the approved USDC swap loss cap were verified.'
+          : 'Finalized. The flash loan and rent were covered by the swaps.')
         : status === 'expired' ? 'Signature expired without landing. No transaction fee was charged.'
           : outcome.status === 'invariant-breach' ? 'Receipt did not satisfy the wallet protection checks. Solana was disarmed.'
             : 'The test reverted. Check the finalized fee and transaction receipt.';

@@ -1,12 +1,13 @@
 import {
   AccountRole, address, appendTransactionMessageInstructions, assertIsTransactionMessageWithinSizeLimit,
   compileTransaction, compressTransactionMessageUsingAddressLookupTables, createSolanaRpc, createTransactionMessage,
-  getBase64Decoder, getBase64EncodedWireTransaction, getAddressDecoder, setTransactionMessageComputeUnitLimit, setTransactionMessageComputeUnitPrice,
+  getBase64Decoder, getBase64EncodedWireTransaction, getAddressDecoder, getCompiledTransactionMessageDecoder,
+  setTransactionMessageComputeUnitLimit, setTransactionMessageComputeUnitPrice,
   setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash,
   type Address, type AddressesByLookupTableAddress, type TransactionMessageBytesBase64, type Instruction, type Transaction,
 } from '@solana/kit';
 import { redactDiagnostic } from '../diagnostics.js';
-import type { FlashTest } from '../network-test.js';
+import { validSolanaSwapLossUsdc, type FlashTest } from '../network-test.js';
 import { lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
 import {
   createKaminoFlashInstructions, createWalletAta, decodeKaminoUsdcReserve, decodeLookupTable, kaminoRepayment,
@@ -64,7 +65,37 @@ export interface SolanaScanConfig {
   venuePair?: VenuePair;
 }
 
-export type SolanaFlashTest = Pick<FlashTest, 'id' | 'minimumNetUsd' | 'minimumLoanUsd'>;
+export type SolanaFlashTest = Pick<FlashTest, 'id' | 'minimumNetUsd' | 'minimumLoanUsd' | 'maximumSwapLossUsdc'>;
+
+export interface SolanaSwapLossGuard {
+  cap: bigint;
+  baselineUsdc: bigint;
+  baselineWsol: bigint;
+  baselineLamports: bigint;
+}
+
+type TokenBalances = readonly { accountIndex: number; mint: Address; owner?: Address; uiTokenAmount: { amount: string } }[] | null;
+
+/** Independently verify the canonical ATA and native balances reported for a capped-loss test. */
+export function matchesSolanaSwapLossBalances(meta: {
+  preBalances?: readonly bigint[] | null; postBalances?: readonly bigint[] | null;
+  preTokenBalances?: TokenBalances; postTokenBalances?: TokenBalances;
+}, accounts: readonly Address[], wallet: Address, usdcAta: Address, wsolAta: Address, guard: SolanaSwapLossGuard, fee: bigint): boolean {
+  const amount = (balances: TokenBalances | undefined, mint: Address, ata: Address) => {
+    const index = accounts.indexOf(ata);
+    if (index < 0) return undefined;
+    const token = balances?.find((token) => token.accountIndex === index && token.mint === mint && token.owner === wallet);
+    return token && rawAmount(token.uiTokenAmount.amount);
+  };
+  const afterUsdc = amount(meta.postTokenBalances, USDC, usdcAta);
+  const afterWsol = amount(meta.postTokenBalances, WRAPPED_SOL, wsolAta);
+  return amount(meta.preTokenBalances, USDC, usdcAta) === guard.baselineUsdc
+    && amount(meta.preTokenBalances, WRAPPED_SOL, wsolAta) === guard.baselineWsol
+    && afterUsdc !== undefined && afterUsdc >= guard.baselineUsdc - guard.cap
+    && afterWsol !== undefined && afterWsol >= guard.baselineWsol
+    && meta.preBalances?.[0] === guard.baselineLamports
+    && (meta.postBalances?.[0] ?? -1n) >= guard.baselineLamports - fee;
+}
 
 export interface PreparedSolanaCycle {
   testId?: string;
@@ -77,6 +108,7 @@ export interface PreparedSolanaCycle {
   firstMinimum: bigint;
   loan: bigint;
   net: bigint;
+  swapLossGuard?: SolanaSwapLossGuard;
 }
 
 interface SolanaRoute {
@@ -129,12 +161,18 @@ function usdcAmount(value: number, minimum: number, maximum: number, label: stri
 }
 
 // A requested minimum is an inclusive floor in atomic USDC units, so sub-unit rounding is upward.
-export function solanaTestMinimums(test?: Pick<SolanaFlashTest, 'minimumNetUsd' | 'minimumLoanUsd'> | null) {
+export function solanaTestMinimums(test?: Omit<SolanaFlashTest, 'id'> | null) {
+  const maximumSwapLossUsdc = test?.maximumSwapLossUsdc;
+  if (maximumSwapLossUsdc !== undefined && (!validSolanaSwapLossUsdc(maximumSwapLossUsdc)
+    || test?.minimumNetUsd !== undefined || test?.minimumLoanUsd !== undefined)) {
+    throw new Error('Invalid Solana test swap loss cap');
+  }
   return {
     minimumNet: test?.minimumNetUsd === undefined ? undefined
       : usdcAmount(test.minimumNetUsd, Number.MIN_VALUE, 1_000, 'Test minimum net profit', Math.ceil),
     minimumLoan: test?.minimumLoanUsd === undefined ? undefined
       : usdcAmount(test.minimumLoanUsd, 1, 100_000, 'Test minimum loan size', Math.ceil),
+    maximumSwapLoss: maximumSwapLossUsdc === undefined ? undefined : BigInt(Math.round(maximumSwapLossUsdc * Number(USDC_UNITS))),
   };
 }
 
@@ -151,7 +189,7 @@ function deadline() {
   return { abortSignal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
 }
 
-async function buildSwap(
+export async function buildSwap(
   wallet: Address, input: Address, output: Address, destination: Address,
   amount: bigint, venue: Venue, apiKey?: string,
 ): Promise<JupiterBuild | null> {
@@ -193,7 +231,7 @@ async function buildSwap(
   return swap;
 }
 
-function swapInstruction(swap: JupiterBuild): Instruction {
+export function swapInstruction(swap: JupiterBuild): Instruction {
   return {
     programAddress: JUPITER,
     accounts: swap.swapInstruction.accounts.map((meta) => {
@@ -206,7 +244,7 @@ function swapInstruction(swap: JupiterBuild): Instruction {
   };
 }
 
-async function lookupTables(rpc: Rpc, swaps: JupiterBuild[]): Promise<AddressesByLookupTableAddress> {
+export async function lookupTables(rpc: Rpc, swaps: JupiterBuild[]): Promise<AddressesByLookupTableAddress> {
   const keys = [...new Set([
     KAMINO_MARKET_LOOKUP, ...swaps.flatMap((swap) => Object.keys(swap.addressesByLookupTableAddress ?? {})),
   ])].map(address);
@@ -219,7 +257,7 @@ async function lookupTables(rpc: Rpc, swaps: JupiterBuild[]): Promise<AddressesB
   }));
 }
 
-function routeMinimum(swap: JupiterBuild, wallet: Address, source: Address, destination: Address): bigint {
+export function routeMinimum(swap: JupiterBuild, wallet: Address, source: Address, destination: Address): bigint {
   const bytes = Buffer.from(swap.swapInstruction.data, 'base64');
   const accounts = swap.swapInstruction.accounts;
   if (bytes.length < 34 || !bytes.subarray(0, 8).equals(routeV2)
@@ -283,7 +321,9 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   const configuredLoan = usdcAmount(config.loanUsdc ?? defaultLoanUsdc, 1, 100_000, 'Loan size');
   const loan = limits.minimumLoan !== undefined && limits.minimumLoan > configuredLoan ? limits.minimumLoan : configuredLoan;
   const gasOnlyTest = !!test && limits.minimumNet === undefined;
-  const minimumNet = gasOnlyTest ? 1n : limits.minimumNet ?? usdcAmount(config.minNetUsdc ?? 0.05, 0.000001, 1_000, 'Minimum net profit');
+  const lossCap = limits.maximumSwapLoss;
+  const minimumNet = lossCap !== undefined ? -lossCap
+    : gasOnlyTest ? 1n : limits.minimumNet ?? usdcAmount(config.minNetUsdc ?? 0.05, 0.000001, 1_000, 'Minimum net profit');
   const configuredFee = config.maxFeeLamports ?? 50_000;
   if (!Number.isSafeInteger(configuredFee) || configuredFee < 5_000 || configuredFee > 5_000_000) {
     throw new Error('Maximum network fee must be between 5,000 and 5,000,000 lamports');
@@ -340,6 +380,13 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         rpc.getLatestBlockhash({ commitment: COMMITMENT, minContextSlot: context.slot }).send(deadline()),
         execute ? liveWalletState(rpc, wallet, usdcAta.ata, solAta.ata, context.slot) : null,
       ]);
+      let swapLossGuard: SolanaSwapLossGuard | undefined;
+      if (lossCap !== undefined) {
+        if (!baseline || baseline.createUsdc || baseline.createWsol || baseline.rent !== 0n || baseline.usdc < lossCap) {
+          throw new Error('The capped Solana test requires both existing wallet ATAs and USDC covering the swap loss cap');
+        }
+        swapLossGuard = { cap: lossCap, baselineUsdc: baseline.usdc, baselineWsol: baseline.wsol, baselineLamports: baseline.lamports };
+      }
       const blockhash = blockhashResult.value;
       const requiredSlot = [context.slot, blockhashResult.context.slot, baseline?.slot ?? 0n]
         .reduce((latest, slot) => slot > latest ? slot : latest);
@@ -407,15 +454,19 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       // Use the first-leg guaranteed output to conservatively convert SOL fees into the same USDC units as the gain.
       const costUsdc = nativeCostInUsdc(costLamports, loan, firstMinimum);
       const net = postUsdc - preUsdc - costUsdc;
-      // A functional test can lose only the network fee. Any account rent is still covered by the swap.
+      // Functional tests assess swap results before network fees. Capped-loss tests have no ATA rent.
       const protectedLamports = gasOnlyTest ? costLamports - fee : costLamports;
       const protectedCost = nativeCostInUsdc(protectedLamports, loan, firstMinimum);
+      const lossBalancesMatch = !swapLossGuard || matchesSolanaSwapLossBalances(simulation,
+        getCompiledTransactionMessageDecoder().decode(transaction.messageBytes).staticAccounts,
+        wallet, usdcAta.ata, solAta.ata, swapLossGuard, fee);
       const qualified = fee <= maxFeeLamports && postUsdc - preUsdc >= protectedCost + minimumNet
-        && beforeNetwork >= protectedCost + minimumNet && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
+        && beforeNetwork >= protectedCost + minimumNet && lossBalancesMatch
+        && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
       if (qualified && execute && !submission && baseline && exactFee !== null) {
         const candidate = { ...(test ? { testId: test.id } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight,
           simulationSlot: execution.slot, maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports: baseline.rent,
-          firstMinimum, loan, net };
+          firstMinimum, loan, net, ...(swapLossGuard ? { swapLossGuard } : {}) };
         // Give the first qualifying route to the signer while the opposite direction finishes.
         submission = Promise.resolve().then(() => execute(candidate));
         void submission.catch(() => undefined); // Observe early failures during the remaining quote.

@@ -9,6 +9,7 @@ import { EthereumIntent } from './ethereum-intent.js';
 import { Engine } from './engine.js';
 import { armArbitrum, armSolana, disarmArbitrum, disarmSolana, expansionView, queueArbitrumTest, queueSolanaTest, startExpansion, stopExpansion } from './expansion.js';
 import { DeploymentFeeLimitError, DeploymentGasError } from './executor.js';
+import { validSolanaSwapLossUsdc } from './network-test.js';
 import type { PortfolioState } from './types.js';
 
 const engine = new Engine();
@@ -257,9 +258,14 @@ app.post('/api/solana/arm', (req, res) => {
 app.post('/api/arbitrum/disarm', control(() => disarmArbitrum()));
 for (const [chain, queue] of [['arbitrum', queueArbitrumTest], ['solana', queueSolanaTest]] as const) {
   app.post(`/api/${chain}/test-once`, (req, res) => {
-    const { id, confirm, minimumNetUsd, minimumLoanUsd } = req.body ?? {};
+    const { id, confirm, minimumNetUsd, minimumLoanUsd, maximumSwapLossUsdc } = req.body ?? {};
     if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
       res.status(400).json({ error: 'Confirm TEST and supply a unique request ID.' });
+      return;
+    }
+    if (maximumSwapLossUsdc !== undefined && (chain !== 'solana' || !validSolanaSwapLossUsdc(maximumSwapLossUsdc)
+      || minimumNetUsd !== undefined || minimumLoanUsd !== undefined)) {
+      res.status(400).json({ error: 'Only Solana tests support an exact swap loss cap of up to 0.02 USDC without profit or loan floors.' });
       return;
     }
     if ((minimumNetUsd !== undefined && (typeof minimumNetUsd !== 'number' || !Number.isFinite(minimumNetUsd) || minimumNetUsd <= 0 || minimumNetUsd > 1000))
@@ -268,7 +274,7 @@ for (const [chain, queue] of [['arbitrum', queueArbitrumTest], ['solana', queueS
       res.status(400).json({ error: 'A loan floor requires a valid positive after-fee profit.' });
       return;
     }
-    if (allowLiveControl(res)) void control(() => queue(id, { minimumNetUsd, minimumLoanUsd }))(req, res);
+    if (allowLiveControl(res)) void control(() => queue(id, { minimumNetUsd, minimumLoanUsd, maximumSwapLossUsdc }))(req, res);
   });
 }
 app.post('/api/arbitrum/arm', (req, res) => {
@@ -306,10 +312,12 @@ app.post('/api/mev/arm', (req, res) => {
   void control(() => { ethereumIntent.set('mev', true); mev.arm(); })(req, res);
 });
 app.post('/api/mev/test-once', (req, res) => {
-  const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false, publicFunctional = false, minimumNetUsd, minimumLoanUsd } = req.body ?? {};
+  const { confirm, id, maximumGasUsd, requireGasCoverage = false, privateSubmission = false, publicFunctional = false,
+    minimumNetUsd, minimumLoanUsd, maximumSwapLossUsdc } = req.body ?? {};
   if (confirm !== 'TEST' || typeof id !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(id)
     || typeof maximumGasUsd !== 'number' || !Number.isFinite(maximumGasUsd) || maximumGasUsd <= 0
     || typeof requireGasCoverage !== 'boolean' || typeof privateSubmission !== 'boolean' || typeof publicFunctional !== 'boolean'
+    || maximumSwapLossUsdc !== undefined
     || (publicFunctional && (privateSubmission || (requireGasCoverage && minimumNetUsd === undefined)))
     || (minimumNetUsd !== undefined && (typeof minimumNetUsd !== 'number' || !Number.isFinite(minimumNetUsd)
       || minimumNetUsd <= 0 || !requireGasCoverage || (!privateSubmission && !publicFunctional)))
