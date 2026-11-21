@@ -8,7 +8,7 @@ import { writeJson } from '../persistence.js';
 import { loadOrCreateWallet } from '../wallet.js';
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
 import { verifyArbitrumExecutor, type ArbitrumExecutor } from './proxy.js';
-import { prepareArbitrumOrder } from './execution.js';
+import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
 import { arbitrumTestLeads } from './test-leads.js';
 import { arbitrumChainId, arbitrumClient, arbitrumEthUsd, discoverArbitrumPools, scanArbitrum, type ArbQuote } from './market.js';
 
@@ -19,6 +19,19 @@ const txLimitUsd = 0.50;
 const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
 const extraLoanSizes = ['0.01', '0.1', '0.5', '2', '8'].flatMap((size) => [undefined, parseEther(size)]);
+const preparationStatus: Record<ArbitrumOrderRejection, string> = {
+  'daily-budget': 'Daily gas budget used',
+  'net-floor': 'Prepared route did not meet the net profit floor',
+  'stale-quote': 'Arbitrum quote or chain head was stale before preparation',
+  'fee-cap': 'Estimated gas exceeded the approved fee cap',
+  'deadline': 'Quoted route expired during pending simulation',
+  'gas-estimate-changed': 'Estimated gas grew beyond the padded gas limit',
+  'simulation-unavailable': 'Arbitrum pending simulation returned no result',
+  'execution-reverted': 'Arbitrum route reverted before signing',
+  'head-rpc': 'Arbitrum RPC failed while reading the chain head',
+  'fee-rpc': 'Arbitrum RPC failed during fee estimation',
+  'simulation-rpc': 'Arbitrum RPC failed during pending simulation',
+};
 type Pending = { hash: Hash; nonce: number; ethUsd: number; budgetUsd: number };
 type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'replaced'; gasUsd: number; netUsd: number; at: number; loanUsd?: number };
 type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest };
@@ -57,6 +70,7 @@ export class ArbitrumWorker {
     canArm: this.enabled && this.executionEnabled,
     status: this.enabled ? 'Starting' : 'Disabled',
     block: 0, pools: 0, routes: 0, simulated: 0, updatedAt: 0, netEstimateUsd: null as number | null,
+    preparationRejections: {} as Partial<Record<ArbitrumOrderRejection, number>>,
     executor: isAddress(this.contract) ? this.contract : null,
     balanceEth: null as string | null, pending: null as Hash | null, settled: null as Settlement | null,
   };
@@ -158,6 +172,7 @@ export class ArbitrumWorker {
     const test = this.summary.mode === 'live' && !this.journal?.pending && activeFlashTest(selectedTest) ? selectedTest : null;
     this.summary.simulated = 0;
     this.summary.netEstimateUsd = null;
+    this.summary.preparationRejections = {};
     if (test && test.minimumNetUsd === undefined && this.summary.executor) {
       const leads = arbitrumTestLeads(this.markets, block);
       if (leads.length) {
@@ -189,15 +204,23 @@ export class ArbitrumWorker {
     const canTest = () => !test || (this.journal?.test === test && activeFlashTest(test));
     const available = this.journal ? Math.min(txLimitUsd, dailyLimitUsd
       - this.journal.recent.filter((row) => row.at > Date.now() - dayMs).reduce((sum, row) => sum + row.gasUsd, 0)) : txLimitUsd;
+    let firstRejection: ArbitrumOrderRejection | undefined;
+    let reachedLiveChecks = false;
     for (const candidate of candidates) {
       this.summary.simulated += 1;
       const prepared = await prepareArbitrumOrder(this.client, this.contract, this.owner, candidate, ethUsd, Math.max(minNetUsd, test?.minimumNetUsd ?? 0), available,
-        !!test && test.minimumNetUsd === undefined, this.deployment.releaseHash ?? undefined)
-        .catch(() => null);
-      if (!prepared || (test?.minimumLoanUsd !== undefined && Number(formatEther(candidate.order.amountIn)) * ethUsd < test.minimumLoanUsd)) continue;
+        !!test && test.minimumNetUsd === undefined, this.deployment.releaseHash ?? undefined);
+      if (!prepared.ok) {
+        firstRejection ??= prepared.reason;
+        const counts = this.summary.preparationRejections;
+        counts[prepared.reason] = (counts[prepared.reason] ?? 0) + 1;
+        continue;
+      }
+      if (test?.minimumLoanUsd !== undefined && Number(formatEther(candidate.order.amountIn)) * ethUsd < test.minimumLoanUsd) continue;
       this.summary.netEstimateUsd = prepared.netUsd;
       this.summary.status = test ? 'Test route passed repayment and gas checks' : 'Executable quote passed profit and gas checks';
       if (this.summary.mode !== 'live' || !this.active || !this.journal || !this.deployment.verified || !canTest()) return true;
+      reachedLiveChecks = true;
       const { account } = loadOrCreateWallet();
       if (!isAddressEqual(account.address, this.owner)) throw new Error('Wallet does not match the Arbitrum executor owner');
       const [nonce, pending, balance, head] = await Promise.all([
@@ -230,7 +253,8 @@ export class ArbitrumWorker {
       await this.client.sendRawTransaction({ serializedTransaction });
       return true;
     }
-    if (available <= 0) this.summary.status = 'Daily gas budget used';
+    if (available <= 0) this.summary.status = preparationStatus['daily-budget'];
+    else if (firstRejection && !reachedLiveChecks) this.summary.status = preparationStatus[firstRejection];
     return false;
   }
 

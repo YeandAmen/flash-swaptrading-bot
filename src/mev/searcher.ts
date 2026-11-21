@@ -46,6 +46,7 @@ const DASHBOARD_BUNDLE_LIMIT = 5;
 const MAX_STARTUP_TRACE_BUNDLES = 6;
 const DIRECT_WINDOW = 1;
 const PRIVATE_DIRECT_WINDOW = 2;
+const PRIVATE_LIVE_WINDOW = 3;
 const PRIVATE_FUNCTIONAL_TEST_WINDOW = 5;
 const PUBLIC_FUNCTIONAL_TEST_WINDOW = 8;
 const MAX_PUBLIC_FUNCTIONAL_TEST_USD = 5;
@@ -1063,8 +1064,10 @@ export class MevSearcher {
     const direct = MEV.submission === 'direct';
     const privateSubmission = direct && (test?.privateSubmission ?? MEV.directProtected) ? true : undefined;
     const privateGasOnly = privateSubmission && gasOnly;
+    const privateLive = privateSubmission && !test;
     let horizon = test?.publicFunctional ? PUBLIC_FUNCTIONAL_TEST_WINDOW
-      : privateGasOnly || profitTest ? PRIVATE_FUNCTIONAL_TEST_WINDOW : privateSubmission ? PRIVATE_DIRECT_WINDOW : DIRECT_WINDOW;
+      : privateGasOnly || profitTest ? PRIVATE_FUNCTIONAL_TEST_WINDOW
+        : privateLive ? PRIVATE_LIVE_WINDOW : privateSubmission ? PRIVATE_DIRECT_WINDOW : DIRECT_WINDOW;
     let target = r.blockNumber + BigInt(horizon);
     const encode = (tip: bigint, minProfit: bigint) => this.liveData(encodeArbitrage(offer.funding, {
       buy: c.A, sell: c.B, token: c.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
@@ -1115,6 +1118,18 @@ export class MevSearcher {
         let affordableFees = gasOnly || !budgetFees ? budgetFees : affordableDirectFees(
           r.nextBaseFee, gas, budgetFees.maxPriorityFeePerGas, minimumTip, spendableProceeds - minimumNet, horizon,
         );
+        if (!affordableFees && privateLive && maxGasWei !== null) {
+          const shorterBudget = affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, PRIVATE_DIRECT_WINDOW);
+          budgetFees ??= shorterBudget;
+          if (shorterBudget) {
+            affordableFees = affordableDirectFees(r.nextBaseFee, gas, shorterBudget.maxPriorityFeePerGas,
+              minimumTip, spendableProceeds - minimumNet, PRIVATE_DIRECT_WINDOW);
+            if (affordableFees) {
+              horizon = PRIVATE_DIRECT_WINDOW;
+              target = r.blockNumber + BigInt(horizon);
+            }
+          }
+        }
         if (!affordableFees && profitTest && privateSubmission && maxGasWei !== null) {
           const safeGasWei = spendableProceeds - minimumNet;
           horizon = PRIVATE_DIRECT_WINDOW;
@@ -1131,8 +1146,15 @@ export class MevSearcher {
           const profitCap = afterRetained < halfProfit ? afterRetained : halfProfit;
           const maximum = premiumCap !== null && premiumCap < profitCap ? premiumCap : profitCap;
           const premiumTip = preferredTip > PREMIUM_TARGET_TIP_WEI ? preferredTip : PREMIUM_TARGET_TIP_WEI;
-          const faster = premiumCap !== null
+          let faster = premiumCap !== null
             ? affordableDirectFees(r.nextBaseFee, gas, premiumTip, minimumTip, maximum, horizon) : null;
+          if (!faster && !affordableFees && privateLive && premiumCap !== null) {
+            faster = affordableDirectFees(r.nextBaseFee, gas, premiumTip, minimumTip, maximum, PRIVATE_DIRECT_WINDOW);
+            if (faster) {
+              horizon = PRIVATE_DIRECT_WINDOW;
+              target = r.blockNumber + BigInt(horizon);
+            }
+          }
           if (faster && faster.maxPriorityFeePerGas > (affordableFees?.maxPriorityFeePerGas ?? 0n)) {
             affordableFees = faster;
             minimumNet = retained;

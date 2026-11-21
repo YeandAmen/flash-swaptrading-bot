@@ -24,13 +24,18 @@ const legacyToken = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const systemProgram = address('11111111111111111111111111111111');
 const routeV2 = Buffer.from('bb64facc31c4af14', 'hex');
 const addressDecoder = getAddressDecoder();
-const VENUES = ['Whirlpool', 'Raydium CLMM'] as const;
+export const solanaVenuePairs = [
+  ['Whirlpool', 'Raydium CLMM'],
+  ['Whirlpool', 'Meteora DLMM'],
+  ['Raydium CLMM', 'Meteora DLMM'],
+] as const;
 const JUPITER_BUILD = 'https://api.jup.ag/swap/v2/build';
 const defaultLoanUsdc = 250;
 export const SOLANA_TEST_MAX_FEE_LAMPORTS = 50_000n;
 
 type Rpc = ReturnType<typeof createSolanaRpc>;
-type Venue = typeof VENUES[number];
+type VenuePair = typeof solanaVenuePairs[number];
+type Venue = VenuePair[number];
 type JupiterAccount = { pubkey: string; isWritable: boolean; isSigner: boolean };
 type JupiterInstruction = { programId: string; data: string; accounts: JupiterAccount[] };
 type JupiterBuild = {
@@ -56,6 +61,7 @@ export interface SolanaScanConfig {
   loanUsdc?: number;
   minNetUsdc?: number;
   maxFeeLamports?: number;
+  venuePair?: VenuePair;
 }
 
 export type SolanaFlashTest = Pick<FlashTest, 'id' | 'minimumNetUsd' | 'minimumLoanUsd'>;
@@ -272,6 +278,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   if (!config.wallet) throw new Error('Set SOLANA_WALLET_ADDRESS to the public address of your Solana wallet');
   const wallet = address(config.wallet);
   const test = execute && requestedTest ? (typeof requestedTest === 'string' ? { id: requestedTest } : requestedTest) : null;
+  const venues = !test && config.venuePair ? config.venuePair : solanaVenuePairs[0];
   const limits = solanaTestMinimums(test);
   const configuredLoan = usdcAmount(config.loanUsdc ?? defaultLoanUsdc, 1, 100_000, 'Loan size');
   const loan = limits.minimumLoan !== undefined && limits.minimumLoan > configuredLoan ? limits.minimumLoan : configuredLoan;
@@ -308,8 +315,8 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   result.status = 'scanned';
 
   const candidates: PreparedSolanaCycle[] = [];
-  result.routes = await Promise.all(VENUES.map(async (buy, index): Promise<SolanaRoute> => {
-    const sell = VENUES[1 - index];
+  result.routes = await Promise.all(venues.map(async (buy, index): Promise<SolanaRoute> => {
+    const sell = venues[1 - index];
     let quote: number | undefined;
     try {
       const first = await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy, config.jupiterApiKey);

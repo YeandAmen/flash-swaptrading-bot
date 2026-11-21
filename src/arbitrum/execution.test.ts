@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { decodeFunctionData, encodeFunctionResult, parseEther, type Address } from 'viem';
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
-import { prepareArbitrumOrder } from './execution.js';
+import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
 import type { ArbQuote, ArbitrumClient } from './market.js';
 
 const owner: Address = '0x0000000000000000000000000000000000000001';
@@ -40,26 +40,44 @@ function clientFor({ head = 104n, preparationBlock = 100n, payout = profitable.p
 test('Arbitrum signing gate requires fresh execution to cover padded gas and the net floor', async () => {
   const ok = clientFor();
   const quote = await prepareArbitrumOrder(ok.client, contract, owner, profitable, 2_000, 0.05, 0.50);
-  assert.ok(quote);
+  assert.ok(quote.ok);
   assert.equal(quote.worstGasUsd, 0.05);
   assert.equal(ok.finalMinProfit(), quote.gasBudget + parseEther('0.000025'));
   const delayed = clientFor({ preparationBlock: 117n, head: 119n });
   const refreshed = await prepareArbitrumOrder(delayed.client, contract, owner, profitable, 2_000, 0.05, 0.50);
-  assert.ok(refreshed);
+  assert.ok(refreshed.ok);
   assert.equal(delayed.finalDeadline(), 127n);
-  assert.equal(await prepareArbitrumOrder(clientFor({ head: 110n }).client, contract, owner, profitable, 2_000, 0.05, 0.50), null);
-  assert.equal(await prepareArbitrumOrder(clientFor({ payout: 1n }).client, contract, owner, profitable, 2_000, 0.05, 0.50), null);
-  assert.equal(await prepareArbitrumOrder(clientFor({ feeCap: 2_000_000_000n }).client, contract, owner, profitable, 2_000, 0.05, 0.50), null);
+  assert.deepEqual(await prepareArbitrumOrder(clientFor({ head: 110n }).client, contract, owner, profitable, 2_000, 0.05, 0.50),
+    { ok: false, reason: 'deadline' });
+  assert.deepEqual(await prepareArbitrumOrder(clientFor({ payout: 1n }).client, contract, owner, profitable, 2_000, 0.05, 0.50),
+    { ok: false, reason: 'net-floor' });
+  assert.deepEqual(await prepareArbitrumOrder(clientFor({ feeCap: 2_000_000_000n }).client, contract, owner, profitable, 2_000, 0.05, 0.50),
+    { ok: false, reason: 'fee-cap' });
 });
-
 
 test('an explicit Arbitrum test isolates the network fee exception', async () => {
   const tiny = { ...profitable, payout: 1000n };
   const fixture = clientFor({ payout: 1000n });
-  assert.equal(await prepareArbitrumOrder(fixture.client, contract, owner, tiny, 2_000, 0.05, 0.50), null);
+  assert.deepEqual(await prepareArbitrumOrder(fixture.client, contract, owner, tiny, 2_000, 0.05, 0.50),
+    { ok: false, reason: 'net-floor' });
   const allowed = await prepareArbitrumOrder(fixture.client, contract, owner, tiny, 2_000, 0.05, 0.50, true);
-  assert.ok(allowed && allowed.netUsd < 0);
+  assert.ok(allowed.ok && allowed.netUsd < 0);
   assert.equal(fixture.finalMinProfit(), 1n);
-  assert.equal(await prepareArbitrumOrder(fixture.client, contract, owner, tiny, 2_000, 0.05, 0.01, true), null);
-  assert.equal(await prepareArbitrumOrder(clientFor({ payout: 0n }).client, contract, owner, tiny, 2_000, 0.05, 0.50, true), null);
+  assert.deepEqual(await prepareArbitrumOrder(fixture.client, contract, owner, tiny, 2_000, 0.05, 0.01, true),
+    { ok: false, reason: 'fee-cap' });
+  assert.deepEqual(await prepareArbitrumOrder(clientFor({ payout: 0n }).client, contract, owner, tiny, 2_000, 0.05, 0.50, true),
+    { ok: false, reason: 'net-floor' });
+});
+
+test('Arbitrum preparation reports the failing RPC stage without exposing provider errors', async () => {
+  const fixture = clientFor();
+  const fail = async () => { throw new Error('https://example.com/private-rpc-token'); };
+  const cases: [ArbitrumClient, ArbitrumOrderRejection][] = [
+    [{ ...fixture.client, getBlock: fail }, 'head-rpc'],
+    [{ ...fixture.client, estimateFeesPerGas: fail }, 'fee-rpc'],
+    [{ ...fixture.client, call: fail }, 'simulation-rpc'],
+  ];
+  for (const [client, reason] of cases) {
+    assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, profitable, 2_000, 0.05, 0.50), { ok: false, reason });
+  }
 });

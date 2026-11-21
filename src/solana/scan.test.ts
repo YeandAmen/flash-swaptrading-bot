@@ -6,7 +6,7 @@ import {
   USDC, WRAPPED_SOL,
 } from './protocol.js';
 import { LIGHTHOUSE } from './guard.js';
-import { scanSolanaCycle } from './scan.js';
+import { scanSolanaCycle, solanaVenuePairs } from './scan.js';
 
 const wallet = address('23g1K6sr2bevNwLYPoB79jzEQtErioYQ8mpUa76xA6yu');
 const tokenProgram = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
@@ -42,6 +42,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   let actualWalletGain = 210_000;
   let live = false;
   let reportedFee = fee;
+  let jupiterRequests = 0;
   const [{ ata: usdcAta }, { ata: solAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
   const account = (owner: string, data: string, space: number, lamports = 10_000_000) =>
     ({ owner, data: [data, 'base64'], executable: false, lamports, rentEpoch: 0, space });
@@ -56,6 +57,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   t.mock.method(globalThis, 'fetch', async (input: URL | RequestInfo, init?: RequestInit) => {
     const url = new URL(String(input));
     if (url.origin === 'https://api.jup.ag') {
+      jupiterRequests++;
       const params = url.searchParams;
       const inputMint = params.get('inputMint');
       const outputMint = params.get('outputMint');
@@ -154,17 +156,26 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   assert.ok(overBudget.routes.every((route) => route.status === 'simulated' && route.simulatedNetUsdc! > 0.2 && route.qualified === false));
 
   live = true;
+  jupiterRequests = 0;
   let submissions = 0;
-  const guarded = await scanSolanaCycle(config, async (candidate) => {
+  const guarded = await scanSolanaCycle({ ...config, venuePair: solanaVenuePairs[1] }, async (candidate) => {
     submissions++;
     assert.equal(candidate.feeLamports, 6400n);
     assert.equal(candidate.maximumLamportDebit, 6400n);
     assert.equal(candidate.simulationSlot, 42n);
     assert.ok(candidate.net >= 50_000n);
   });
+  assert.deepEqual(guarded.routes.map(({ buy, sell }) => [buy, sell]), [
+    ['Whirlpool', 'Meteora DLMM'], ['Meteora DLMM', 'Whirlpool'],
+  ]);
+  assert.equal(jupiterRequests, 4, 'query two legs in each direction for the selected venue pair');
   for (const route of guarded.routes) assert.equal(route.status, 'simulated', route.detail);
   assert.equal(submissions, 1, 'submit only the best qualifying guarded route');
   reportedFee = fee + 1;
-  const inconsistent = await scanSolanaCycle(config, async () => { assert.fail('Fee mismatch authorized a candidate'); });
+  const inconsistent = await scanSolanaCycle({ ...config, venuePair: solanaVenuePairs[2] },
+    async () => { assert.fail('Fee mismatch authorized a candidate'); }, 'guarded-test');
+  assert.deepEqual(inconsistent.routes.map(({ buy, sell }) => [buy, sell]), [
+    ['Whirlpool', 'Raydium CLMM'], ['Raydium CLMM', 'Whirlpool'],
+  ]);
   assert.ok(inconsistent.routes.every((route) => route.qualified === false));
 });

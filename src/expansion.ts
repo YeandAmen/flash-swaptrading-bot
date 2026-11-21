@@ -22,7 +22,9 @@ let loggedSignature: string | null = null;
 let loggedOutcome: string | null = null;
 const solanaTestSizes = [50, 250, 1000, 10] as const;
 const solanaProfitTestMultipliers = [1, 2, 5, 10] as const;
-const solanaLoanFractions = [1, 0.5, 1, 0.2] as const;
+// Coprime rotation lengths ensure each venue pair sees every loan size.
+const solanaLoanFractions = [1, 0.5, 1, 0.2, 1] as const;
+const solanaVenueRotation = [0, 1, 0, 2] as const;
 let solanaTestScans = 0;
 let solanaRegularScans = 0;
 let stopping = false;
@@ -45,7 +47,7 @@ async function poll(task: () => Promise<void>, delay: number, reportError: (text
 export function startExpansion() {
   if (arbitrum.enabled) void poll(() => arbitrum.scan(), 6_000, (error) => arbitrum.scanError(error));
   if (solanaEnabled) void poll(async () => {
-    const { scanSolanaCycle, solanaScanConfig } = await import('./solana/scan.js');
+    const { scanSolanaCycle, solanaScanConfig, solanaVenuePairs } = await import('./solana/scan.js');
     const config = solanaScanConfig();
     let liveError: string | null = null;
     if (solanaCanArm) {
@@ -71,7 +73,9 @@ export function startExpansion() {
         : Math.min(100_000, (test.minimumLoanUsd ?? 500) * solanaProfitTestMultipliers[solanaTestScans % solanaProfitTestMultipliers.length]);
       solanaTestScans += 1;
     } else if (config.loanUsdc !== undefined && config.loanUsdc >= 1 && config.loanUsdc <= 100_000) {
-      config.loanUsdc = Math.max(1, config.loanUsdc * solanaLoanFractions[solanaRegularScans++ % solanaLoanFractions.length]);
+      const scan = solanaRegularScans++;
+      config.venuePair = solanaVenuePairs[solanaVenueRotation[scan % solanaVenueRotation.length]];
+      config.loanUsdc = Math.max(1, config.loanUsdc * solanaLoanFractions[scan % solanaLoanFractions.length]);
     }
     solanaResult = await scanSolanaCycle(config, execution ? (candidate) => execution.submit(candidate) : undefined, test ?? undefined);
     if (test) execution?.recordTestScan(test.id, solanaResult.routes.length);
