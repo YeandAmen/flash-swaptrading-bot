@@ -263,6 +263,21 @@ try {
   assert.equal(lostProtectedSpread.journaled.length, 0);
   assert.equal(lostProtectedSpread.submitted.length, 0);
 
+  // With 187,500 padded gas, 310e12 wei can pay the full 0.25 gwei tip only for one block.
+  // A higher payout first allows the same tip for two blocks and then for all three.
+  for (const [proceeds, target] of [[310_000_000_000_000n, 101n], [330_000_000_000_000n, 102n], [coversGas, 103n]]) {
+    const ranked = await scan({ ...protectedInput, profit: proceeds, finalProfit: proceeds });
+    assert.equal(ranked.signed.length, 1);
+    assert.equal(ranked.submitted.length, 1);
+    assert.equal(ranked.submitted[0].privateSubmission, true);
+    assert.equal(ranked.submitted[0].target, target.toString(), 'keep the longest window that affords the selected tip');
+    const transaction = ranked.signed[0];
+    const signedOrder = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: transaction.data }).args[0];
+    assert.equal(transaction.maxPriorityFeePerGas, 250_000_000n);
+    assert.equal(signedOrder.maxBlock, target);
+    assert.equal(signedOrder.minProfit, transaction.gas * transaction.maxFeePerGas + 25_000_000_000_000n);
+  }
+
   const late = await scan({
     age: 31 * minute,
     profit: (symbol) => ['TEST0', 'TEST1', 'TEST2'].includes(symbol) ? underGas : coversGas,

@@ -1148,18 +1148,20 @@ export class MevSearcher {
         let affordableFees = gasOnly || !budgetFees ? budgetFees : affordableDirectFees(
           r.nextBaseFee, gas, budgetFees.maxPriorityFeePerGas, minimumTip, spendableProceeds - minimumNet, horizon,
         );
-        if (!affordableFees && privateLive && maxGasWei !== null) {
-          // Extra blocks consume base-fee headroom even when the next block is affordable.
+        if (privateLive && maxGasWei !== null && (!affordableFees || affordableFees.maxPriorityFeePerGas < ordinaryTip)) {
+          // Prefer longer validity when it can pay the same tip. A shorter window can free room
+          // for a more competitive priority fee within the same gas budget and profit floor.
           for (const shorter of [PRIVATE_DIRECT_WINDOW, DIRECT_WINDOW]) {
             const shorterBudget = affordableDirectFees(r.nextBaseFee, gas, ordinaryTip, minimumTip, maxGasWei, shorter);
             if (!shorterBudget) continue;
             budgetFees ??= shorterBudget;
-            affordableFees = affordableDirectFees(r.nextBaseFee, gas, shorterBudget.maxPriorityFeePerGas,
+            const shorterFees = affordableDirectFees(r.nextBaseFee, gas, shorterBudget.maxPriorityFeePerGas,
               minimumTip, spendableProceeds - minimumNet, shorter);
-            if (!affordableFees) continue;
+            if (!shorterFees || (affordableFees && shorterFees.maxPriorityFeePerGas <= affordableFees.maxPriorityFeePerGas)) continue;
+            affordableFees = shorterFees;
             horizon = shorter;
             target = r.blockNumber + BigInt(horizon);
-            break;
+            if (shorterFees.maxPriorityFeePerGas === ordinaryTip) break;
           }
         }
         if (!affordableFees && profitTest && privateSubmission && maxGasWei !== null) {
