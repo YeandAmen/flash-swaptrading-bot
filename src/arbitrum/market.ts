@@ -3,6 +3,7 @@ import {
   parseEther, zeroAddress, type Address,
 } from 'viem';
 import { arbitrum } from 'viem/chains';
+import { loanLimitWei } from '../mev/cadence.js';
 
 export const defaultArbitrumRpc = 'https://arb1.arbitrum.io/rpc';
 const alternateArbitrumReadRpc = 'https://arbitrum-one-rpc.publicnode.com';
@@ -34,6 +35,9 @@ const tokens = [
 ] as const;
 const tiers = [[100, 1], [500, 10], [3000, 60], [10000, 200]] as const;
 const amounts = ['0.05', '0.25', '1', '4', '16'].map((size) => parseEther(size));
+const explorationSizes = ['0.01', '0.1', '0.5', '2', '8', '32', '64'].map((size) => parseEther(size));
+const refinementRatios = [[3n, 2n], [3n, 4n], [2n, 1n], [1n, 2n]] as const;
+const quoteLeadMaxAge = 30_000;
 const profitTestAmounts = ['0.015', '0.05', '0.1', '0.25', '1', '4', '8', '16', '32', '64'].map((size) => parseEther(size));
 const testAmounts = ['0.0002', '0.0006', '0.0018', '0.005', '0.015', '0.05', '0.1', '0.25', '1', '4', '16'].map((size) => parseEther(size));
 const keyAbi = parseAbiParameters('address,address,uint24,int24,address');
@@ -63,6 +67,31 @@ export type ArbOrder = {
   amountIn: bigint; minProfit: bigint; tip: bigint; maxBlock: bigint;
 };
 export type ArbQuote = { order: ArbOrder; symbol: string; payout: bigint };
+type SizingLead = { amount: bigint; payout: bigint };
+type SampledQuote = SizingLead & { symbol: string };
+export type RecentArbitrumSizingLead = { amount: bigint; at: number };
+
+export function arbitrumProbeSize(scan: number, lead: RecentArbitrumSizingLead | null, now: number): bigint | undefined {
+  if (scan % 2 === 0) return undefined;
+  const extra = Math.floor(scan / 2);
+  const round = Math.floor(extra / 2);
+  const exploration = explorationSizes[round % explorationSizes.length];
+  // Keep the existing one extra size every other scan. Half of those slots explore independently of the quote signal.
+  if (extra % 2 === 1 || !lead || lead.at > now || now - lead.at > quoteLeadMaxAge) return exploration;
+  const [numerator, denominator] = refinementRatios[round % refinementRatios.length];
+  const refined = lead.amount * numerator / denominator;
+  return refined >= explorationSizes[0] && refined <= explorationSizes[explorationSizes.length - 1]
+    && !amounts.includes(refined) ? refined : exploration;
+}
+
+function betterSizingLead(amount: bigint, payout: bigint, current: SizingLead | null): boolean {
+  // Use small-loss quotes as size hints only where lender fees leave the route within two basis points of break-even.
+  if (payout < 0n && (amount < amounts[0] || payout * 5_000n < -amount)) return false;
+  if (!current) return true;
+  if (payout >= 0n || current.payout >= 0n) return payout > current.payout;
+  const byMargin = payout * current.amount - current.payout * amount;
+  return byMargin > 0n || (byMargin === 0n && amount > current.amount);
+}
 
 function poolKey(token: Address, pool: Pool) {
   const base = pool.nativeEth ? zeroAddress : weth;
@@ -114,7 +143,7 @@ export async function arbitrumEthUsd(client: ArbitrumClient, blockNumber?: bigin
 }
 
 export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[],
-  test: boolean | number = false, extraSize?: bigint) {
+  test: boolean | number = false, extraSize?: bigint, maxLoanUsd = 1_000_000) {
   const [premiumBps, config, available, ethUsd] = await Promise.all([
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'FLASHLOAN_PREMIUM_TOTAL', blockNumber }),
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'getConfiguration', args: [weth], blockNumber }),
@@ -123,10 +152,12 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
   ]);
   const active = (config & (1n << 56n)) !== 0n && (config & (1n << 60n)) === 0n && (config & (1n << 63n)) !== 0n;
   if (!active) throw new Error('Aave WETH flash loans are disabled');
-  const sizes = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
-    : test ? testAmounts : extraSize === undefined ? amounts : [...amounts, extraSize];
+  const usdLimit = loanLimitWei(maxLoanUsd, ethUsd) ?? 0n;
+  const ladder = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
+    : test ? testAmounts : extraSize === undefined || amounts.includes(extraSize) ? amounts : [...amounts, extraSize];
+  const sizes = ladder.filter((size) => size > 0n && size <= available && size <= usdLimit);
   const buys = markets.flatMap((market) => market.pools.flatMap((pool) =>
-    sizes.filter((size) => size <= available).map((size) => ({ market, pool, size }))));
+    sizes.map((size) => ({ market, pool, size }))));
   const bought = await client.multicall({
     blockNumber, batchSize: 6000, contracts: buys.map(({ market, pool, size }) => quote(market.token, pool, true, size)),
   });
@@ -139,12 +170,20 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     blockNumber, batchSize: 6000, contracts: sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)),
   });
   const opportunities: ArbQuote[] = [];
+  let bestQuote: SampledQuote | null = null;
+  let largestQuote: SampledQuote | null = null;
+  let sizingLead: SizingLead | null = null;
   let quotedRoutes = 0;
   for (const [i, { market, buy, sell, size }] of sells.entries()) {
     const received = sold[i].result?.[0] ?? 0n;
     if (received <= 0n) continue;
     quotedRoutes += 1;
     const payout = received - size - (size * premiumBps + 5_000n) / 10_000n;
+    if (!bestQuote || payout > bestQuote.payout) bestQuote = { symbol: market.symbol, amount: size, payout };
+    if (!largestQuote || size > largestQuote.amount || (size === largestQuote.amount && payout > largestQuote.payout)) {
+      largestQuote = { symbol: market.symbol, amount: size, payout };
+    }
+    if (betterSizingLead(size, payout, sizingLead)) sizingLead = { amount: size, payout };
     if (payout <= 0n) continue;
     opportunities.push({
       order: { funding: 1, token: market.token, buy, sell, amountIn: size, minProfit: 1n, tip: 0n, maxBlock: blockNumber + 10n },
@@ -153,8 +192,14 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
   }
   opportunities.sort((a, b) => a.payout > b.payout ? -1 : a.payout < b.payout ? 1 : 0);
   const best = opportunities[0];
+  const report = (quote: SampledQuote | null) => quote ? {
+    symbol: quote.symbol,
+    loanUsd: Number(formatEther(quote.amount)) * ethUsd,
+    payoutUsd: Number(formatEther(quote.payout)) * ethUsd,
+  } : null;
   return {
-    ethUsd, quotedRoutes, opportunities,
+    ethUsd, quotedRoutes, opportunities, sizingAmount: sizingLead?.amount,
     best: best ? { symbol: best.symbol, payoutUsd: Number(formatEther(best.payout)) * ethUsd } : null,
+    bestQuote: report(bestQuote), largestQuote: report(largestQuote),
   };
 }

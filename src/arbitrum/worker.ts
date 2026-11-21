@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { formatEther, isAddress, isAddressEqual, keccak256, parseEther, parseEventLogs, type Address, type Hash, type Hex } from 'viem';
-import { CONFIG, DATA_DIR } from '../config.js';
+import { formatEther, isAddress, isAddressEqual, keccak256, parseEventLogs, type Address, type Hash, type Hex } from 'viem';
+import { CONFIG, DATA_DIR, MEV } from '../config.js';
 import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest, type FlashTestOptions } from '../network-test.js';
 import { NetworkActivity } from '../network-activity.js';
 import { writeJson } from '../persistence.js';
@@ -11,7 +11,10 @@ import { broadcastArbitrum, type ArbitrumBroadcast } from './broadcast.js';
 import { verifyArbitrumExecutor, type ArbitrumExecutor } from './proxy.js';
 import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
 import { arbitrumTestLeads } from './test-leads.js';
-import { arbitrumChainId, arbitrumClient, arbitrumEthUsd, defaultArbitrumRpc, discoverArbitrumPools, scanArbitrum, type ArbQuote } from './market.js';
+import {
+  arbitrumChainId, arbitrumClient, arbitrumEthUsd, arbitrumProbeSize, defaultArbitrumRpc,
+  discoverArbitrumPools, scanArbitrum, type ArbQuote, type RecentArbitrumSizingLead,
+} from './market.js';
 
 const journalFile = path.join(DATA_DIR, 'arbitrum-trades.json');
 const haltedFile = path.join(DATA_DIR, 'arbitrum-disarmed.json');
@@ -19,7 +22,6 @@ const dayMs = 86400_000;
 const txLimitUsd = 0.50;
 const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
-const extraLoanSizes = ['0.01', '0.1', '0.5', '2', '8'].flatMap((size) => [undefined, parseEther(size)]);
 const preparationStatus: Record<ArbitrumOrderRejection, string> = {
   'daily-budget': 'Daily gas budget used',
   'net-floor': 'Prepared route did not meet the net profit floor',
@@ -64,6 +66,7 @@ export class ArbitrumWorker {
   private markets: Awaited<ReturnType<typeof discoverArbitrumPools>> = [];
   private refreshAfter = 0;
   private regularScans = 0;
+  private sizingLead: RecentArbitrumSizingLead | null = null;
   private verified = false;
   private executorCheckAt = 0;
   private journal: Journal | null = null;
@@ -93,6 +96,8 @@ export class ArbitrumWorker {
     canArm: this.enabled && this.executionEnabled,
     status: this.enabled ? 'Starting' : 'Disabled',
     block: 0, pools: 0, routes: 0, simulated: 0, updatedAt: 0, netEstimateUsd: null as number | null,
+    bestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['bestQuote'],
+    largestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['largestQuote'],
     preparationRejections: {} as Partial<Record<ArbitrumOrderRejection, number>>,
     executor: isAddress(this.contract) ? this.contract : null,
     balanceEth: null as string | null, pending: null as Hash | null, settled: null as Settlement | null,
@@ -188,6 +193,7 @@ export class ArbitrumWorker {
       this.summary.balanceEth = formatEther(await this.client.getBalance({ address: this.owner }));
     }
     if (this.journal?.pending) await this.reconcile();
+    const quoteAt = Date.now();
     const block = await this.client.getBlockNumber({ cacheTime: 0 });
     if (Date.now() >= this.refreshAfter) {
       const markets = await discoverArbitrumPools(this.client, block);
@@ -208,18 +214,25 @@ export class ArbitrumWorker {
         if (await this.tryOrders(leads, ethUsd, test)) return;
       }
     }
-    const extraSize = test ? undefined : extraLoanSizes[this.regularScans++ % extraLoanSizes.length];
+    const extraSize = test ? undefined : arbitrumProbeSize(this.regularScans++, this.sizingLead, Date.now());
     const result = await scanArbitrum(this.client, block, this.markets,
-      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize);
+      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize, MEV.maxLoanUsd);
     if (test) test.checked += result.quotedRoutes;
+    else this.sizingLead = result.sizingAmount === undefined ? null : { amount: result.sizingAmount, at: quoteAt };
     this.summary.block = Number(block);
     this.summary.pools = this.markets.reduce((sum, market) => sum + market.pools.length, 0);
     this.summary.routes = result.quotedRoutes;
     this.summary.updatedAt = Date.now();
+    this.summary.bestQuote = result.bestQuote;
+    this.summary.largestQuote = result.largestQuote;
     this.activity.recordScan(result.quotedRoutes, this.summary.updatedAt);
     if (this.journal?.pending) this.summary.status = receiptStatus(this.journal.pending.broadcast);
-    else if (!result.best) this.summary.status = 'No positive payout after loan fees';
-    else if (!this.summary.executor) this.summary.status = 'Flash payout quoted. Deploy executor to check full fees';
+    else if (!result.best) {
+      const best = result.bestQuote;
+      this.summary.status = best
+        ? `Best ${best.symbol} quote on a $${best.loanUsd.toFixed(2)} loan was ${best.payoutUsd < 0 ? '-' : ''}$${Math.abs(best.payoutUsd).toFixed(4)} after lender fee, before gas`
+        : 'No complete round-trip quote';
+    } else if (!this.summary.executor) this.summary.status = 'Flash payout quoted. Deploy executor to check full fees';
     else {
       this.summary.status = 'No fresh route passed padded gas and payout floor';
       await this.tryOrders(result.opportunities.slice(0, 3), result.ethUsd, test);

@@ -19,7 +19,7 @@ import { directCadence, extraRoutes, loanLimitWei } from './cadence.js';
 import { HeadBackfill } from './head-backfill.js';
 import { createHeadWake } from './head-wake.js';
 import { pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
-import { routeInputSizes } from './sizing.js';
+import { comparableRouteQuote, rankRouteNet, routeInputSizes, type RouteQuoteSample } from './sizing.js';
 import { NextVenueKind } from './next-pools.js';
 import { arbGas, bestCycle, buildStateReads, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
 import { MevUniverse } from './universe.js';
@@ -290,6 +290,7 @@ interface RouteCooldown {
 }
 
 const STRUCTURAL_REVERTS = new Set(['v2 factory', 'v3 factory', 'v4 key', 'pool parameters', 'same pool']);
+const REPEATED_SWAP_REVERTS = new Set(['tf', 'transfer failed', 'v3 deltas', 'v4 deltas', 'no token bought', 'no swap output']);
 const ROUTE_RETRY_MS = 30_000;
 const MAX_REVERT_RETRY_MS = 5 * 60_000;
 const MAX_REVERT_STREAK = 5;
@@ -329,7 +330,7 @@ export class MevSearcher {
   private contractReady = false;
   private armGeneration = 0;
   private cooldown = new Map<string, RouteCooldown>();
-  private previousSizes = new Map<string, { amount: bigint; at: number }>();
+  private routeQuotes = new Map<string, RouteQuoteSample & { amount: bigint; funding: RouteFunding }>();
   private stopping = false;
   private queuedTest: GasOnlyTest | null = null;
   private readonly startedAt = Date.now();
@@ -673,13 +674,16 @@ export class MevSearcher {
           testCandidates.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet, gasUnits });
         }
         if (cycle.profit <= gasEth * (broadenSizes ? 0.65 : 0.8)) continue;
-        const cd = this.cooldown.get(`${poolIdentity(A)}|${poolIdentity(B)}`);
+        const key = `${poolIdentity(A)}|${poolIdentity(B)}`;
+        const cd = this.cooldown.get(key);
         if (cd && now < cd.until && !estimateChanged(cycle.profit, cd)) {
           const retry = cd.gasRetry;
           const cadenceRetry = broadenSizes && retry?.cadenceAt !== undefined && now >= retry.cadenceAt;
           if (!cadenceRetry && (!retry || retry.profit - BigInt(retry.gasUnits) * nextMaxBase <= minimumNet)) continue;
         }
-        cands.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet, gasUnits });
+        const rank = rankRouteNet(cycle.profit, cycle.dx, gasUnits, gasPriceEth,
+          historical ? undefined : this.routeQuotes.get(key), now);
+        cands.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet: rank, gasUnits });
       }
     }
     if (historical) {
@@ -871,9 +875,9 @@ export class MevSearcher {
     const price = this.host.ethUsd();
     const limit = loanLimitWei(MEV.maxLoanUsd, price);
     if (limit === null || (test?.minimumLoanUsd !== undefined && !validPrice(price))) return null;
-    const previous = this.previousSizes.get(key);
-    const previousAmount = previous && Date.now() - previous.at < 10 * 60_000 ? previous.amount : undefined;
-    let sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previousAmount, limit, broadenSizes);
+    const sample = this.routeQuotes.get(key);
+    const previous = !test && sample && comparableRouteQuote(c.est, c.dx, sample, Date.now()) ? sample : undefined;
+    let sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previous?.amount, limit, broadenSizes);
     if (test?.minimumLoanUsd !== undefined && validPrice(price)) {
       const floor = BigInt(Math.ceil(test.minimumLoanUsd / price * 1e18));
       sizes = sizes.filter((amount) => amount >= floor);
@@ -881,7 +885,7 @@ export class MevSearcher {
     }
     if (!sizes.length) return null;
     const lenderOnlyTest = test?.requireGasCoverage === false && !test.privateSubmission && !test.publicFunctional;
-    const trials = fundingTrials(MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark)
+    const trials = fundingTrials(MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark, previous)
       .filter(({ funding }) => funding !== 0 || (!lenderOnlyTest && c.A.kind !== NextVenueKind.CurveTricrypto));
     if (!trials.length) return null;
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));
@@ -912,18 +916,25 @@ export class MevSearcher {
       const previousStreak = previousFailure && !estimateChanged(c.est, previousFailure) ? previousFailure.revertStreak ?? 0 : 0;
       // A provider error does not count as evidence that the route keeps reverting.
       const revertStreak = allReverted ? Math.min(previousStreak + 1, MAX_REVERT_STREAK) : undefined;
-      const delay = structuralFailure ? HOUR : Math.min(ROUTE_RETRY_MS * 2 ** ((revertStreak ?? 1) - 1), MAX_REVERT_RETRY_MS);
+      const repeatSwapFailure = (revertStreak ?? 0) >= 3
+        && sims.every((s) => !s.ok && REPEATED_SWAP_REVERTS.has(s.reason.toLowerCase()));
+      const delay = structuralFailure ? HOUR : repeatSwapFailure ? 15 * 60_000
+        : Math.min(ROUTE_RETRY_MS * 2 ** ((revertStreak ?? 1) - 1), MAX_REVERT_RETRY_MS);
       this.cooldown.set(key, { until: Date.now() + delay, est: c.est, grow: structuralFailure ? 3 : 1.5, revertStreak });
+      if (allReverted) this.routeQuotes.delete(key);
       opp.note = `simulation: ${sims.find((s) => !s.ok)?.reason ?? 'reverted'}`;
       this.record(opp);
       return null;
     }
     const b = best;
-    this.previousSizes.delete(key);
-    this.previousSizes.set(key, { amount: b.amount, at: Date.now() });
-    if (this.previousSizes.size > 512) {
-      const oldest = this.previousSizes.keys().next().value;
-      if (oldest !== undefined) this.previousSizes.delete(oldest);
+    if (!test) {
+      this.routeQuotes.delete(key);
+      this.routeQuotes.set(key, { amount: b.amount, funding: b.funding, at: Date.now(),
+        modelProfitEth: c.est, modelAmountEth: c.dx, proceedsEth: eth(b.profit), gasUnits: b.gasUnits });
+      if (this.routeQuotes.size > 512) {
+        const oldest = this.routeQuotes.keys().next().value;
+        if (oldest !== undefined) this.routeQuotes.delete(oldest);
+      }
     }
     const net = b.net;
     this.trackSim(eth(b.profit), eth(gasWei), c.t.token.symbol);

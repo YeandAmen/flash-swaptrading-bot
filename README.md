@@ -93,6 +93,8 @@ MEV pool reads use bounded batches pinned to the same block. If a batch fails va
 
 When the target block has enough time left, the live search can use one extra exact gas check for an alternate simulated amount or funding source, or for a route close to covering its estimated costs. The selected bundle still has to pass a final simulation with the signed gas limit and profit floor.
 
+Ethereum ranks routes using fresh pool state and recent execution simulations when comparable. A successful sample can carry a tested loan size and lender into the next scan. Repeated consistent swap failures are retried less often so other routes get simulation time.
+
 Live MEV can use a different bid after 30 minutes without a confirmed landing. Set `MEV_IDLE_MIN_NET_USD` to a positive floor such as `0.01` and `MEV_IDLE_BUILDER_TIP_PCT` to an after-gas share such as `0.80`. The bid is capped to leave the configured net minimum after gas. A confirmed settlement returns the bot to its normal policy. The idle settings default to the normal values.
 
 `MEV_IDLE_GAS_PADDING_PCT` controls the extra gas above the estimate while idle. It defaults to 25%. A smaller buffer can free room for the builder bid and can also leave less margin for changes in gas usage. The bot simulates using the exact gas limit before sending and budgets the full limit in the profit floor.
@@ -230,6 +232,8 @@ The upgrade deploys the new implementation and activates it in one transaction a
 
 With `ARBITRUM_LIVE=on` and global signing enabled, the worker submits qualifying routes after a pending-state simulation. Default limits are $0.50 per transaction, $2 over 24 hours and at least $0.05 modeled net after padded fees. An included revert still costs gas.
 
+Arbitrum uses same-block quotes at several loan sizes. Its additional size probe alternates between exploring a broader range up to 64 WETH and refining around a recent competitive quote. Quotes respect the configured USD loan cap and Aave's available liquidity. The dashboard reports the best quoted return after the lender fee and before gas, including losses.
+
 To test with fake funds, use an Arbitrum archive endpoint with state access at the selected L2 block.
 
 ```sh
@@ -253,6 +257,7 @@ For live Solana, set `ALLOW_LIVE_TRADING=on`, `SOLANA_LIVE=on`, and `SOLANA_WALL
 
 The default Solana minimum is 0.05 USDC after transaction fees and any in-transaction token-account rent. The default network fee ceiling is 0.00005 SOL per transaction and 0.002 SOL over 24 hours. The worker maintains a 0.015 SOL gas reserve. A transaction that lands and reverts can still pay its network fee.
 
+Set `SOLANA_LOAN_USDC` to cap regular loan sizing. The default is 250 USDC. The scanner measures each venue pair at small, intermediate and maximum sizes, with an additional rotation slot for refining near a fresh quote. Network fees and full execution simulation are checked before the worker can sign.
 
 The dashboard's Arbitrum One and Solana cards show each scanner's latest block or slot, deployment or program verification, recent route logs, and transaction receipts. Set `ARBITRUM_DEPLOYMENT_TX` to show the verified Arbitrum deployment receipt and timestamp.
 

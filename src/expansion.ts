@@ -5,6 +5,7 @@ import { NetworkActivity } from './network-activity.js';
 import { LIGHTHOUSE } from './solana/guard.js';
 import { JUPITER, KAMINO } from './solana/protocol.js';
 import { ArbitrumWorker } from './arbitrum/worker.js';
+import { SolanaMarketPlanner, type SolanaMarketProbe } from './solana/market.js';
 import type { SolanaScanResult } from './solana/scan.js';
 import type { SolanaLiveWorker } from './solana/worker.js';
 
@@ -23,14 +24,10 @@ let loggedOutcome: string | null = null;
 const solanaTestSizes = [1, 5, 10, 25, 50, 250, 1000] as const;
 const solanaBoundedLossTestSizes = [1, 5, 10] as const;
 const solanaProfitTestMultipliers = [1, 2, 3, 5, 10] as const;
-// Coprime rotation lengths ensure each venue pair sees every loan size.
-const solanaLoanFractions = [1, 0.5, 1, 0.2, 1] as const;
 const solanaVenueRotation = [0, 1, 0, 2] as const;
-const solanaQuoteMaxAgeMs = 60_000;
-type SolanaQuoteSample = { venue: number; loanUsdc: number; quotedNetUsdc: number; at: number };
-let recentSolanaQuotes: SolanaQuoteSample[] = [];
+let solanaMarket: SolanaMarketPlanner | undefined;
+let solanaMarketProbe: SolanaMarketProbe | null = null;
 let solanaTestScans = 0;
-let solanaRegularScans = 0;
 let stopping = false;
 const schedule = new Set<ReturnType<typeof setTimeout>>();
 
@@ -71,7 +68,7 @@ export function startExpansion() {
     const worker = solanaLive;
     const execution = !liveError && worker?.summary.armed && worker.summary.ready && !worker.summary.pending ? worker : null;
     const test = execution?.activeTest();
-    let regularVenue: number | undefined;
+    let probe: SolanaMarketProbe | undefined;
     if (test) {
       const scan = solanaTestScans++;
       config.venuePair = solanaVenuePairs[solanaVenueRotation[scan % solanaVenueRotation.length]];
@@ -80,17 +77,10 @@ export function startExpansion() {
         ? sizes[scan % sizes.length]
         : Math.min(100_000, test.minimumLoanUsd * solanaProfitTestMultipliers[scan % solanaProfitTestMultipliers.length]);
     } else if (config.loanUsdc !== undefined && config.loanUsdc >= 1 && config.loanUsdc <= 100_000) {
-      const scan = solanaRegularScans++;
-      const slot = scan % solanaVenueRotation.length;
-      const loanLimit = config.loanUsdc;
-      const freshAfter = Date.now() - solanaQuoteMaxAgeMs;
-      // Reuse the redundant pair slot for a fresh lead. The other slots preserve full pair coverage.
-      const lead = slot === 2 ? recentSolanaQuotes.reduce<SolanaQuoteSample | undefined>((best, sample) =>
-        sample.at >= freshAfter && sample.loanUsdc <= loanLimit && (!best || sample.quotedNetUsdc >= best.quotedNetUsdc)
-          ? sample : best, undefined) : undefined;
-      regularVenue = lead?.venue ?? solanaVenueRotation[slot];
-      config.venuePair = solanaVenuePairs[regularVenue];
-      config.loanUsdc = lead?.loanUsdc ?? Math.max(1, loanLimit * solanaLoanFractions[scan % solanaLoanFractions.length]);
+      solanaMarket ??= new SolanaMarketPlanner(solanaVenuePairs.length);
+      probe = solanaMarket.plan(config.loanUsdc, Date.now());
+      config.venuePair = solanaVenuePairs[probe.venue];
+      config.loanUsdc = probe.loanUsdc;
     }
     solanaResult = await scanSolanaCycle(config, execution ? (candidate) => execution.submit(candidate) : undefined, test ?? undefined);
     if (test) execution?.recordTestScan(test.id, solanaResult.routes.length);
@@ -98,16 +88,14 @@ export function startExpansion() {
       ? solanaResult.routes[0].detail ?? 'The venue quotes are unavailable' : null;
     solanaStatus = liveError ?? quoteFailure ?? (execution ? 'Guarded live scan completed' : 'Unsigned scan completed');
     solanaUpdatedAt = Date.now();
-    if (regularVenue !== undefined) {
-      const { loanUsdc, routes, checkedAt } = solanaResult;
-      const at = Date.parse(checkedAt);
-      recentSolanaQuotes = recentSolanaQuotes.filter((sample) =>
-        sample.at >= solanaUpdatedAt - solanaQuoteMaxAgeMs && !(sample.venue === regularVenue && sample.loanUsdc === loanUsdc));
+    if (probe) {
+      const { routes, checkedAt } = solanaResult;
       const quotes = routes.flatMap(({ status, quotedNetBeforeNetworkUsdc }) =>
         (status === 'below-profit-floor' || status === 'simulated') && quotedNetBeforeNetworkUsdc !== undefined
           && Number.isFinite(quotedNetBeforeNetworkUsdc) ? [quotedNetBeforeNetworkUsdc] : []);
-      if (quotes.length > 0) recentSolanaQuotes.push({ venue: regularVenue, loanUsdc, quotedNetUsdc: Math.max(...quotes), at });
+      solanaMarket?.record(probe, quotes.length > 0 ? Math.max(...quotes) : undefined, Date.parse(checkedAt));
     }
+    solanaMarketProbe = probe ?? null;
     solanaActivity.recordScan(solanaResult.routes.filter((route) => route.quotedNetBeforeNetworkUsdc !== undefined).length, solanaUpdatedAt);
     const status = worker?.summary;
     if (status?.ready && !verifiedGuardLogged) {
@@ -126,7 +114,9 @@ export function startExpansion() {
     }
     const routes = solanaResult.routes.map((route) =>
       `${route.buy} → ${route.sell}: ${route.detail ?? route.status}${route.quotedNetBeforeNetworkUsdc === undefined ? '' : ` (${route.quotedNetBeforeNetworkUsdc.toFixed(6)} USDC before network fees)`}`);
-    solanaActivity.record(quoteFailure || liveError ? 'warn' : 'info', `Slot ${solanaResult.slot}. ${routes.join(' | ') || solanaResult.status}.`);
+    const sizing = probe ? ' ' + probe.loanUsdc + ' USDC ' + probe.reason + ' probe.' : '';
+    const report = 'Slot ' + solanaResult.slot + '.' + sizing + ' ' + (routes.join(' | ') || solanaResult.status) + '.';
+    solanaActivity.record(quoteFailure || liveError ? 'warn' : 'info', report);
   }, solanaCanArm ? 12_000 : 30_000, (error) => {
     solanaStatus = error;
     solanaActivity.record('error', error);
@@ -141,6 +131,7 @@ export function expansionView() {
     execution: solanaLive?.summary ?? null,
     updatedAt: solanaUpdatedAt,
     result: solanaResult,
+    marketProbe: solanaMarketProbe,
     deployment: {
       address: null, owner: null, guardAddress: LIGHTHOUSE, lenderAddress: KAMINO, routerAddress: JUPITER,
       guardVerified: solanaLive?.summary.ready ?? false,

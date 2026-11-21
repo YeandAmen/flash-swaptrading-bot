@@ -65,8 +65,9 @@ try {
   const { mevReadClient } = await import('../dist/chain.js');
   const { CONFIG, MEV } = await import('../dist/config.js');
   const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
+  const { fundingTrials } = await import('../dist/mev/flash-arb.js');
   const { MevSearcher } = await import('../dist/mev/searcher.js');
-  const { routeInputSizes } = await import('../dist/mev/sizing.js');
+  const { rankRouteNet, routeInputSizes } = await import('../dist/mev/sizing.js');
   const now = Date.now();
   const cadence = (age, active = true) => directCadence(now, now - age, baseLimit, maxLimit, active);
 
@@ -88,6 +89,18 @@ try {
   assert.ok(cappedSizes.every((size) => size <= loanCap));
   assert.ok(routeInputSizes(10, true, undefined, loanCap, true).length
     > routeInputSizes(10, true, undefined, loanCap).length);
+  const sample = { at: now, modelProfitEth: 0.004, modelAmountEth: 10, proceedsEth: 0.001, gasUnits: 270_000 };
+  const net = (amount, when, quote = sample) => rankRouteNet(0.004, amount, 200_000, 1e-9, quote, when);
+  assert.ok(net(10, now + 12_000) < net(10, now, { ...sample, proceedsEth: 0.004 }));
+  assert.equal(net(10, now + 100_000), net(20, now + 12_000),
+    'stale samples and materially changed pool estimates both return to uncalibrated ranking');
+  const prior = { amount: 7n * oneEth, funding: 2 };
+  const sizes = routeInputSizes(10, true, prior.amount, loanCap);
+  const adaptiveTrials = fundingTrials('auto', sizes, true, true, prior);
+  assert.equal(adaptiveTrials.length, fundingTrials('auto', sizes, true, true).length);
+  assert.ok(adaptiveTrials.some(({ amount, funding }) => amount === prior.amount && funding === prior.funding));
+  assert.ok(fundingTrials('auto', cappedSizes, true, true, { amount: 510n * oneEth, funding: 2 })
+    .every(({ amount }) => amount <= loanCap));
 
   const [primary, repeated, second, third] = ['a', 'a', 'b', 'c'].map((token) => ({ token }));
   assert.deepEqual(extraRoutes([primary, repeated, second, third], [primary], 2, (route) => route.token), [second, third]);
@@ -139,7 +152,7 @@ try {
       return { ok: true, profit: typeof profit === 'function' ? profit(token.token.symbol) : profit };
     };
     mevReadClient.getFeeHistory = async ({ rewardPercentiles }) => {
-      assert.deepEqual(rewardPercentiles, [50, 75]);
+      assert.deepEqual(rewardPercentiles, [50, 90]);
       return { reward: [[100_000_000n, 300_000_000n]] };
     };
     mevReadClient.estimateGas = async ({ blockNumber }) => {
@@ -245,17 +258,17 @@ try {
   assert.equal(tooLateForTarget.signed.length, 0, 'a direct route needs a minimum lead before the next block');
   assert.equal(tooLateForTarget.journaled.length, 0);
 
-  // At $2,000/ETH, 187,500 padded gas costs $0.46875 at the faster fee and $0.4125 at the standard fee.
+  // At $2,000/ETH, the $0.43 ceiling allows at most 1.146666666 gwei for 187,500 padded gas.
   const standardPriority = await scan({ age: 31 * minute, profit: coversGas, maximumDirectGasUsd: 0.43 });
   assert.equal(standardPriority.submitted.length, 1);
-  assert.equal(standardPriority.signed[0].maxPriorityFeePerGas, 100_000_000n);
-  assert.equal(standardPriority.signed[0].maxFeePerGas, 1_100_000_000n);
+  assert.equal(standardPriority.signed[0].maxPriorityFeePerGas, 146_666_666n);
+  assert.equal(standardPriority.signed[0].maxFeePerGas, 1_146_666_666n);
 
   const thinProfit = 245_000_000_000_000n;
   const protectProfit = await scan({ age: 31 * minute, profit: thinProfit, finalProfit: thinProfit });
   assert.equal(protectProfit.submitted.length, 1);
-  assert.equal(protectProfit.signed[0].maxPriorityFeePerGas, 100_000_000n,
-    'the faster fee is skipped if it would eat into the configured profit floor');
+  assert.equal(protectProfit.signed[0].maxPriorityFeePerGas, 42_666_666n,
+    'priority is clipped to preserve both the modeled execution reserve and the configured profit floor');
 
   const directCapReached = await scan({ age: 31 * minute, profit: coversGas, maximumDirectGasUsd: 0.01 });
   assert.equal(directCapReached.signed.length, 0, 'next-block acceleration still honors the direct gas ceiling');

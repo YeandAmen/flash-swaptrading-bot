@@ -16,9 +16,9 @@ try {
     if (await client.getChainId() !== arbitrumChainId) throw new Error('RPC is not Arbitrum One');
     const block = await client.getBlockNumber({ cacheTime: 0 });
     const markets = await discoverArbitrumPools(client, block);
-    const { quotedRoutes, best } = await scanArbitrum(client, block, markets);
+    const { quotedRoutes, best, bestQuote, largestQuote } = await scanArbitrum(client, block, markets);
     console.log(JSON.stringify({ mode: 'paper', block: Number(block), markets: markets.length,
-      pools: markets.reduce((total, market) => total + market.pools.length, 0), quotedRoutes, best }, null, 2));
+      pools: markets.reduce((total, market) => total + market.pools.length, 0), quotedRoutes, best, bestQuote, largestQuote }, null, 2));
   } else {
     throw new Error('Use scan, quote, deploy, upgrade-quote, or upgrade');
   }

@@ -195,7 +195,13 @@ function renderArbitrum(arb) {
   networkMode('arbitrum', arb, canArm);
   const scanned = arb?.block > 0;
   const status = arb?.status || 'Arbitrum state unavailable.';
-  $('arbitrumStatus').textContent = status + (scanned ? networkAge(arb.updatedAt) : '');
+  const quote = arb?.bestQuote;
+  const quoteDetail = Number.isFinite(quote?.payoutUsd) && !status.startsWith('Best ')
+    ? ` · ${quote.symbol} ${networkUsd(quote.payoutUsd)} after lender fee, before gas on ${networkUsd(quote.loanUsd)}` : '';
+  const largestLoan = arb?.largestQuote?.loanUsd;
+  const depth = Number.isFinite(largestLoan) && largestLoan > (quote?.loanUsd ?? 0)
+    ? ` · Quoted loans up to ${usd(largestLoan, 0)}` : '';
+  $('arbitrumStatus').textContent = status + quoteDetail + depth + (scanned ? networkAge(arb.updatedAt) : '');
   $('arbitrumBlock').textContent = scanned ? networkNumber(arb.block) : '–';
   $('arbitrumRoutes').textContent = scanned ? networkNumber(arb.routes) : '–';
   $('arbitrumGas').textContent = networkGas(arb?.balanceEth, 'ETH');
@@ -238,7 +244,10 @@ function renderSolana(solana) {
   const status = completed && qualified !== undefined
     ? `${qualified} qualifying ${qualified === 1 ? 'route' : 'routes'}` : solana?.status;
   const principal = Number.isFinite(result?.loanUsdc) ? ` · ${networkGas(result.loanUsdc, 'USDC')} loan` : '';
-  $('solanaStatus').textContent = (status || 'Solana state unavailable.') + principal + networkAge(checkedAt);
+  const probe = solana?.marketProbe;
+  const sizeDetail = completed && probe && Number.isFinite(probe.maxLoanUsdc)
+    ? ` · ${probe.reason === 'refinement' ? 'Size refinement' : 'Depth scan'} · cap ${networkGas(probe.maxLoanUsdc, 'USDC')}` : '';
+  $('solanaStatus').textContent = (status || 'Solana state unavailable.') + principal + sizeDetail + networkAge(checkedAt);
   $('solanaSlot').textContent = result?.slot > 0 ? networkNumber(result.slot) : '–';
   $('solanaRoutes').textContent = routes ? networkNumber(routes.length) : '–';
   $('solanaGas').textContent = networkGas(result?.walletSol, 'SOL');
@@ -514,7 +523,7 @@ function render() {
     mevBody.innerHTML = (X.recent || []).length ? X.recent.map((o) => `<tr><td>${hm(o.t)}</td><td><b>${esc(o.symbol)}</b></td>
       <td class="why">${esc(o.buy)} → ${esc(o.sell)}${o.funding ? `<div class="sub">${esc(o.funding)}</div>` : ''}</td><td class="r">${o.sizeEth.toFixed(3)}</td><td class="r">${o.grossEth.toFixed(5)}</td>
       <td class="r">${o.gasEth.toFixed(5)}</td><td class="r ${cls(o.netEth)}">${o.netEth.toFixed(5)}</td>
-      <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
+      <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.gasOnlyTestId ? ' <span class="sub">Manual test</span>' : ''}${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
       <span class="why">${esc(o.note || '')}</span>${o.hash && (o.status === 'landed' || (o.submission?.kind === 'direct' && !S.forkMode)) ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}${submissionDetails(o.submission, openSubmissions)}</td></tr>`).join('')
       : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
   }

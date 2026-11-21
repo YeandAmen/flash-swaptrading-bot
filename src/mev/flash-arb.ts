@@ -29,7 +29,8 @@ export function decodeArbitrage(data: Hex): bigint {
 }
 
 /** Compare the reserve estimate and smallest trial for each lender. Explicit modes use the full grid. */
-export function fundingTrials(mode: MevFundingMode, sizes: bigint[], includeBalancer = false, includeSpark = false) {
+export function fundingTrials(mode: MevFundingMode, sizes: bigint[], includeBalancer = false, includeSpark = false,
+  previous?: { amount: bigint; funding: RouteFunding }) {
   if (mode === 'pool') return sizes.map((amount) => ({ funding: 0 as const, amount }));
   if (mode === 'aave') return sizes.map((amount) => ({ funding: 1 as const, amount }));
   if (mode === 'morpho') return sizes.map((amount) => ({ funding: 2 as const, amount }));
@@ -41,5 +42,10 @@ export function fundingTrials(mode: MevFundingMode, sizes: bigint[], includeBala
   const sources: RouteFunding[] = [0, 1, 2];
   if (includeBalancer) sources.push(3);
   if (includeSpark) sources.push(4);
-  return sources.flatMap((funding) => (funding === 0 ? sizes : lenderSizes).map((amount) => ({ funding, amount })));
+  return sources.flatMap((funding) => {
+    const fundedSizes = funding === 0 ? sizes
+      : previous?.funding === funding && previous.amount !== sizes[0] && sizes.includes(previous.amount)
+        ? [sizes[0], previous.amount] : lenderSizes;
+    return fundedSizes.map((amount) => ({ funding, amount }));
+  });
 }
