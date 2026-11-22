@@ -241,3 +241,70 @@ test('Arbitrum distributes the full audit without delaying eligible or unknown-p
   assert.equal(manual.spotReads, 0);
   assert.equal(manual.quotes.size, full.quotes.size / 5 * 11);
 });
+
+test('Arbitrum screens returns after the actual buy while retaining sizing leads, winners, and audit coverage', async () => {
+  const token = '0x0000000000000000000000000000000000000001';
+  const weth = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
+  const markets: Parameters<typeof scanArbitrum>[2] = [{
+    symbol: 'TEST', token, pools: [2, 3, 4, 5, 6].map((i) => ({
+      kind: 2, pool: `0x${String(i).padStart(40, '0')}` as Address, fee: 100 + i,
+      tickSpacing: 0, nativeEth: false,
+    })),
+  }];
+  const [buy, poor, near, winner, unknown] = markets[0].pools;
+  const size = parseEther('0.05');
+  const debt = size + size / 2_000n;
+  // The buy's slot0 price implies enough output for every known return, but its exact quote is much smaller.
+  const actualBuy = size * 1_000_500n / 9_000_000n;
+  const quotes = new Map([
+    [poor.fee, size / 3n], [near.fee, debt - size * 15n / 100_000n],
+    [winner.fee, debt + size / 1_000n], [unknown.fee, debt - size / 1_000n],
+  ]);
+  const returnFees: number[] = [];
+  const client = {
+    readContract: async ({ functionName }: { functionName: string }) => {
+      if (functionName === 'FLASHLOAN_PREMIUM_TOTAL') return 5n;
+      if (functionName === 'getConfiguration') return (1n << 56n) | (1n << 63n);
+      if (functionName === 'balanceOf') return size;
+      throw new Error('Unexpected contract read');
+    },
+    multicall: async ({ blockNumber, contracts }: { blockNumber: bigint; contracts: {
+      functionName: string; address: Address; args: [{ tokenIn: Address; fee: number; amountIn: bigint }];
+    }[] }) => {
+      assert.equal(blockNumber, 100n);
+      if (contracts[0].functionName === 'slot0') {
+        return contracts.map(({ address }) => address === unknown.pool ? { status: 'failure' } :
+          { status: 'success', result: [BigInt(markets[0].pools.findIndex((pool) => pool.pool === address) + 1) * 2n ** 96n] });
+      }
+      return contracts.map(({ args: [{ tokenIn, fee, amountIn }] }) => {
+        if (tokenIn === weth) return { status: 'success', result: [fee === buy.fee && amountIn === size ? actualBuy : 0n] };
+        assert.equal(amountIn, actualBuy);
+        returnFees.push(fee);
+        return { status: 'success', result: [quotes.get(fee)] };
+      });
+    },
+  } as unknown as ArbitrumClient;
+  const run = async (screen: Parameters<typeof scanArbitrum>[6], testMode = false) => {
+    returnFees.length = 0;
+    return scanArbitrum(client, 100n, markets, testMode, undefined, 100, screen, Promise.resolve(2_000));
+  };
+
+  const screened = await run({ auditScan: 1 });
+  assert.equal(screened.prunedAfterBuy, 1);
+  assert.deepEqual(returnFees, [near.fee, winner.fee, unknown.fee]);
+  assert.equal(screened.quotedRoutes, 3);
+  assert.deepEqual(screened.opportunities.map(({ order }) => order.sell.fee), [winner.fee]);
+
+  // A near miss remains available to size the next scan if the larger-spread sell stops winning.
+  quotes.set(winner.fee, size);
+  const sizing = await run(true);
+  assert.equal(sizing.sizingAmount, size);
+  assert.equal(sizing.opportunities.length, 0);
+
+  for (const [screen, testMode] of [[{ auditScan: 0 }, false], [false, false], [{ auditScan: 1 }, true]] as const) {
+    const full = await run(screen, testMode);
+    assert.equal(full.prunedAfterBuy, 0);
+    assert.deepEqual(returnFees, [poor.fee, near.fee, winner.fee, unknown.fee]);
+    assert.equal(full.quotedRoutes, 4);
+  }
+});

@@ -106,6 +106,40 @@ test('USDC lending requires a fresh oracle round while WETH remains independentl
   }
 });
 
+test('cached pools start same-block state reads while funding and shared ETH price are pending', async () => {
+  const source = fixture();
+  const stages: string[] = [];
+  let pauseFunding: Promise<void> | undefined;
+  const client = { multicall: async (request: { blockNumber: bigint; contracts: Request[] }) => {
+    assert.equal(request.blockNumber, block);
+    const stage = request.contracts[0].functionName;
+    stages.push(stage);
+    if (stage === 'balanceOf') await pauseFunding;
+    return source.multicall(request as Parameters<typeof source.multicall>[0]);
+  } } as unknown as ArbitrumClient;
+  const cold = await scanArbitrumPaths(client, block, 2000, 75);
+  const warmStages = stages.filter(stage => stage !== 'getPool').sort();
+  stages.length = 0;
+  let fund!: () => void;
+  pauseFunding = new Promise(resolve => { fund = resolve; });
+  let setPrice!: (price: number) => void;
+  const price = new Promise<number>(resolve => { setPrice = resolve; });
+  const run = scanArbitrumPaths(client, block, price, 75);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual([...stages].sort(), ['balanceOf', 'liquidity', 'slot0']);
+  fund();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual([...stages].sort(), ['balanceOf', 'liquidity', 'slot0'], 'sizing still waits for the shared price');
+  setPrice(2000);
+  assert.deepEqual(await run, cold);
+  assert.deepEqual(stages.sort(), warmStages, 'warm scan uses exactly the cold requests minus discovery');
+
+  stages.length = 0;
+  await assert.rejects(scanArbitrumPaths(client, block, Promise.reject(new Error('feed unavailable')), 75), /feed unavailable/);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.ok(stages.every(stage => !stage.startsWith('quote')));
+});
+
 test('unavailable or partially filled quote legs cannot complete a path', async () => {
   for (const mode of ['unavailable','partial'] as const) {
     const result = await scanArbitrumPaths(fixture(mode), block, 2000, 75);

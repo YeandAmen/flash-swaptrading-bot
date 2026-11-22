@@ -101,22 +101,34 @@ function quoteLeg(edge: Edge, amount: bigint) {
     args: [{ tokenIn: input, tokenOut: output, amountIn: amount, fee: pool.tier, sqrtPriceLimitX96: 0n }] } as const;
 }
 
-export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, ethUsd: number, maxLoanUsd: number) {
+export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, ethUsd: number | Promise<number>, maxLoanUsd: number) {
   const result = { opportunities: [] as ArbPathQuote[], best: null as { route: string; payoutUsd: number; loanUsd: number } | null, pools: 0, paths: 0, quotedRoutes: 0, unavailableLegs: 0 };
-  if (!Number.isFinite(ethUsd) || ethUsd <= 0 || !Number.isFinite(maxLoanUsd) || maxLoanUsd <= 0) return result;
-  const [pools, funding] = await Promise.all([
-    discoverPathPools(client, block),
+  if (!Number.isFinite(maxLoanUsd) || maxLoanUsd <= 0) {
+    await ethUsd;
+    return result;
+  }
+  if (typeof ethUsd === 'number' && (!Number.isFinite(ethUsd) || ethUsd <= 0)) return result;
+  // Pool reads depend on discovery alone. Start them as soon as the list is available,
+  // while this block's lender balances and shared ETH/USD oracle are still in flight.
+  const market = discoverPathPools(client, block).then(async pools => {
+    if (!pools.length) return { pools, prices: [], liquidity: [] };
+    const [prices, liquidity] = await Promise.all((['slot0', 'liquidity'] as const).map(functionName =>
+      client.multicall({ blockNumber: block, contracts: pools.map(({ pool }) => ({ address: pool, abi: poolAbi, functionName })) })));
+    return { pools, prices, liquidity };
+  });
+  const [{ pools, prices, liquidity }, funding, ethPrice] = await Promise.all([
+    market,
     client.multicall({ blockNumber: block, contracts: [
       { address: weth, abi: balanceAbi, functionName: 'balanceOf', args: [morpho] },
       { address: usdc, abi: balanceAbi, functionName: 'balanceOf', args: [morpho] },
       { address: usdcUsdFeed, abi: feedAbi, functionName: 'latestRoundData' },
       { address: '0xca11bde05977b3631167028862be2a173976ca11', abi: clockAbi, functionName: 'getCurrentBlockTimestamp' },
     ] }),
+    ethUsd,
   ]);
+  if (!Number.isFinite(ethPrice) || ethPrice <= 0) return result;
   result.pools = pools.length;
   if (!pools.length) return result;
-  const [prices, liquidity] = await Promise.all((['slot0', 'liquidity'] as const).map((functionName) =>
-    client.multicall({ blockNumber: block, contracts: pools.map(({ pool }) => ({ address: pool, abi: poolAbi, functionName })) })));
   const edges: Edge[] = [];
   for (const [i, pool] of pools.entries()) {
     const sqrt = prices[i]?.result;
@@ -135,7 +147,7 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
   type Trial = { path: Edge[]; asset: Address; symbol: 'WETH' | 'USDC'; usd: number; decimals: number; amountIn: bigint; out: bigint };
   let trials: Trial[] = [];
   for (const [i, asset] of [weth, usdc].entries()) {
-    const usd = i === 0 ? ethUsd : stableUsd;
+    const usd = i === 0 ? ethPrice : stableUsd;
     const available = funding[i].result as bigint | undefined;
     if (!available || !usd) continue;
     const decimals = i === 0 ? 18 : 6;

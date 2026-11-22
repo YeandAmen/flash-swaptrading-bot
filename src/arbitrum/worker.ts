@@ -108,7 +108,7 @@ export class ArbitrumWorker {
     canArm: this.enabled && this.executionEnabled,
     status: this.enabled ? 'Starting' : 'Disabled',
     block: 0, pools: 0, routes: 0, simulated: 0, updatedAt: 0, netEstimateUsd: null as number | null,
-    prunedRoutes: 0, unavailableLegs: 0, pathRoutes: 0, pathStatus: 'Awaiting implementation verification',
+    prunedRoutes: 0, prunedAfterBuy: 0, unavailableLegs: 0, pathRoutes: 0, pathStatus: 'Awaiting implementation verification',
     pathPools: 0, pathBlock: 0, pathMarkets: 0, pathUnavailable: 0,
     pathBest: null as { route: string; payoutUsd: number; loanUsd: number } | null,
     bestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['bestQuote'],
@@ -200,8 +200,7 @@ export class ArbitrumWorker {
     const release = this.deployment.releaseHash;
     const executable = this.deployment.verified && arbitrumSupportsPaths(release);
     const mode = executable ? 'Multi-hop' : 'Multi-hop observation (upgrade required)';
-    void price.then(async (usd) => {
-      const result = await this.scanPaths(this.client, block, usd, MEV.maxLoanUsd);
+    void Promise.all([price, this.scanPaths(this.client, block, price, MEV.maxLoanUsd)]).then(async ([usd, result]) => {
       if (!this.active || this.deployment.releaseHash !== release) return;
       this.summary.pathBlock = Number(block);
       this.summary.pathRoutes = result.quotedRoutes;
@@ -282,6 +281,7 @@ export class ArbitrumWorker {
     this.summary.pools = this.markets.reduce((sum, market) => sum + market.pools.length, 0);
     this.summary.routes = result.quotedRoutes;
     this.summary.prunedRoutes = result.prunedRoutes;
+    this.summary.prunedAfterBuy = result.prunedAfterBuy;
     this.summary.unavailableLegs = result.unavailableLegs;
     this.summary.updatedAt = Date.now();
     this.summary.bestQuote = result.bestQuote;
@@ -301,7 +301,7 @@ export class ArbitrumWorker {
     }
     const status = this.summary.status;
     if (result.unavailableLegs) this.summary.status += `. Partial scan, RPC unavailable for ${result.unavailableLegs} quote legs`;
-    const screened = result.prunedRoutes ? ` ${result.prunedRoutes} size and route combinations below the marginal repayment bound.` : '';
+    const screened = result.prunedRoutes ? ` ${result.prunedRoutes} routes screened out, ${result.prunedAfterBuy} after the buy quote.` : '';
     this.activity.record('info', `Block ${block}: ${result.quotedRoutes} two-swap quotes across ${this.summary.pools} pools, ${result.unavailableLegs} unavailable quote legs.${screened} ${this.summary.pathStatus}. ${status}.`, undefined, this.summary.updatedAt);
   }
 

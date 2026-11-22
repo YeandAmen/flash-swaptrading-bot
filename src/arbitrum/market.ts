@@ -115,9 +115,13 @@ export function arbitrumProbeSize(scan: number, lead: RecentArbitrumSizingLead |
     && !amounts.includes(refined) ? refined : exploration;
 }
 
+function qualifiesForSizing(amount: bigint, payout: bigint): boolean {
+  // Keep small-loss quotes as size hints within two basis points of break-even on the base ladder and above.
+  return payout >= 0n || (amount >= amounts[0] && payout * 5_000n >= -amount);
+}
+
 function betterSizingLead(amount: bigint, payout: bigint, current: SizingLead | null): boolean {
-  // Use small-loss quotes as size hints only where lender fees leave the route within two basis points of break-even.
-  if (payout < 0n && (amount < amounts[0] || payout * 5_000n < -amount)) return false;
+  if (!qualifiesForSizing(amount, payout)) return false;
   if (!current) return true;
   if (payout >= 0n || current.payout >= 0n) return payout > current.payout;
   const byMargin = payout * current.amount - current.payout * amount;
@@ -143,12 +147,16 @@ function ceilRatio(numerator: bigint, denominator: bigint) {
   return (numerator + denominator - 1n) / denominator;
 }
 
+function maxSellOutput(tokenAmount: bigint, sell: SpotRate) {
+  return ceilRatio(tokenAmount * sell.baseIn * (swapFeeScale - sell.lpFee), sell.tokenOut * swapFeeScale);
+}
+
 /** Swap rates are monotone along each hook-free curve. Use each starting price as an optimistic bound. */
 export function mayProfitAtArbitrumSpot(amount: bigint, premiumBps: bigint, buy?: SpotRate, sell?: SpotRate): boolean {
   if (!buy || !sell) return true;
   // Round up both legs to cover atomic pricing boundaries. Ignoring any protocol fee only raises the bound.
   const tokenOut = ceilRatio(amount * buy.tokenOut * (swapFeeScale - buy.lpFee), buy.baseIn * swapFeeScale);
-  const baseOut = ceilRatio(tokenOut * sell.baseIn * (swapFeeScale - sell.lpFee), sell.tokenOut * swapFeeScale);
+  const baseOut = maxSellOutput(tokenOut, sell);
   return baseOut > amount + flashPremium(amount, premiumBps);
 }
 
@@ -269,14 +277,23 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
       prunedRoutes++;
       return false;
     });
-    return sellPools.length ? [{ market, pool, size, sellPools }] : [];
+    return sellPools.length ? [{ market, pool, size, sellPools, auditSize }] : [];
   })));
   const bought = await quoteArbitrumPools(client, blockNumber,
     buys.map(({ market, pool, size }) => quote(market.token, pool, true, size)));
-  const sells = buys.flatMap(({ market, pool, size, sellPools }, i) => {
+  let prunedAfterBuy = 0;
+  const sells = buys.flatMap(({ market, pool, size, sellPools, auditSize }, i) => {
     const amount = bought[i].result?.[0] ?? 0n;
     if (amount <= 0n || amount >= 2n ** 128n) return [];
-    return sellPools.map((sell) => ({ market, buy: pool, sell, size, amount }));
+    const repayment = size + flashPremium(size, premiumBps);
+    return sellPools.flatMap((sell) => {
+      const rate = !auditSize && spotRates?.has(pool) ? spotRates.get(sell) : undefined;
+      if (rate && !qualifiesForSizing(size, maxSellOutput(amount, rate) - repayment)) {
+        prunedAfterBuy++;
+        return [];
+      }
+      return [{ market, buy: pool, sell, size, amount }];
+    });
   });
   const sold = await quoteArbitrumPools(client, blockNumber,
     sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)));
@@ -310,7 +327,8 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     payoutUsd: Number(formatEther(quote.payout)) * ethUsd,
   } : null;
   return {
-    ethUsd, quotedRoutes, prunedRoutes, unavailableLegs, opportunities, sizingAmount: sizingLead?.amount,
+    ethUsd, quotedRoutes, prunedRoutes: prunedRoutes + prunedAfterBuy, prunedAfterBuy, unavailableLegs,
+    opportunities, sizingAmount: sizingLead?.amount,
     best: best ? { symbol: best.symbol, payoutUsd: Number(formatEther(best.payout)) * ethUsd } : null,
     bestQuote: report(bestQuote), largestQuote: report(largestQuote),
   };
