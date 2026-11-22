@@ -9,8 +9,8 @@ A local Ethereum mainnet dashboard for Uniswap v3 spot strategies and two-pool a
 Install [Node.js 22 or later](https://nodejs.org/en/download), Git, and an Ethereum mainnet read RPC endpoint. Historical replay requires an archive-capable RPC. MEV paper simulation requires `eth_call` state overrides. For Windows PowerShell, use `npm.cmd` in place of `npm` if execution policy blocks the PowerShell npm shim.
 
 ```sh
-git clone https://github.com/cutiapreta/eth-token-bot.git
-cd eth-token-bot
+git clone https://github.com/cutiapreta/flash-swaptrading-bot.git
+cd flash-swaptrading-bot
 npm ci
 cp .env.example .env
 ```
