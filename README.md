@@ -164,6 +164,8 @@ Paper scanning is available after startup. The default `ALLOW_LIVE_TRADING=off` 
 
 The current Ethereum implementation can borrow WETH from Morpho Blue and execute a cycle of three or four swaps. For these cycles, the scanner also checks SushiSwap v3 and PancakeSwap v3 pools for selected WETH, WBTC and stablecoin pairs using each venue's Ethereum quoter. The scanner quotes each leg at the same block, checks the full transaction against the proxy, and applies the configured net profit floor and fee limits before signing. The dashboard shows the pools and exact quotes checked. Proxies running an older implementation can observe these routes and continue executing supported two-swap routes.
 
+For these Ethereum cycles, the scanner compares amounts between its standard loan sizes on the same pools. A promising intermediate amount can take one of the existing 12 exact-quote slots.
+
 Profitable trades repay the lender and forward proceeds and relevant route leftovers to the bot wallet in one transaction. Call the owner-only `sweep` function on the proxy to recover assets transferred to it outside a route.
 
 For maintainers, keep the trading owner in persistent slot zero, the execution lock in transient slot zero, and the existing execution and settlement interfaces compatible. Keep previously supported implementation runtimes in the bot's release list so existing proxies can still operate after a software update. Rebuild with solc 0.8.26, then verify the upgrade on a pinned Ethereum fork using fake funds.
@@ -240,6 +242,8 @@ With `ARBITRUM_LIVE=on` and global signing enabled, the worker submits qualifyin
 Arbitrum uses same-block quotes at several loan sizes. Every regular scan requests exact quotes for potentially profitable paths and paths with unavailable starting prices. Exact quote requests for routes below the marginal repayment bound are scheduled at the base loan sizes across ten regular scans. The standalone scan command and manual tests request quotes for the full enabled market. The additional size probe explores up to 64 WETH and refines around recent competitive quotes. Quotes respect the configured USD loan cap and Aave's available liquidity. The dashboard reports the best completed quote after the lender fee and before gas.
 
 The current Arbitrum implementation also supports three- and four-swap cycles funded by Morpho Blue in native USDC or WETH. The scanner checks Uniswap v3 and Aero Slipstream pools among WETH, USDC, ARB and USDG. The proxy repays the loan and sends the surplus in the borrowed token to the trading wallet. The dashboard shows completed quotes and the implementation status while older releases continue scanning.
+
+When the best fixed-size quote falls below the profit floor before gas, the scanner uses completed quotes on the same pools to estimate an intermediate loan size. It checks at most one extra size per borrowed asset against the same block. The dashboard compares the best quotes before gas. Live execution still requires at least $0.05 net after padded fees and the pending-state check.
 
 To test with fake funds, use an Arbitrum archive endpoint with state access at the selected L2 block.
 

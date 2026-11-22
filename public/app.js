@@ -210,8 +210,13 @@ function renderArbitrum(arb) {
   pathStatus.hidden = !arb?.pathStatus || arb.mode === 'off';
   const pathBlock = arb?.pathBlock > 0 ? ' · L2 block ' + networkNumber(arb.pathBlock) : '';
   const pathBest = Number.isFinite(arb?.pathBest?.payoutUsd)
-    ? ' · ' + arb.pathBest.route + ' ' + networkUsd(arb.pathBest.payoutUsd) + ' before gas' : '';
-  pathStatus.textContent = (arb?.pathStatus ?? '') + pathBlock + pathBest;
+    ? ' · ' + arb.pathBest.route + ' ' + networkUsd(arb.pathBest.payoutUsd) + ' before gas'
+      + (Number.isFinite(arb.pathBest.loanUsd) ? ' on a ' + networkUsd(arb.pathBest.loanUsd) + ' loan' : '') : '';
+  const sizing = arb?.pathRefinement;
+  const fixedBest = Number.isFinite(sizing?.bestPayoutUsd) && Number.isFinite(sizing?.baselineBestPayoutUsd)
+    && sizing.bestPayoutUsd > sizing.baselineBestPayoutUsd
+    ? ' · Best at fixed loan sizes was ' + networkUsd(sizing.baselineBestPayoutUsd) + ' before gas' : '';
+  pathStatus.textContent = (arb?.pathStatus ?? '') + pathBlock + pathBest + fixedBest;
   $('arbitrumBlock').textContent = scanned ? networkNumber(arb.block) : '–';
   $('arbitrumRoutes').textContent = scanned ? networkNumber(arb.routes) : '–';
   $('arbitrumGas').textContent = networkGas(arb?.balanceEth, 'ETH');

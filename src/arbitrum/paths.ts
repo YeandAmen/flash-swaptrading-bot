@@ -24,6 +24,7 @@ const assets = [weth, usdc, arb, usdg] as const;
 const symbols = new Map<Address, string>([[weth, 'WETH'], [usdc, 'USDC'], [arb, 'ARB'], [usdg, 'USDG']]);
 type Pool = { kind: 2 | 6; pool: Address; token0: Address; token1: Address; tier: number };
 type Edge = { pool: Pool; input: Address; output: Address; rate: number; inputDepth: number };
+type Trial = { path: Edge[]; asset: Address; symbol: 'WETH' | 'USDC'; usd: number; decimals: number; amountIn: bigint; out: bigint };
 const marketCache = new WeakMap<ArbitrumClient, { block: bigint; pools: Pool[] }>();
 export type ArbPathLeg = { kind: 2 | 6; pool: Address; tokenOut: Address; tickSpacing: number };
 export interface ArbPathQuote {
@@ -101,8 +102,52 @@ function quoteLeg(edge: Edge, amount: bigint) {
     args: [{ tokenIn: input, tokenOut: output, amountIn: amount, fee: pool.tier, sqrtPriceLimitX96: 0n }] } as const;
 }
 
-export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, ethUsd: number | Promise<number>, maxLoanUsd: number) {
-  const result = { opportunities: [] as ArbPathQuote[], best: null as { route: string; payoutUsd: number; loanUsd: number } | null, pools: 0, paths: 0, quotedRoutes: 0, unavailableLegs: 0 };
+async function optionalQuotes<T>(request: Promise<T[]>, deadline: number): Promise<T[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([request.catch(() => []), new Promise<T[]>(resolve => {
+      timer = setTimeout(() => resolve([]), Math.max(0, deadline - Date.now()));
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function refineSizes(completed: Trial[], baseline: Trial[], minimumNetUsd: number) {
+  const bestExact = new Map<Address, bigint>();
+  for (const t of completed) {
+    const payout = t.out - t.amountIn;
+    if (payout > (bestExact.get(t.asset) ?? 0n)) bestExact.set(t.asset, payout);
+  }
+  const previous = new Map<Edge[], Trial>();
+  const best = new Map<Address, { trial: Trial; estimated: bigint }>();
+  // Samples of each exact pool sequence arrive in ascending loan order.
+  for (const upper of completed) {
+    const lower = previous.get(upper.path);
+    previous.set(upper.path, upper);
+    if (!lower) continue;
+    const x = lower.amountIn, y = upper.amountIn;
+    const p = lower.out - x, q = upper.out - y;
+    // Fit payout(s) = a*s - b*s² through zero and the two exact payouts.
+    // The common denominator is x*y*(y-x). Only test an interior maximum.
+    const b = p * y - q * x;
+    if (b <= 0n || y <= x) continue;
+    const a = p * y * (y - x) + b * x;
+    const amountIn = a / (2n * b);
+    if (amountIn <= x || amountIn >= y || baseline.some(t => t.path === upper.path && t.amountIn === amountIn)) continue;
+    const estimated = amountIn * (a - b * amountIn) / (x * y * (y - x));
+    if (estimated <= (bestExact.get(upper.asset) ?? 0n) || estimated <= (best.get(upper.asset)?.estimated ?? 0n)) continue;
+    if (Number(formatUnits(estimated, upper.decimals)) * upper.usd < minimumNetUsd) continue;
+    best.set(upper.asset, { trial: { ...upper, amountIn, out: amountIn }, estimated });
+  }
+  return [...best.values()].map(({ trial }) => trial);
+}
+
+export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, ethUsd: number | Promise<number>, maxLoanUsd: number, minimumNetUsd = 0.05) {
+  const startedAt = Date.now();
+  const refinement = { tried: 0, quoted: 0, bestPayoutUsd: null as number | null, baselineBestPayoutUsd: null as number | null };
+  const result = { opportunities: [] as ArbPathQuote[], best: null as { route: string; payoutUsd: number; loanUsd: number } | null,
+    pools: 0, paths: 0, quotedRoutes: 0, unavailableLegs: 0, refinement };
   if (!Number.isFinite(maxLoanUsd) || maxLoanUsd <= 0) {
     await ethUsd;
     return result;
@@ -144,8 +189,7 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
   const feed = funding[2].result;
   const now = funding[3].result;
   const stableUsd = now && feed && feed[1] > 0n && feed[3] <= now && now - feed[3] <= 3600n && feed[4] >= feed[0] ? Number(feed[1]) / 1e8 : 0;
-  type Trial = { path: Edge[]; asset: Address; symbol: 'WETH' | 'USDC'; usd: number; decimals: number; amountIn: bigint; out: bigint };
-  let trials: Trial[] = [];
+  const baseline: Trial[] = [];
   for (const [i, asset] of [weth, usdc].entries()) {
     const usd = i === 0 ? ethPrice : stableUsd;
     const available = funding[i].result as bigint | undefined;
@@ -161,37 +205,69 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
     const selectedPaths = new Set<Edge[]>();
     for (const amountIn of amounts) for (const { path } of shortlist(cycles, amountIn, block)) {
       selectedPaths.add(path);
-      trials.push({ path, asset, symbol, usd, decimals, amountIn, out: amountIn });
+      baseline.push({ path, asset, symbol, usd, decimals, amountIn, out: amountIn });
     }
     result.paths += selectedPaths.size;
   }
-  for (let hop = 0; trials.length && hop < 4; hop++) {
-    const keys = trials.map((t) => t.path[hop].pool.pool + '/' + t.path[hop].input + '/' + t.out);
-    const reads = new Map(keys.map((key, i) => [key, quoteLeg(trials[i].path[hop], trials[i].out)]));
-    const rows = await client.multicall({ blockNumber: block, batchSize: 900, contracts: [...reads.values()] });
-    const replies = new Map([...reads.keys()].map((key, i) => [key, rows[i]]));
-    trials = trials.filter((trial, i) => {
-      const quoted = replies.get(keys[i])?.result;
-      if (!quoted || quoted[0] <= 0n) { if (!quoted) result.unavailableLegs++; return false; }
-      // Reject a partial concentrated-liquidity fill stopped at the tick range boundary.
-      if (quoted[1] <= 4295128740n || quoted[1] >= 1461446703485210103287273052203988822378723970341n) return false;
-      trial.out = quoted[0];
-      if (hop + 1 < trial.path.length) return true;
-      result.quotedRoutes++;
-      const payout = trial.out - trial.amountIn;
-      const payoutUsd = Number(formatUnits(payout, trial.decimals)) * trial.usd;
-      const loanUsd = Number(formatUnits(trial.amountIn, trial.decimals)) * trial.usd;
-      const label = [trial.symbol, ...trial.path.map((leg) => symbols.get(leg.output))].join(' → ');
-      if (!result.best || payoutUsd > result.best.payoutUsd) result.best = { route: label, payoutUsd, loanUsd };
-      if (payout > 0n) {
-        const legs = trial.path.map(({ pool, output }) => ({ kind: pool.kind, pool: pool.pool,
-          tokenOut: output, tickSpacing: pool.kind === 6 ? pool.tier : 0 }));
-        result.opportunities.push({ asset: trial.asset, symbol: trial.symbol, assetUsd: trial.usd,
-          decimals: trial.decimals, amountIn: trial.amountIn, payout, legs, block,
-          payoutUsd, loanUsd, label });
+  const completed: Trial[] = [];
+  const quotedLegs = new Map<string, readonly [bigint, bigint] | undefined>();
+  for (const refining of [false, true]) {
+    let trials = baseline;
+    let deadline: number | undefined;
+    if (refining) {
+      // Hand an already qualifying base quote straight to preparation.
+      if (refinement.baselineBestPayoutUsd === null || refinement.baselineBestPayoutUsd >= minimumNetUsd) break;
+      deadline = Math.min(startedAt + 10_000, Date.now() + 1500);
+      if (Date.now() >= deadline) break;
+      trials = refineSizes(completed, baseline, minimumNetUsd);
+      refinement.tried = trials.length;
+    }
+    for (let hop = 0; trials.length && hop < 4; hop++) {
+      if (deadline !== undefined && Date.now() >= deadline) break;
+      const keys = trials.map(t => t.path[hop].pool.pool + '/' + t.path[hop].input + '/' + t.out);
+      const reads = new Map<string, ReturnType<typeof quoteLeg>>();
+      for (const [i, t] of trials.entries()) {
+        if (!quotedLegs.has(keys[i]) && !reads.has(keys[i])) reads.set(keys[i], quoteLeg(t.path[hop], t.out));
       }
-      return false;
-    });
+      if (reads.size) {
+        const req = client.multicall({ blockNumber: block, batchSize: 900, contracts: [...reads.values()] });
+        const rows = deadline === undefined ? await req : await optionalQuotes(req, deadline);
+        if (deadline !== undefined && Date.now() >= deadline) break;
+        for (const [i, key] of [...reads.keys()].entries()) {
+          const output = rows[i]?.result;
+          quotedLegs.set(key, output ? [output[0], output[1]] : undefined);
+        }
+      }
+      trials = trials.filter((trial, i) => {
+        const quoted = quotedLegs.get(keys[i]);
+        if (!quoted || quoted[0] <= 0n) { if (!quoted) result.unavailableLegs++; return false; }
+        // Reject a partial concentrated-liquidity fill stopped at the tick range boundary.
+        if (quoted[1] <= 4295128740n || quoted[1] >= 1461446703485210103287273052203988822378723970341n) return false;
+        trial.out = quoted[0];
+        if (hop + 1 < trial.path.length) return true;
+        result.quotedRoutes++;
+        const payout = trial.out - trial.amountIn;
+        const payoutUsd = Number(formatUnits(payout, trial.decimals)) * trial.usd;
+        const loanUsd = Number(formatUnits(trial.amountIn, trial.decimals)) * trial.usd;
+        const label = [trial.symbol, ...trial.path.map((leg) => symbols.get(leg.output))].join(' → ');
+        if (refining) {
+          refinement.quoted++;
+          if (refinement.bestPayoutUsd === null || payoutUsd > refinement.bestPayoutUsd) refinement.bestPayoutUsd = payoutUsd;
+        } else {
+          completed.push(trial);
+          if (refinement.baselineBestPayoutUsd === null || payoutUsd > refinement.baselineBestPayoutUsd) refinement.baselineBestPayoutUsd = payoutUsd;
+        }
+        if (!result.best || payoutUsd > result.best.payoutUsd) result.best = { route: label, payoutUsd, loanUsd };
+        if (payout > 0n) {
+          const legs = trial.path.map(({ pool, output }) => ({ kind: pool.kind, pool: pool.pool,
+            tokenOut: output, tickSpacing: pool.kind === 6 ? pool.tier : 0 }));
+          result.opportunities.push({ asset: trial.asset, symbol: trial.symbol, assetUsd: trial.usd,
+            decimals: trial.decimals, amountIn: trial.amountIn, payout, legs, block,
+            payoutUsd, loanUsd, label });
+        }
+        return false;
+      });
+    }
   }
   result.opportunities.sort((a, b) => b.payoutUsd - a.payoutUsd);
   return result;

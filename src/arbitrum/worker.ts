@@ -116,6 +116,7 @@ export class ArbitrumWorker {
     pathRoutes: 0, pathStatus: 'Awaiting implementation verification',
     pathPools: 0, pathBlock: 0, pathMarkets: 0, pathUnavailable: 0,
     pathBest: null as { route: string; payoutUsd: number; loanUsd: number } | null,
+    pathRefinement: null as Awaited<ReturnType<typeof scanArbitrumPaths>>['refinement'] | null,
     bestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['bestQuote'],
     largestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['largestQuote'],
     preparationRejections: {} as Partial<Record<ArbitrumOrderRejection, number>>,
@@ -205,7 +206,7 @@ export class ArbitrumWorker {
     const release = this.deployment.releaseHash;
     const executable = this.deployment.verified && arbitrumSupportsPaths(release);
     const mode = executable ? 'Multi-hop' : 'Multi-hop observation (upgrade required)';
-    void Promise.all([price, this.scanPaths(this.client, block, price, MEV.maxLoanUsd)]).then(async ([usd, result]) => {
+    void Promise.all([price, this.scanPaths(this.client, block, price, MEV.maxLoanUsd, minNetUsd)]).then(async ([usd, result]) => {
       if (!this.active || this.deployment.releaseHash !== release) return;
       this.summary.pathBlock = Number(block);
       this.summary.pathRoutes = result.quotedRoutes;
@@ -213,6 +214,7 @@ export class ArbitrumWorker {
       this.summary.pathMarkets = result.paths;
       this.summary.pathUnavailable = result.unavailableLegs;
       this.summary.pathBest = result.best;
+      this.summary.pathRefinement = result.refinement;
       this.summary.pathStatus = `${mode}: ${result.quotedRoutes} complete quotes across ${result.pools} pools`
         + (result.unavailableLegs ? `, ${result.unavailableLegs} unavailable legs` : '');
       this.activity.recordScan(result.quotedRoutes, Date.now());
@@ -223,6 +225,7 @@ export class ArbitrumWorker {
     }).catch(() => {
       this.summary.pathBlock = Number(block);
       this.summary.pathBest = null;
+      this.summary.pathRefinement = null;
       this.summary.pathStatus = `${mode}: quotes unavailable`;
     }).finally(() => { this.readingPaths = false; });
   }

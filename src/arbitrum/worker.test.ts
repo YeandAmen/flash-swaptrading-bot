@@ -12,6 +12,7 @@ const { arbitrumReleaseHash, arbitrumPinnedCall } = await import('./proxy.js');
 const token = '0x0000000000000000000000000000000000000001';
 const contract = '0x0000000000000000000000000000000000000002';
 const head = 100n;
+const noRefinement = { tried: 0, quoted: 0, bestPayoutUsd: null, baselineBestPayoutUsd: null };
 const quote: ArbPathQuote = { asset: token, symbol: 'USDC', decimals: 6, assetUsd: 1, amountIn: 50_000_000n,
   payout: 1_000_000n, payoutUsd: 1, loanUsd: 50, block: head, label: 'USDC cycle',
   legs: ([token, contract, token] as const).map(pool => ({ kind: 2, pool, tokenOut: contract, tickSpacing: 0 })) };
@@ -28,7 +29,7 @@ test('partial pool discovery preserves verified pools, includes new ones and ret
   let block = 100n;
   const factoryBlocks: bigint[] = [];
   const worker = new ArbitrumWorker(async () => ({
-    opportunities: [], best: null, pools: 0, paths: 0, quotedRoutes: 0, unavailableLegs: 0,
+    opportunities: [], best: null, pools: 0, paths: 0, quotedRoutes: 0, unavailableLegs: 0, refinement: noRefinement,
   }));
   const client = {
     getBlockNumber: async () => block,
@@ -99,7 +100,8 @@ function fixture(options: { simulate?: boolean; unavailable?: boolean } = {}) {
   const worker = new ArbitrumWorker(async () => {
     observations++;
     await foundPaths.promise;
-    return { opportunities: observations === 1 ? [quote] : [], best: null, pools: 4, paths: 1, quotedRoutes: 1, unavailableLegs: 0 };
+    return { opportunities: observations === 1 ? [quote] : [], best: null, pools: 4, paths: 1, quotedRoutes: 1,
+      unavailableLegs: 0, refinement: noRefinement };
   });
   const journal: { pending: object | null; recent: never[]; test?: object } = { pending: null, recent: [] };
   const deployment = { releaseHash: arbitrumReleaseHash, kind: 'proxy', verified: true };
@@ -175,6 +177,7 @@ test('a profitable path starts preparation while the two-swap scan waits, and bo
   await scan;
   assert.ok(f.preparations.includes('two-swap'));
   assert.equal(f.peak(), 1);
+  assert.deepEqual(f.worker.view().pathRefinement, noRefinement);
 });
 
 test('when the two-swap batch is already preparing, the later positive path is consumed exactly once', async () => {

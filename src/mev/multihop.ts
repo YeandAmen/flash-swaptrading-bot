@@ -50,6 +50,11 @@ const compare = (a: bigint, b: bigint) => a < b ? 1 : a > b ? -1 : 0;
 const modeledGas = (hops: number) => 155_000n + BigInt(hops) * 65_000n;
 const tokenKey = (edges: PathEdge[]) => edges.map(e => e.hop.tokenOut).join('/');
 
+function edgeKey(edge: PathEdge) {
+  const { kind, pool, fee, tickSpacing, nativeEth, tokenOut } = edge.hop;
+  return [edge.tokenIn, tokenOut, kind, pool, fee, tickSpacing, nativeEth].join('/').toLowerCase();
+}
+
 function cpOut(edge: PathEdge, amount: bigint) {
   const input = amount * (million - edge.fee);
   return edge.reserveOut * input / (million * edge.reserveIn + input);
@@ -69,10 +74,28 @@ function outputLimit(edge: PathEdge, first: PathEdge | undefined, loan: bigint) 
   return edge.outputBalance + (replenished ? loan : 0n);
 }
 
+function extendTrial(part: Trial, edge: PathEdge): Trial {
+  const modeled = cpOut(edge, part.amountOut);
+  // V2 reserves determine the exact monotone output. Concentrated pools may cross ticks.
+  const upper = isPathV3(edge.hop.kind) || edge.hop.kind === 5 ? marginalOut(edge, part.upper) : cpOut(edge, part.upper);
+  const limit = outputLimit(edge, part.edges[0], part.amountIn);
+  return { edges: [...part.edges, edge], amountIn: part.amountIn,
+    amountOut: limit === undefined ? modeled : min(modeled, limit),
+    upper: limit === undefined ? upper : min(upper, limit) };
+}
+
+function modelPath(edges: PathEdge[], amountIn: bigint) {
+  return edges.reduce<Trial>(extendTrial, { edges: [], amountIn, amountOut: amountIn, upper: amountIn });
+}
+
 /** Simple token cycles ensure no physical pool is quoted twice against its pre-swap state. */
 function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan) {
   const graph = new Map<Address, Map<Address, PathEdge[]>>();
+  const seenEdges = new Set<string>();
   for (const edge of edges) {
+    const key = edgeKey(edge);
+    if (seenEdges.has(key)) continue;
+    seenEdges.add(key);
     const destinations = graph.get(edge.tokenIn) ?? new Map<Address, PathEdge[]>();
     graph.set(edge.tokenIn, destinations);
     const out = destinations.get(edge.hop.tokenOut) ?? [];
@@ -112,15 +135,7 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
       for (const amountIn of viable ? loans : [referenceSize]) {
         let variants: Trial[] = [{ edges: [], amountIn, amountOut: amountIn, upper: amountIn }];
         for (const venues of path) {
-          const next = variants.flatMap(part => venues.map(edge => {
-            const modeled = cpOut(edge, part.amountOut);
-            // V2 reserves determine the exact monotone output. Concentrated pools may cross ticks.
-            const upper = isPathV3(edge.hop.kind) || edge.hop.kind === 5 ? marginalOut(edge, part.upper) : cpOut(edge, part.upper);
-            const limit = outputLimit(edge, part.edges[0], amountIn);
-            return { edges: [...part.edges, edge], amountIn,
-              amountOut: limit === undefined ? modeled : min(modeled, limit),
-              upper: limit === undefined ? upper : min(upper, limit) };
-          }));
+          const next = variants.flatMap(part => venues.map(edge => extendTrial(part, edge)));
           next.sort((a, b) => compare(a.amountOut, b.amountOut) || compare(a.upper, b.upper));
           variants = next.slice(0, 2);
         }
@@ -150,9 +165,40 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
   if (reference && !chosen.includes(reference)) chosen.push(reference);
   const four = references.get(4);
   if (four && (audit || !trials.length) && !chosen.includes(four)) chosen.push(four);
+  const reserved = chosen.length;
   for (const trial of trials) {
     if (chosen.length >= maxTrials) break;
     if (!chosen.includes(trial)) chosen.push(trial);
+  }
+  // Search the gaps next to shortlisted sizes on the same concrete pools. Only
+  // exact-quote an interior size if its modeled net beats both endpoints and the floor.
+  let interior: Trial | undefined;
+  const intervals = new Set<string>();
+  for (const seed of chosen) {
+    const i = loans.indexOf(seed.amountIn);
+    const path = seed.edges.map(edgeKey).join('|');
+    for (const neighbor of [i - 1, i + 1]) {
+      if (neighbor < 0 || neighbor >= loans.length) continue;
+      const low = loans[Math.min(i, neighbor)];
+      const key = path + ':' + low;
+      if (intervals.has(key)) continue;
+      intervals.add(key);
+      const gap = loans[Math.max(i, neighbor)] - low;
+      if (gap < 3n) continue;
+      const other = modelPath(seed.edges, loans[neighbor]);
+      const endpointNet = score(seed) > score(other) ? score(seed) : score(other);
+      for (const offset of [gap / 3n, 2n * gap / 3n]) {
+        const candidate = modelPath(seed.edges, low + offset);
+        if (candidate.upper < candidate.amountIn + floor) continue;
+        const net = score(candidate);
+        if (net >= scan.minNetWei && net > endpointNet && (!interior || net > score(interior))) interior = candidate;
+      }
+    }
+  }
+  if (interior) {
+    const last = chosen.length - 1;
+    if (chosen.length < maxTrials) chosen.push(interior);
+    else if (last >= reserved && score(interior) > score(chosen[last])) chosen[last] = interior;
   }
   return { cycles, trials: chosen };
 }

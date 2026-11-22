@@ -159,11 +159,63 @@ test('finite V2 exits prune impossible amounts while a near-even reference gets 
   assert.ok(small.candidates.every(quote => quote.amountIn < parseEther('0.05') && quote.grossProfit > 0n));
 });
 
+test('an interior loan size clears the retained floor on the same three pool states', async () => {
+  const first = edge(WETH, a, 2), middle = edge(a, b, 0), exit = edge(b, WETH, 0);
+  for (const [pool, input, output, fee] of [
+    [first, '10', '10.266', 500], [middle, '10000000', '10000000', 3000], [exit, '10000000', '10000000', 3000],
+  ] as const) {
+    pool.reserveIn = pool.rateD = parseEther(input);
+    pool.reserveOut = pool.rateN = parseEther(output);
+    pool.hop.fee = pool.pool.fee = fee;
+    pool.fee = BigInt(fee);
+  }
+  const amounts: bigint[] = [];
+  let calls = 0;
+  let payoutPct = 100n;
+  const reader = client((rows, block) => {
+    calls++;
+    return rows.map((row, i) => {
+      if (!i) return block;
+      const { amountIn } = row.args![0] as { amountIn: bigint };
+      amounts.push(amountIn);
+      const paid = amountIn * (1_000_000n - first.fee);
+      return [first.reserveOut * paid / (first.reserveIn * 1_000_000n + paid) * payoutPct / 100n, 1n << 96n];
+    });
+  });
+  const markets = [first, middle, exit];
+  const run = (cap: string, edges = markets) => quoteEthereumPaths({
+    ...settings(), minNetWei: parseEther('0.00085'), maxLoanWei: parseEther('512'),
+  }, reader, edges, parseEther(cap), labels);
+  const sized = await run('0.2');
+  assert.deepEqual(amounts.sort((l,r) => l < r ? -1 : 1), ['0.05', '0.1', '0.2'].map(s => parseEther(s)));
+  assert.equal(sized.exactQuotes, 3);
+  assert.equal(calls, 1, 'the extra size shares the existing single concentrated-leg batch');
+  assert.deepEqual(sized.candidates.map(c => c.amountIn), [parseEther('0.1')]);
+  assert.equal(sized.candidates[0].estimatedNet, parseEther('0.000949598334612858'));
+
+  const duplicate = structuredClone(first);
+  assert.deepEqual(await run('0.2', [first, duplicate, middle, exit]), sized, 'identical directed pools cannot crowd the beam or quote budget');
+  payoutPct = 99n;
+  assert.deepEqual((await run('0.2')).candidates, [], 'only the chained exact quote may qualify an interior size');
+  payoutPct = 100n;
+  amounts.length = 0;
+  await run('0.085');
+  assert.ok(amounts.length && amounts.every(size => size <= parseEther('0.085')));
+
+  const otherVenue = structuredClone(first);
+  otherVenue.hop.kind = otherVenue.pool.kind = 3;
+  otherVenue.hop.pool = otherVenue.pool.pool = c;
+  const full = await run('512', [first, otherVenue, middle, exit]);
+  assert.equal(full.exactQuotes, 12, 'the interior trial fits inside the existing full budget');
+  assert.equal(full.bestQuote?.amountIn, parseEther('0.1'));
+});
+
 test('a full set of high-ranked three-hop trials leaves room for the four-hop audit', async () => {
   const scan = { ...settings(), blockNumber: 104n, maxLoanWei: parseEther('512') };
   const alternative = edge(a, b, 0, 2n);
-  alternative.pool = { ...alternative.pool, pool: c };
-  alternative.hop = { ...alternative.hop, pool: c };
+  const alternativePool = getAddress('0x0000000000000000000000000000000000000004');
+  alternative.pool = { ...alternative.pool, pool: alternativePool };
+  alternative.hop = { ...alternative.hop, pool: alternativePool };
   const edges = [edge(WETH, a, 0), edge(a, b, 0), alternative, edge(b, WETH, 0, 3n), edge(b, c, 0), edge(c, WETH, 2)];
   // An adverse C/WETH marginal quote rules the four-hop cycle out for trading.
   edges[5].reserveOut /= 4n;
@@ -180,6 +232,26 @@ test('a full set of high-ranked three-hop trials leaves room for the four-hop au
   assert.ok(audited);
   assert.equal(out.exactQuotes, 12);
   assert.ok(out.candidates.every(q => q.hops.length === 3));
+});
+
+test('separate V4 keys on the same manager retain distinct quotes at the same loan size', async () => {
+  const base = edge(WETH, a, 5, 2n);
+  const secondKey = structuredClone(base);
+  secondKey.hop.tickSpacing = secondKey.pool.tickSpacing = 10;
+  const quotedSpacings = new Set<number>();
+  const reader = client((reads, block) => reads.map((read, i) => {
+    if (!i) return block;
+    const { exactAmount, poolKey } = read.args![0] as { exactAmount: bigint; poolKey: { tickSpacing: number } };
+    quotedSpacings.add(poolKey.tickSpacing);
+    return [2n * exactAmount];
+  }));
+  const keys = [base, secondKey];
+  // Real V4 discovery assigns distinct canonical IDs per key, even with the same manager address.
+  keys.forEach((edge, i) => { edge.pool.id = `0x${String(i + 1).padStart(64, '0')}`; });
+  const result = await quoteEthereumPaths(settings(), reader, [...keys, structuredClone(base), edge(a,b,0), edge(b,WETH,0)],
+    parseEther('0.005'), labels);
+  assert.equal(result.exactQuotes, 2);
+  assert.deepEqual([...quotedSpacings].sort((l,r) => l - r), [1, 10]);
 });
 
 test('pinned physical balances free quote slots for other routes despite inflated virtual liquidity', async () => {

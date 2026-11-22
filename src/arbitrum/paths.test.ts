@@ -161,3 +161,98 @@ test('tiny high-spot pools cannot crowd both funded assets out of the executable
   assert.deepEqual(route.legs.map(l => l.pool), markets.map(m => m.pool));
   assert.equal(result.best?.payoutUsd, result.opportunities[0].payoutUsd);
 });
+
+function sizingFixture(spreadPpm: bigint, reserve: bigint, failRefinement = false) {
+  const base = fixture();
+  const firstLoans: bigint[] = [];
+  const legs = new Set<string>();
+  const ordinarySizes = [50_000_000n, 250_000_000n];
+  const client = { multicall: async (request: { blockNumber: bigint; contracts: Request[] }) => {
+    const rows = await base.multicall(request as Parameters<typeof base.multicall>[0]);
+    return request.contracts.map(({ functionName, args = [], address }, i) => {
+      const ok = (result: unknown) => ({ status: 'success', result });
+      if (functionName === 'balanceOf') return ok(address === usdc ? ordinarySizes[1] : 0n);
+      const spot = 1 + Number(spreadPpm) / 1e6;
+      if (address === markets[3].pool && functionName === 'slot0') return ok(BigInt(Math.floor(2 ** 96 * Math.sqrt(spot))));
+      if (address === markets[3].pool && functionName === 'liquidity') return ok(BigInt(Math.floor(Number(reserve) * Math.sqrt(spot))));
+      if (!functionName.startsWith('quote')) return rows[i];
+      const uni = functionName === 'quoteExactInputSingle';
+      const input = uni ? (args[0] as { tokenIn: Address }).tokenIn : args[1] as Address;
+      const amount = uni ? (args[0] as { amountIn: bigint }).amountIn : args[2] as bigint;
+      const key = [uni ? markets[0].pool : args[0], input, amount].join('/');
+      assert.ok(!legs.has(key), 'a pinned pool/input/amount quote is requested once');
+      legs.add(key);
+      if (uni && input === usdc) {
+        firstLoans.push(amount);
+        if (failRefinement && !ordinarySizes.includes(amount)) throw new Error('refinement RPC unavailable');
+        // The first fixed conversion includes the V3 500 ppm fee.
+        const out = amount * markets[0].n * 999_500n / (markets[0].d * 1_000_000n);
+        return ok([out, 1n << 96n, 0n, 0n]);
+      }
+      if (!uni && args[0] === markets[3].pool && input === usdg) {
+        const out = amount * (1_000_000n + spreadPpm) * reserve / ((reserve + amount) * 1_000_000n);
+        return ok([out, 1n << 96n, 0n]);
+      }
+      return rows[i];
+    });
+  } } as unknown as ArbitrumClient;
+  return { client, firstLoans, legs };
+}
+
+test('an intermediate USDC loan clears the net floor on the same market where the fixed sizes miss it', async t => {
+  const run = async (minimumNetUsd: number, fail = false) => {
+    const market = sizingFixture(1701n, 208_333_333_333n, fail);
+    const result = await scanArbitrumPaths(market.client, block, 2000, 250, minimumNetUsd);
+    return { ...market, result };
+  };
+  // A deliberately unreachable refinement threshold observes only the original ladder.
+  const fixed = await run(100);
+  const adaptive = await run(0.05);
+  assert.deepEqual(fixed.firstLoans, [50_000_000n, 250_000_000n]);
+  assert.deepEqual(adaptive.firstLoans.slice(0, 2), fixed.firstLoans);
+  assert.equal(adaptive.firstLoans.length, 3);
+  const [best] = adaptive.result.opportunities;
+  assert.ok(best.loanUsd > 120 && best.loanUsd < 130);
+  assert.equal(best.amountIn, adaptive.firstLoans[2]);
+  assert.equal(adaptive.legs.size, fixed.legs.size + 4, 'only the extra four-hop cycle was quoted');
+  assert.deepEqual(adaptive.result.refinement, { tried: 1, quoted: 1, bestPayoutUsd: best.payoutUsd,
+    baselineBestPayoutUsd: fixed.result.best!.payoutUsd });
+  const paddedGasUsd = 0.01;
+  assert.ok(fixed.result.best!.payoutUsd < 0.05);
+  assert.ok(best.payoutUsd * 0.9 - paddedGasUsd >= 0.05, 'exact payout clears the 10% cushion, padded fee and net floor');
+  t.diagnostic('Fixed gross $' + fixed.result.best!.payoutUsd + ', refined $' + best.loanUsd + ' loan gross $' + best.payoutUsd
+    + ', cushioned net $' + (best.payoutUsd * 0.9 - paddedGasUsd).toFixed(6) + ' at $0.01 padded gas.');
+  const unavailable = await run(0.05, true);
+  assert.deepEqual(unavailable.result.best, fixed.result.best);
+  assert.deepEqual(unavailable.result.opportunities, fixed.result.opportunities);
+  assert.equal(unavailable.result.refinement.tried, 1);
+  assert.equal(unavailable.result.refinement.quoted, 0);
+  assert.equal(unavailable.result.refinement.bestPayoutUsd, null);
+});
+
+test('an already qualifying ladder quote and a losing market both skip every refinement read', async () => {
+  for (const [spread, reserve, winning] of [[4000n, 208_333_333_333n, true], [1701n, 20_000_000_000n, false]] as const) {
+    const market = sizingFixture(spread, reserve);
+    const result = await scanArbitrumPaths(market.client, block, 2000, 250);
+    assert.deepEqual(market.firstLoans, [50_000_000n, 250_000_000n]);
+    assert.ok(winning ? result.best!.payoutUsd >= 0.05 : result.best!.payoutUsd < 0);
+    assert.deepEqual(result.refinement, { tried: 0, quoted: 0, bestPayoutUsd: null, baselineBestPayoutUsd: result.best!.payoutUsd });
+  }
+});
+
+test('a refined final leg arriving after its deadline preserves the completed ladder quotes', async t => {
+  let time = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => time);
+  const ordinary = sizingFixture(1701n, 208_333_333_333n);
+  const reference = await scanArbitrumPaths(ordinary.client, block, 2000, 250, 100);
+  const market = sizingFixture(1701n, 208_333_333_333n);
+  const delayed = { multicall: async (request: { blockNumber: bigint; contracts: Request[] }) => {
+    const rows = await market.client.multicall(request as Parameters<typeof market.client.multicall>[0]);
+    if (market.firstLoans.length === 3 && request.contracts.some(c => c.args?.[0] === markets[3].pool)) time += 2000;
+    return rows;
+  } } as unknown as ArbitrumClient;
+  const result = await scanArbitrumPaths(delayed, block, 2000, 250);
+  assert.deepEqual(result.opportunities, reference.opportunities);
+  assert.deepEqual(result.best, reference.best);
+  assert.deepEqual(result.refinement, { tried: 1, quoted: 0, bestPayoutUsd: null, baselineBestPayoutUsd: reference.best!.payoutUsd });
+});
