@@ -52,6 +52,7 @@ const DIRECT_WINDOW = 1;
 const PRIVATE_DIRECT_WINDOW = 2;
 const PRIVATE_LIVE_WINDOW = 3;
 const PRIVATE_EXPIRY_NOTE = 'private deadline passed without using this nonce';
+const PATH_REPAYMENT_RETRY_MS = 120_000;
 const PRIVATE_FUNCTIONAL_TEST_WINDOW = 5;
 const PUBLIC_FUNCTIONAL_TEST_WINDOW = 8;
 const MAX_PUBLIC_FUNCTIONAL_TEST_USD = 5;
@@ -131,6 +132,7 @@ interface BundleSubmission {
   relayAfterAck?: PrivateRelayStatus & { checkedAt: number };
   relayAtTargetHead?: { block: number; blockHash: Hex; requestedAt: number; result?: PrivateRelayStatus & { checkedAt: number } };
   relayAfterExpiry?: PrivateRelayStatus & { checkedAt: number };
+  pathQuote?: { routeId: Hex; grossProfitWei: string };
   gasEth: number;
   tipEth: number;
   netUsd: number;
@@ -318,6 +320,12 @@ function estimateChanged(estimate: number, cooldown: RouteCooldown): boolean {
 
 function minimumScreeningFee(nextBaseFee: bigint, estimatedFee: bigint): bigint {
   return MEV.submission === 'direct' ? nextBaseFee + minimumDirectPriority(directPriorityCap()) : estimatedFee;
+}
+
+function pathRouteId(path: EthereumPathCandidate, release: Hex): Hex {
+  // The ABI includes each venue, token, pool and V4 key component, the loan amount
+  // and the release. Keep the per-submission profit floor and deadline constant.
+  return keccak256(encodePathArbitrage(path.hops, path.amountIn, 1n, 0n, release));
 }
 
 /** Short revert reason from a viem error ("unprofitable", "transfer", ...). */
@@ -862,11 +870,36 @@ export class MevSearcher {
     }).finally(() => { this.pathReadInFlight = false; });
   }
 
+  private rankPathRetries(paths: EthereumPathCandidate[], release: Hex, now: number) {
+    if (paths.length < 2 || !MEV.directProtected) return paths;
+    const failedGross = new Map<Hex, bigint>();
+    for (const row of this.file.recent) {
+      const sub = row.submission;
+      const quote = sub?.pathQuote;
+      if (row.status !== 'not included' || row.gasOnlyTestId || sub?.kind !== 'direct' || !sub.privateSubmission || !quote
+        || failedGross.has(quote.routeId) || typeof quote.grossProfitWei !== 'string' || !/^[1-9]\d{0,77}$/.test(quote.grossProfitWei)) continue;
+      const failed = [sub.relayAtTargetHead?.result, sub.relayAfterAck].some(sample =>
+        sample?.simError === 'ExecutionReverted' && sample.revertReason === 'loan repayment'
+        && sample.checkedAt >= sub.startedAt && sample.checkedAt <= now && now - sample.checkedAt < PATH_REPAYMENT_RETRY_MS);
+      if (failed) failedGross.set(quote.routeId, BigInt(quote.grossProfitWei));
+    }
+    if (!failedGross.size) return paths;
+    const ranked = paths.map(path => {
+      const previous = failedGross.get(pathRouteId(path, release));
+      const defer = previous !== undefined && path.grossProfit * 4n < previous * 5n && path.estimatedNet > 0n;
+      // Let an alternative at 80% of this estimated net go first. A 25% larger
+      // gross quote restores ordinary ranking for this exact route and size.
+      return { path, defer, score: path.estimatedNet * (defer ? 4n : 5n) };
+    });
+    return ranked.sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : Number(a.defer) - Number(b.defer))
+      .map(entry => entry.path);
+  }
+
   private async tryPaths(paths: EthereumPathCandidate[], r: BlockRead, policy: ProfitPolicy, generation: number) {
     const release = this.pathRelease;
     const contract = this.file.proxyContract;
     if (!release || !contract) return;
-    for (const path of paths) {
+    for (const path of this.rankPathRetries(paths, release, Date.now())) {
       const price = this.host.ethUsd();
       if (!validPrice(price) || !this.liveArmed(generation) || this.pathRelease !== release || this.walletPending()
         || this.activeGasOnlyTest() || !this.canMeetSendDeadline(r)) return;
@@ -1524,6 +1557,8 @@ export class MevSearcher {
         priorityGwei: direct ? Number(fees.maxPriorityFeePerGas) / 1e9 : undefined,
         gasLimit: direct ? gas.toString() : undefined,
         maxFeePerGasWei: direct ? fees.maxFeePerGas.toString() : undefined,
+        pathQuote: privateSubmission && offer.path && !test
+          ? { routeId: pathRouteId(offer.path, offer.release), grossProfitWei: offer.path.grossProfit.toString() } : undefined,
         gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(net) * ethUsd, builders: [],
       };
       const queued = direct ? this.activeGasOnlyTest() : null;

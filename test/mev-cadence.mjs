@@ -200,7 +200,8 @@ try {
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
-    protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport, startup }) {
+    protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport,
+    pathHistory, pathCandidates, pendingForPath, startup }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -235,14 +236,16 @@ try {
     if (pathRelease) {
       searcher.file.proxyContract = address(2);
       searcher.file.proxyRelease = pathRelease;
+      if (pathHistory) searcher.file.recent = pathHistory;
       searcher.pathPlanner.scan = async (input) => {
         assert.equal(input.blockHash, block.hash);
         const hops = [address(10), address(11), address(12)].map((tokenOut, i) => ({
           kind: 2, pool: address(40 + i), fee: 500, tickSpacing: 0, nativeEth: false, tokenOut,
         }));
+        const candidate = { hops, amountIn: pathAmount, amountOut: pathAmount + coversGas, grossProfit: coversGas,
+          estimatedNet: coversGas, label: 'WETH → A → B → WETH' };
         return { status: 'scanned', blockNumber: block.blockNumber, pools: 3, cycles: 1, exactQuotes: 1,
-          candidates: [{ hops, amountIn: pathAmount, amountOut: pathAmount + coversGas, grossProfit: coversGas,
-            estimatedNet: coversGas, label: 'WETH → A → B → WETH' }] };
+          candidates: pathCandidates ? pathCandidates(candidate) : [candidate] };
       };
     }
     const submitDirect = searcher.submitSignedDirect.bind(searcher);
@@ -288,7 +291,7 @@ try {
           const decoded = decodeFunctionData({ abi: FLASH_ARB_LOGIC_V3_ABI, data });
           assert.equal(decoded.functionName, 'executePath');
           assert.equal(decoded.args[0], pathRelease);
-          return { data: hash(pendingProfit) };
+          return { data: hash(pendingForPath ? pendingForPath(decoded.args[1]) : pendingProfit) };
         }
         const inner = startup ? decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data }).args[1] : data;
         const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: inner }).args[0];
@@ -522,6 +525,50 @@ try {
   assert.equal(BigInt(multi.submitted[0].target), maxBlock);
   assert.equal(tx.maxFeePerGas, protectedTx.maxFeePerGas);
   assert.equal(payoutFloor, tx.gas * tx.maxFeePerGas + 25_000_000_000_000n);
+
+  // Same token labels can conceal different venues, pool keys and loan amounts.
+  // The journal supplies only eligible-window evidence for the exact signed order.
+  {
+    const settings = { ...pathOptions, pathAmount: loan, protectedDirect: true };
+    const v4 = candidate => ({ ...candidate, hops: candidate.hops.map((hop, i) => i === 1
+      ? { ...hop, kind: 5, fee: 3000, tickSpacing: 60 } : hop) });
+    const first = await scan({ ...settings, pathCandidates: c => [v4(c)] });
+    const missed = structuredClone(first.submitted[0].opp);
+    assert.match(missed.submission.pathQuote.routeId, /^0x[0-9a-f]{64}$/);
+    assert.equal(missed.submission.pathQuote.grossProfitWei, coversGas.toString());
+    missed.status = 'not included';
+    missed.submission.startedAt = now - 60_000;
+    const failure = { status: 'PENDING', simError: 'ExecutionReverted', revertReason: 'loan repayment', checkedAt: now };
+    missed.submission.relayAfterAck = { status: 'PENDING', checkedAt: now - 1_000 };
+    missed.submission.relayAtTargetHead = { block: 101, blockHash: hash(101), requestedAt: now, result: failure };
+    const select = async (variants, history = missed, pendingForPath) => {
+      const attempt = await scan({ ...settings, pathHistory: [history], pathCandidates: c => variants(v4(c)), pendingForPath });
+      assert.equal(attempt.signed.length, 1);
+      assert.equal(attempt.submitted.length, 1);
+      return decodeFunctionData({ abi: FLASH_ARB_LOGIC_V3_ABI, data: attempt.signed[0].data }).args;
+    };
+    const withHop = (path, edits) => ({ ...path, hops: path.hops.map((hop, i) => i === 1 ? { ...hop, ...edits } : hop) });
+    const alternatives = (path, share = 80n) => [path, { ...withHop(path, { fee: 500, tickSpacing: 10 }),
+      estimatedNet: path.estimatedNet * share / 100n }];
+    assert.equal((await select(alternatives))[1][1].fee, 500, 'a comparable, separate V4 key gets first execution checks');
+    assert.equal((await select(alternatives, missed, hops => hops[1].fee === 500 ? 0n : coversGas))[1][1].fee, 3000,
+      'if the alternate no longer qualifies, the original can still execute on this block');
+    assert.equal((await select(p => [p]))[1][1].fee, 3000, 'the sole candidate still signs on the same head');
+    assert.equal((await select(p => alternatives(p, 79n)))[1][1].fee, 3000, 'a clearly larger net keeps priority');
+    assert.equal((await select(p => alternatives({ ...p, grossProfit: coversGas * 5n / 4n })))[1][1].fee, 3000);
+    for (const unrelated of [p => withHop(p, { pool: address(91) }), p => withHop(p, { tickSpacing: 59 }),
+      p => withHop(p, { nativeEth: true }), p => ({ ...p, amountIn: p.amountIn + 1n })]) {
+      assert.equal((await select(p => alternatives(unrelated(p))))[1][1].fee, 3000, 'another pool, V4 key or size is unaffected');
+    }
+    const old = structuredClone(missed);
+    old.submission.startedAt = now - 180_000;
+    old.submission.relayAtTargetHead.result.checkedAt = now - 120_000;
+    old.submission.relayAfterExpiry = { ...failure, checkedAt: now };
+    assert.equal((await select(alternatives, old))[1][1].fee, 3000, 'the terminal lookup cannot refresh the ranking penalty');
+    const legacy = structuredClone(missed);
+    delete legacy.submission.pathQuote;
+    assert.equal((await select(alternatives, legacy))[1][1].fee, 3000, 'historical token labels cannot identify exact orders');
+  }
 
   // Starting at 1 gwei, a full block followed by an empty block can move the
   // base fee above this signature's cap and then back below it.
