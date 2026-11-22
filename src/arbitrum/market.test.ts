@@ -1,7 +1,36 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseEther } from 'viem';
-import { arbitrumProbeSize, mayProfitAtArbitrumSpot, scanArbitrum, type ArbitrumClient } from './market.js';
+import { BaseError, ContractFunctionExecutionError, encodeAbiParameters, keccak256, parseAbiParameters, parseEther,
+  zeroAddress, type Address, type Hex } from 'viem';
+import { arbitrumProbeSize, discoverArbitrumPools, mayProfitAtArbitrumSpot, scanArbitrum, type ArbitrumClient } from './market.js';
+
+test('Arbitrum discovers liquid static v4 keys independently of v3 factory fees', async () => {
+  const token = '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9';
+  const weth = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
+  const poolId = (base: Address, fee: number, spacing: number) => keccak256(encodeAbiParameters(
+    parseAbiParameters('address,address,uint24,int24,address'), [base, token, fee, spacing, zeroAddress],
+  ));
+  const liquid = new Set([poolId(zeroAddress, 8, 1), poolId(zeroAddress, 250, 5), poolId(weth, 1000, 20)]);
+  const client = {
+    multicall: async ({ blockNumber, contracts }: {
+      blockNumber: bigint; contracts: { functionName: string; args: (Address | Hex | number)[] }[];
+    }) => {
+      assert.equal(blockNumber, 123n);
+      if (contracts[0].functionName === 'getPool') {
+        assert.deepEqual([...new Set(contracts.map(({ args }) => args[2]))], [100, 500, 3000, 10000]);
+        return contracts.map(() => ({ status: 'success', result: zeroAddress }));
+      }
+      return contracts.map(({ functionName, args }) => {
+        assert.equal(functionName, 'getLiquidity');
+        return { status: 'success', result: liquid.has(args[0] as Hex) ? 1n : 0n };
+      });
+    },
+  } as unknown as ArbitrumClient;
+  const markets = await discoverArbitrumPools(client, 123n);
+  assert.deepEqual(markets.map(({ symbol }) => symbol), ['USDT']);
+  assert.deepEqual(markets[0].pools.map(({ fee, tickSpacing, nativeEth }) => [fee, tickSpacing, nativeEth]),
+    [[8, 1, true], [250, 5, true], [1000, 20, false]]);
+});
 
 test('Arbitrum uses one extra quote size every other scan and keeps large probes in the rotation', () => {
   const now = 100_000;
@@ -39,6 +68,9 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
   }];
   const requestedSizes: bigint[][] = [];
   let incompletePrices: boolean | 'error' = false;
+  let gasLimited = false;
+  const rpcError = (functionName: string, details: string) => ({ status: 'failure',
+    error: new ContractFunctionExecutionError(new BaseError('RPC failed', { details }), { abi: [], functionName }) });
   const client = {
     readContract: async ({ functionName, blockNumber }: { functionName: string; blockNumber: bigint }) => {
       assert.equal(blockNumber, 100n);
@@ -50,9 +82,9 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
         default: throw new Error('Unexpected read');
       }
     },
-    multicall: async ({ contracts, blockNumber }: { contracts: {
+    multicall: async ({ contracts, blockNumber, batchSize }: { contracts: {
       functionName: string; args: [{ amountIn?: bigint; exactAmount?: bigint }];
-    }[]; blockNumber: bigint }) => {
+    }[]; blockNumber: bigint; batchSize?: number }) => {
       assert.equal(blockNumber, 100n);
       if (contracts[0].functionName === 'slot0') {
         assert.deepEqual(contracts.map(({ functionName }) => functionName), ['slot0', 'getSlot0']);
@@ -64,6 +96,14 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
       }
       const sizes = contracts.map(({ args }) => args[0].amountIn ?? args[0].exactAmount!);
       requestedSizes.push(sizes);
+      if (gasLimited && requestedSizes.length === 1) {
+        return [rpcError('aggregate3', 'out of gas'), rpcError('quoteExactInputSingle', 'out of gas'),
+          rpcError('aggregate3', 'rate limited'), { status: 'success', result: [sizes[3]] }];
+      }
+      if (gasLimited) {
+        assert.equal(batchSize, requestedSizes.length === 2 ? 1400 : 6000);
+        return sizes.map((amount) => ({ status: 'success', result: [amount] }));
+      }
       return sizes.map((amount) => ({ status: 'success', result: [
         requestedSizes.length === 1 ? amount : amount + amount / 2_500n,
       ] }));
@@ -99,4 +139,12 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
   const missing = await scanArbitrum(client, 100n, markets, false, parseEther('64'), 500, true);
   assert.equal(missing.prunedRoutes, 0);
   assert.equal(missing.quotedRoutes, 4);
+
+  requestedSizes.length = 0;
+  gasLimited = true;
+  const recovered = await scanArbitrum(client, 100n, markets, false, undefined, 500, true);
+  assert.deepEqual(requestedSizes, [[...sizes, ...sizes], [sizes[0]], sizes]);
+  assert.equal(recovered.quotedRoutes, 2);
+  assert.equal(recovered.unavailableLegs, 1);
+  assert.deepEqual(recovered.opportunities, []);
 });

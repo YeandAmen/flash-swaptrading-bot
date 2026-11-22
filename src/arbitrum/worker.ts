@@ -99,7 +99,7 @@ export class ArbitrumWorker {
     canArm: this.enabled && this.executionEnabled,
     status: this.enabled ? 'Starting' : 'Disabled',
     block: 0, pools: 0, routes: 0, simulated: 0, updatedAt: 0, netEstimateUsd: null as number | null,
-    prunedRoutes: 0,
+    prunedRoutes: 0, unavailableLegs: 0,
     bestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['bestQuote'],
     largestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['largestQuote'],
     preparationRejections: {} as Partial<Record<ArbitrumOrderRejection, number>>,
@@ -230,6 +230,7 @@ export class ArbitrumWorker {
     this.summary.pools = this.markets.reduce((sum, market) => sum + market.pools.length, 0);
     this.summary.routes = result.quotedRoutes;
     this.summary.prunedRoutes = result.prunedRoutes;
+    this.summary.unavailableLegs = result.unavailableLegs;
     this.summary.updatedAt = Date.now();
     this.summary.bestQuote = result.bestQuote;
     this.summary.largestQuote = result.largestQuote;
@@ -246,6 +247,7 @@ export class ArbitrumWorker {
       this.summary.status = 'No fresh route passed padded gas and payout floor';
       await this.tryOrders(result.opportunities.slice(0, 3), result.ethUsd, test);
     }
+    if (result.unavailableLegs) this.summary.status += `. Partial scan, RPC unavailable for ${result.unavailableLegs} quote legs`;
     const screened = result.prunedRoutes ? ` ${result.prunedRoutes} size and route combinations below the marginal repayment bound.` : '';
     this.activity.record('info', `Block ${block}: ${result.quotedRoutes} routes across ${this.summary.pools} pools.${screened} ${this.summary.status}.`, undefined, this.summary.updatedAt);
   }

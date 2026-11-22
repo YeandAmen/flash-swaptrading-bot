@@ -1,5 +1,5 @@
 import {
-  createPublicClient, encodeAbiParameters, fallback, formatEther, http, keccak256, parseAbi, parseAbiParameters,
+  ContractFunctionExecutionError, createPublicClient, encodeAbiParameters, fallback, formatEther, http, keccak256, parseAbi, parseAbiParameters,
   parseEther, zeroAddress, type Address,
 } from 'viem';
 import { arbitrum } from 'viem/chains';
@@ -33,11 +33,15 @@ const tokens = [
   ['wstETH', '0x5979d7b546e38e414f7e9822514be443a4800529'],
   ['rETH', '0xec70dcb4a1efa46b8f2d97c310c9c4790ba5ffa8'],
 ] as const;
-const tiers = [[100, 1], [500, 10], [3000, 60], [10000, 200]] as const;
+const v3Fees = [100, 500, 3000, 10000] as const;
+// V4 pool keys include an independent tick spacing. These hook-free keys include
+// liquid Arbitrum pools outside the conventional v3 fee and spacing combinations.
+const v4Tiers = [[8, 1], [100, 1], [250, 5], [500, 10], [1000, 20], [3000, 60], [10000, 200]] as const;
 const amounts = ['0.05', '0.25', '1', '4', '16'].map((size) => parseEther(size));
 const explorationSizes = ['0.01', '0.1', '0.5', '2', '8', '32', '64'].map((size) => parseEther(size));
 const refinementRatios = [[3n, 2n], [3n, 4n], [2n, 1n], [1n, 2n]] as const;
 const quoteLeadMaxAge = 30_000;
+const maxRetryQuoteLegs = 96;
 const profitTestAmounts = ['0.015', '0.05', '0.1', '0.25', '1', '4', '8', '16', '32', '64'].map((size) => parseEther(size));
 const testAmounts = ['0.0002', '0.0006', '0.0018', '0.005', '0.015', '0.05', '0.1', '0.25', '1', '4', '16'].map((size) => parseEther(size));
 const q192 = 2n ** 192n;
@@ -152,17 +156,18 @@ async function readArbitrumSpotRates(client: ArbitrumClient, blockNumber: bigint
 }
 
 export async function discoverArbitrumPools(client: ArbitrumClient, blockNumber: bigint): Promise<Market[]> {
-  const combinations = tokens.flatMap(([, token]) => tiers.map(([fee, tickSpacing]) => ({ token, fee, tickSpacing })));
-  const addresses = await client.multicall({ blockNumber, contracts: combinations.map(({ token, fee }) => ({
+  const v3Pairs = tokens.flatMap(([, token]) => v3Fees.map((fee) => ({ token, fee })));
+  const addresses = await client.multicall({ blockNumber, contracts: v3Pairs.map(({ token, fee }) => ({
     address: factory, abi: factoryAbi, functionName: 'getPool' as const, args: [weth, token, fee] as const,
   })) });
-  const v3Pools = combinations.flatMap(({ token, fee }, i) => {
+  const v3Pools = v3Pairs.flatMap(({ token, fee }, i) => {
     const poolAddress = addresses[i].result;
     if (!poolAddress || poolAddress === zeroAddress) return [];
     const pool: Pool = { kind: 2, pool: poolAddress, fee, tickSpacing: 0, nativeEth: false };
     return [{ token, pool, read: { address: poolAddress, abi: v3PoolAbi, functionName: 'liquidity' as const } }];
   });
-  const v4Pools = combinations.flatMap(({ token, fee, tickSpacing }) => [true, false].map((nativeEth) => {
+  const v4Keys = tokens.flatMap(([, token]) => v4Tiers.map(([fee, tickSpacing]) => ({ token, fee, tickSpacing })));
+  const v4Pools = v4Keys.flatMap(({ token, fee, tickSpacing }) => [true, false].map((nativeEth) => {
     const pool: Pool = { kind: 5, pool: poolManager, fee, tickSpacing, nativeEth };
     return { token, pool, read: { address: stateView, abi: stateAbi, functionName: 'getLiquidity' as const,
       args: [poolId(token, pool)] as const } };
@@ -183,6 +188,30 @@ function quote(token: Address, pool: Pool, buy: boolean, amount: bigint) {
   return { address: quoterV4, abi: quoteV4Abi, functionName: 'quoteExactInputSingle', args: [{
     poolKey: key, zeroForOne: key.currency0 === tokenIn, exactAmount: amount, hookData: '0x',
   }] } as const;
+}
+
+function aggregateFailure(error: unknown): error is ContractFunctionExecutionError {
+  return error instanceof ContractFunctionExecutionError && error.functionName === 'aggregate3';
+}
+
+async function quoteArbitrumPools(client: ArbitrumClient, blockNumber: bigint, contracts: ReturnType<typeof quote>[]) {
+  if (!contracts.length) return [];
+  const rows = await client.multicall({ blockNumber, batchSize: 6000, contracts });
+  // A gas-limited aggregate supplies the same error for every leg in that RPC
+  // batch, including valid pools. A revert from an individual quoter is final.
+  const missing = rows.flatMap((row, index) => row.status === 'failure' && aggregateFailure(row.error)
+    && /\bout of gas\b/i.test(row.error.details ?? '') ? [index] : []);
+  if (missing.length) {
+    // Bound even a full-market audit to one recovery pass per leg. Vary the
+    // starting point so a repeatedly expensive early pool cannot starve later ones.
+    const start = missing.length > maxRetryQuoteLegs ? Number(blockNumber % BigInt(missing.length)) : 0;
+    const selected = Array.from({ length: Math.min(missing.length, maxRetryQuoteLegs) },
+      (_, i) => missing[(start + i) % missing.length]);
+    const retry = await client.multicall({ blockNumber, batchSize: 1400, contracts: selected.map((i) => contracts[i]) })
+      .catch(() => []);
+    for (const [j, row] of retry.entries()) rows[selected[j]] = row;
+  }
+  return rows;
 }
 
 export async function arbitrumEthUsd(client: ArbitrumClient, blockNumber?: bigint): Promise<number> {
@@ -219,17 +248,16 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     });
     return sellPools.length ? [{ market, pool, size, sellPools }] : [];
   })));
-  const bought = buys.length ? await client.multicall({
-    blockNumber, batchSize: 6000, contracts: buys.map(({ market, pool, size }) => quote(market.token, pool, true, size)),
-  }) : [];
+  const bought = await quoteArbitrumPools(client, blockNumber,
+    buys.map(({ market, pool, size }) => quote(market.token, pool, true, size)));
   const sells = buys.flatMap(({ market, pool, size, sellPools }, i) => {
     const amount = bought[i].result?.[0] ?? 0n;
     if (amount <= 0n || amount >= 2n ** 128n) return [];
     return sellPools.map((sell) => ({ market, buy: pool, sell, size, amount }));
   });
-  const sold = sells.length ? await client.multicall({
-    blockNumber, batchSize: 6000, contracts: sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)),
-  }) : [];
+  const sold = await quoteArbitrumPools(client, blockNumber,
+    sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)));
+  const unavailableLegs = [...bought, ...sold].filter((row) => row.status === 'failure' && aggregateFailure(row.error)).length;
   const opportunities: ArbQuote[] = [];
   let bestQuote: SampledQuote | null = null;
   let largestQuote: SampledQuote | null = null;
@@ -259,7 +287,7 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     payoutUsd: Number(formatEther(quote.payout)) * ethUsd,
   } : null;
   return {
-    ethUsd, quotedRoutes, prunedRoutes, opportunities, sizingAmount: sizingLead?.amount,
+    ethUsd, quotedRoutes, prunedRoutes, unavailableLegs, opportunities, sizingAmount: sizingLead?.amount,
     best: best ? { symbol: best.symbol, payoutUsd: Number(formatEther(best.payout)) * ethUsd } : null,
     bestQuote: report(bestQuote), largestQuote: report(largestQuote),
   };
