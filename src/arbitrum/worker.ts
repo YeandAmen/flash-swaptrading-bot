@@ -299,9 +299,10 @@ export class ArbitrumWorker {
       this.summary.status = 'No fresh route passed padded gas and payout floor';
       await this.queueOrders(candidates.slice(0, 3), result.ethUsd, test, generation, this.deployment.releaseHash);
     }
+    const status = this.summary.status;
     if (result.unavailableLegs) this.summary.status += `. Partial scan, RPC unavailable for ${result.unavailableLegs} quote legs`;
     const screened = result.prunedRoutes ? ` ${result.prunedRoutes} size and route combinations below the marginal repayment bound.` : '';
-    this.activity.record('info', `Block ${block}: ${result.quotedRoutes} two-swap quotes across ${this.summary.pools} pools.${screened} ${this.summary.pathStatus}. ${this.summary.status}.`, undefined, this.summary.updatedAt);
+    this.activity.record('info', `Block ${block}: ${result.quotedRoutes} two-swap quotes across ${this.summary.pools} pools, ${result.unavailableLegs} unavailable quote legs.${screened} ${this.summary.pathStatus}. ${status}.`, undefined, this.summary.updatedAt);
   }
 
   private queueOrders(candidates: (ArbQuote | ArbPathQuote)[], ethUsd: number, test: FlashTest | null, generation: number, release: Hex | null) {

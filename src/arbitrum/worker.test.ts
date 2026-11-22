@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setImmediate as nextTurn } from 'node:timers/promises';
-import { decodeFunctionData, encodeAbiParameters, parseEther, type Hex } from 'viem';
+import { BaseError, ContractFunctionExecutionError, decodeFunctionData, encodeAbiParameters, parseEther, type Hex } from 'viem';
 import { ARBITRUM_FLASH_ARB_LOGIC_V2_ABI } from './artifact-logic-v2.js';
 import type { ArbPathQuote } from './paths.js';
 
@@ -21,7 +21,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function fixture(options: { simulate?: boolean } = {}) {
+function fixture(options: { simulate?: boolean; unavailable?: boolean } = {}) {
   const foundPaths = deferred(), twoSwapReads = deferred(), releasePreparation = deferred();
   const preparations: string[] = [];
   let parallel = 0, peak = 0, observations = 0;
@@ -44,8 +44,11 @@ function fixture(options: { simulate?: boolean } = {}) {
       await twoSwapReads.promise;
       return 0n;
     },
-    multicall: async ({ contracts }: { contracts: { args: [{ amountIn: bigint }] }[] }) => contracts.map(c =>
-      ({ status: 'success', result: [2n * c.args[0].amountIn, 1n << 96n, 0, 0n] })),
+    multicall: async ({ contracts }: { contracts: { args: [{ amountIn: bigint }] }[] }) => contracts.map(c => {
+      if (options.unavailable) return { status: 'failure', error: new ContractFunctionExecutionError(
+        new BaseError('RPC failed', { details: 'timeout' }), { abi: [], functionName: 'aggregate3' }) };
+      return { status: 'success', result: [2n * c.args[0].amountIn, 1n << 96n, 0, 0n] };
+    }),
     call: async () => ({ data: encodeAbiParameters([{ type: 'uint256' }], [quote.payout]) }),
     estimateFeesPerGas: async () => ({ maxFeePerGas: 1n, maxPriorityFeePerGas: 1n }),
     estimateGas: async ({ data }: { data: Hex }) => {
@@ -66,6 +69,19 @@ function fixture(options: { simulate?: boolean } = {}) {
   return { worker, foundPaths, twoSwapReads, releasePreparation, preparations, journal, deployment,
     peak: () => peak, observations: () => observations };
 }
+
+test('a truncated Arbitrum activity entry retains the numeric count of unavailable quote legs', async () => {
+  const f = fixture({ unavailable: true });
+  f.worker.summary.pathStatus = 'Long path status. '.repeat(30);
+  f.twoSwapReads.resolve();
+  await f.worker.scan();
+  const { logs, unavailableLegs } = f.worker.view();
+  assert.equal(unavailableLegs, 2);
+  assert.equal(logs[0].message.length, 280);
+  assert.match(logs[0].message, /^Block 100: 0 two-swap quotes across 2 pools, 2 unavailable quote legs\./);
+  f.worker.stop();
+  f.foundPaths.resolve();
+});
 
 test('a profitable path starts preparation while the two-swap scan waits, and both producers use one lane', async () => {
   const f = fixture();
