@@ -36,7 +36,7 @@ export const solanaDiscoveryPairs = [
   ['Meteora DLMM', 'PancakeSwap'],
   ['SolFi V2', 'BisonFi'],
 ] as const;
-const discoveryVenues = solanaDiscoveryPairs.flat();
+const returnVenues = [...solanaDiscoveryPairs.flat(), 'Kipseli', 'ZeroFi'] as const;
 const JUPITER_BUILD = 'https://api.jup.ag/swap/v2/build';
 const defaultLoanUsdc = 250;
 export const SOLANA_TEST_MAX_FEE_LAMPORTS = 50_000n;
@@ -44,6 +44,7 @@ export const SOLANA_TEST_MAX_FEE_LAMPORTS = 50_000n;
 type Rpc = ReturnType<typeof createSolanaRpc>;
 type VenuePair = typeof solanaVenuePairs[number] | typeof solanaDiscoveryPairs[number];
 type Venue = VenuePair[number];
+type ReturnVenue = typeof returnVenues[number];
 type JupiterAccount = { pubkey: string; isWritable: boolean; isSigner: boolean };
 type JupiterInstruction = { programId: string; data: string; accounts: JupiterAccount[] };
 type JupiterBuild = {
@@ -207,7 +208,7 @@ function deadline() {
 
 export async function buildSwap(
   wallet: Address, input: Address, output: Address, destination: Address,
-  amount: bigint, venues: Venue | readonly Venue[], apiKey?: string, slippageBps = TEST_SLIPPAGE_BPS,
+  amount: bigint, venues: ReturnVenue | readonly ReturnVenue[], apiKey?: string, slippageBps = TEST_SLIPPAGE_BPS,
 ): Promise<JupiterBuild | null> {
   const allowedVenues: readonly string[] = typeof venues === 'string' ? [venues] : venues;
   const url = new URL(JUPITER_BUILD);
@@ -392,7 +393,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       reusableFirst = first;
       const firstMinimum = execute ? routeMinimum(first, wallet, usdcAta.ata, solAta.ata, slippageBps) : rawAmount(first.otherAmountThreshold);
       if (firstMinimum <= 0n) throw new Error('Jupiter did not guarantee any first-leg output');
-      const exits = compareReturns ? discoveryVenues.filter((venue) => venue !== buy) : pairedVenue;
+      const exits = compareReturns ? returnVenues.filter((venue) => venue !== buy) : pairedVenue;
       const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, exits, config.jupiterApiKey, slippageBps);
       if (!second) {
         if (compareReturns && !submission) return scanRoute(buy, index, first);

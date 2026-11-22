@@ -329,20 +329,31 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     requestedExits.length = 0;
   });
   await t.test('compares other direct exits and records the actual venue with one quote per leg', async () => {
-    groupedExit = 'PancakeSwap';
-    jupiterRequests = 0;
     const settings = { ...config, venuePair: solanaDiscoveryPairs[2], compareReturnVenues: true };
     let submissions = 0;
-    const direct = await scanSolanaCycle(settings, async () => { submissions++; });
-    assert.equal(jupiterRequests, 4);
-    assert.equal(submissions, 1);
-    assert.deepEqual(direct.routes.map((route) => [route.buy, route.sell, route.qualified]),
-      [['SolFi V2', 'PancakeSwap', true], ['BisonFi', 'PancakeSwap', true]]);
-    assert.equal(requestedExits.length, 2);
-    for (const allowed of requestedExits) {
-      assert.equal(new Set(allowed).size, 5);
-      assert.ok(allowed.includes('SolFi V2') !== allowed.includes('BisonFi'));
+    for (const exit of ['Kipseli', 'ZeroFi']) {
+      groupedExit = exit;
+      jupiterRequests = 0;
+      submissions = 0;
+      requestedExits.length = 0;
+      const direct = await scanSolanaCycle(settings, async () => { submissions++; });
+      assert.equal(jupiterRequests, 4);
+      assert.equal(submissions, 1);
+      assert.deepEqual(direct.routes.map((route) => [route.buy, route.sell, route.qualified]),
+        [['SolFi V2', exit, true], ['BisonFi', exit, true]]);
+      assert.equal(requestedExits.length, 2);
+      for (const allowed of requestedExits) {
+        assert.equal(new Set(allowed).size, 7);
+        assert.ok(allowed.includes('Kipseli') && allowed.includes('ZeroFi'));
+        assert.ok(allowed.includes('SolFi V2') !== allowed.includes('BisonFi'));
+      }
     }
+    requestedExits.length = 0;
+    jupiterRequests = 0;
+    const manual = await scanSolanaCycle(settings, async () => {}, 'paired-manual-test');
+    assert.equal(jupiterRequests, 4);
+    assert.equal(requestedExits.length, 0);
+    assert.deepEqual(manual.routes.map(({ buy, sell }) => [buy, sell]), [['SolFi V2', 'BisonFi'], ['BisonFi', 'SolFi V2']]);
 
     groupedExit = 'unexpected venue';
     jupiterRequests = 0;
