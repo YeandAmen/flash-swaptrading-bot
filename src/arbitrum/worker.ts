@@ -76,6 +76,8 @@ export class ArbitrumWorker {
   private markets: Awaited<ReturnType<typeof refreshArbitrumPools>>['markets'] = [];
   private knownPools?: Awaited<ReturnType<typeof refreshArbitrumPools>>['knownPools'];
   private refreshAfter = 0;
+  private readingDisplayBalance = false;
+  private nextDisplayBalanceRead = 0;
   private regularScans = 0;
   private readingPaths = false;
   // One poll and one background path observation may offer orders at once.
@@ -167,6 +169,7 @@ export class ArbitrumWorker {
   stop() {
     this.active = false;
     this.sendGeneration++;
+    this.nextDisplayBalanceRead = 0;
   }
 
   disarm() {
@@ -196,6 +199,23 @@ export class ArbitrumWorker {
     this.deployment = { ...this.deployment, ...executor, verified: true, status: executor.kind === 'proxy'
       ? 'ERC-1967 proxy, owner, admin and implementation verified' : 'Standalone executor bytecode and owner verified' };
     this.executorCheckAt = Date.now() + 60_000;
+  }
+
+  private async refreshDisplayBalance(generation: number) {
+    if (!this.active || this.sendGeneration !== generation || this.readingDisplayBalance
+      || Date.now() < this.nextDisplayBalanceRead || !isAddress(this.owner)) return;
+    this.readingDisplayBalance = true;
+    let balance: string | null;
+    try {
+      balance = formatEther(await this.client.getBalance({ address: this.owner }));
+    } catch {
+      balance = null;
+    }
+    this.readingDisplayBalance = false;
+    if (this.active && this.sendGeneration === generation) {
+      this.summary.balanceEth = balance;
+      this.nextDisplayBalanceRead = Date.now() + 30_000;
+    }
   }
 
   // Market observations do not delay two-swap quotes. Only the reviewed
@@ -246,9 +266,7 @@ export class ArbitrumWorker {
     } else if (this.deployment.kind === 'proxy' && Date.now() >= this.executorCheckAt) {
       await this.verifyExecutor();
     }
-    if (isAddress(this.owner)) {
-      this.summary.balanceEth = formatEther(await this.client.getBalance({ address: this.owner }));
-    }
+    void this.refreshDisplayBalance(generation);
     if (this.journal?.pending) await this.reconcile();
     const quoteAt = Date.now();
     const header = this.quoteReaders && !activeFlashTest(this.journal?.test) ? await this.client.getBlock().catch(() => null) : null;

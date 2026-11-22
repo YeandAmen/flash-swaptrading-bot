@@ -139,9 +139,77 @@ function fixture(options: { simulate?: boolean; unavailable?: boolean } = {}) {
   Object.assign(worker, { client, contract, owner: token, journal, deployment, markets, quoteReaders: undefined,
     verified: true, halted: false, refreshAfter: Infinity, executorCheckAt: Infinity });
   Object.assign(worker.summary, { executor: contract, mode: 'live' });
-  return { worker, foundPaths, twoSwapReads, releasePreparation, preparations, journal, deployment,
+  return { worker, client, foundPaths, twoSwapReads, releasePreparation, preparations, journal, deployment,
     peak: () => peak, observations: () => observations };
 }
+
+test('pending and failed display balance reads allow receipt checks and market scans to continue', async t => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const f = fixture({ unavailable: true });
+  const releaseBalance = deferred();
+  let balanceReads = 0, receiptChecks = 0;
+  f.journal.pending = { hash: `0x${'ab'.repeat(32)}`, nonce: 0 };
+  f.worker.summary.balanceEth = '0.25';
+  Object.assign(f.client, {
+    getBalance: async () => {
+      if (++balanceReads === 1) {
+        await releaseBalance.promise;
+        throw new Error('Balance RPC unavailable');
+      }
+      return 0n;
+    },
+    getTransactionReceipt: async () => { receiptChecks++; throw new Error('Receipt RPC unavailable'); },
+  });
+  f.twoSwapReads.resolve();
+  const scan = f.worker.scan();
+  await nextTurn();
+  assert.equal(receiptChecks, 1);
+  assert.equal(f.worker.summary.quoteRecoveryTotals.scans, 1);
+  await scan;
+  now += 60_000;
+  await f.worker.scan();
+  assert.equal(balanceReads, 1);
+  assert.equal(receiptChecks, 2);
+  releaseBalance.resolve();
+  await nextTurn();
+  assert.equal(f.worker.summary.balanceEth, null);
+  now += 29_999;
+  await f.worker.scan();
+  assert.equal(balanceReads, 1);
+  now++;
+  await f.worker.scan();
+  assert.equal(balanceReads, 2);
+  assert.equal(f.worker.summary.balanceEth, '0');
+  assert.equal(receiptChecks, 4);
+  assert.equal(f.worker.summary.quoteRecoveryTotals.scans, 4);
+});
+
+test('a balance read completing after stop and restart cannot update the new generation', async () => {
+  const f = fixture({ unavailable: true });
+  const releaseBalance = deferred();
+  let balanceReads = 0;
+  f.client.getBalance = async () => {
+    if (++balanceReads === 1) {
+      await releaseBalance.promise;
+      return parseEther('2');
+    }
+    return parseEther('3');
+  };
+  f.twoSwapReads.resolve();
+  await f.worker.scan();
+  f.worker.stop();
+  await f.worker.scan();
+  assert.equal(balanceReads, 1);
+  releaseBalance.resolve();
+  await nextTurn();
+  assert.equal(f.worker.summary.balanceEth, null);
+  await f.worker.scan();
+  assert.equal(balanceReads, 2);
+  assert.equal(f.worker.summary.balanceEth, '3');
+  f.worker.stop();
+  f.foundPaths.resolve();
+});
 
 test('a truncated Arbitrum activity entry retains the numeric count of unavailable quote legs', async () => {
   const f = fixture({ unavailable: true });
