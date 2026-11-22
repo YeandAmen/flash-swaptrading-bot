@@ -6,7 +6,7 @@ import type { EthereumPathScan } from './multihop.js';
 
 process.env.RPC_URL ??= 'http://127.0.0.1:8545';
 const { ADDR } = await import('../config.js');
-const { pathTokens, discoverPathPools } = await import('./multihop-market.js');
+const { pathTokens, discoverPathPools, pathMarket } = await import('./multihop-market.js');
 const { quoteEthereumPaths, EthereumPathPlanner } = await import('./multihop.js');
 const a = getAddress('0x0000000000000000000000000000000000000001');
 const b = getAddress('0x0000000000000000000000000000000000000002');
@@ -16,7 +16,7 @@ const labels = new Map([[WETH, 'WETH'], [a, 'A'], [b, 'B'], [c, 'C']]);
 const currentBlock = 100n;
 const settings = (): EthereumPathScan => ({ blockNumber: currentBlock, maxLoanWei: parseEther('0.1'), minNetWei: 1n,
   gasPriceWei: 10n ** 8n, deadlineMs: Date.now() + 10_000 });
-function edge(from: Address, to: Address, kind: 0 | 2 | 5, rate = 1n, nativeEth = false): PathEdge {
+function edge(from: Address, to: Address, kind: 0 | 2 | 3 | 4 | 5, rate = 1n, nativeEth = false): PathEdge {
   const reserveIn = parseEther('1000000');
   const pool = getAddress('0x' + (BigInt(from) ^ BigInt(to)).toString(16).padStart(40,'0'));
   const zeroForOne = nativeEth ? from === WETH : BigInt(from) < BigInt(to);
@@ -180,4 +180,64 @@ test('a full set of high-ranked three-hop trials leaves room for the four-hop au
   assert.ok(audited);
   assert.equal(out.exactQuotes, 12);
   assert.ok(out.candidates.every(q => q.hops.length === 3));
+});
+
+
+test('Sushi and Pancake factory discovery, fee tiers and slot layouts remain bounded across token rotations', async () => {
+  const sushi = getAddress('0xbaceb8ec6b9355dfc0269c18bac9d6e2bdc29c4f');
+  const pancake = getAddress('0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865');
+  const counts = new Map([[sushi, 0], [pancake, 0]]);
+  const tokens = pathTokens(currentBlock, [{ address: a, symbol: 'A' }, { address: b, symbol: 'B' }]);
+  const usdt = tokens.find(t => t.symbol === 'USDT')!.address;
+  const reader = client((calls, block) => calls.map(call => {
+    const { functionName, address, args } = call;
+    if (functionName === 'getBlockNumber') return block;
+    if (functionName === 'getLiquidity') return 0n;
+    if (functionName === 'balanceOf') return 10n ** 18n;
+    if (functionName === 'liquidity') return 10n ** 22n;
+    if (functionName === 'slot0') {
+      const { abi } = call as unknown as { abi: { name: string; outputs: { type: string }[] }[] };
+      assert.equal(abi.find(f => f.name === 'slot0')!.outputs[5].type, address === b ? 'uint32' : 'uint8');
+      return [1n << 96n, 0, 1, 1, 1, address === b ? 2000 : 0, true];
+    }
+    if (!counts.has(address)) return zeroAddress;
+    counts.set(address, counts.get(address)! + 1);
+    assert.equal(functionName, 'getPool');
+    assert.ok(args![0] !== a && args![1] !== b && args![0] !== b && args![1] !== a);
+    return args![0] === ADDR.usdc && args![1] === usdt && args![2] === 100 ? (address === sushi ? a : b) : zeroAddress;
+  }));
+  const discovery = await discoverPathPools(reader, currentBlock, tokens, settings().deadlineMs);
+  assert.deepEqual([...counts.values()], [6,7]);
+  const market = await pathMarket(reader, currentBlock, discovery.pools, settings().deadlineMs);
+  assert.ok(discovery.complete && market.complete);
+  assert.deepEqual(market.edges.map(e => [e.hop.kind, e.fee, e.hop.tickSpacing, e.hop.nativeEth]),
+    [[3,100n,0,false], [3,100n,0,false], [4,100n,0,false], [4,100n,0,false]]);
+});
+
+test('Sushi and Pancake use their own exact quoters and discard partial fills in either direction', async () => {
+  const first = edge(WETH, a, 3), middle = edge(a, b, 4), exit = edge(b, WETH, 0, 2n);
+  const scan = { ...settings(), maxLoanWei: parseEther('0.005') };
+  for (const stopAt of [0, 3, 4]) {
+    const visited: number[] = [];
+    const reader = client((calls, block) => calls.map(({ address, functionName, args }, i) => {
+      if (!i) return block;
+      const { tokenIn, tokenOut, amountIn, sqrtPriceLimitX96 } = args![0] as
+        { tokenIn: Address; tokenOut: Address; amountIn: bigint; sqrtPriceLimitX96: bigint };
+      const sushi = tokenIn === WETH;
+      const kind = sushi ? 3 : 4;
+      visited.push(kind);
+      assert.equal(address.toLowerCase(), sushi ? '0x64e8802fe490fa7cc61d3463958199161bb608a7' : '0xb048bbc1ee6b733fffcfb9e9cef7375518e25997');
+      assert.equal(functionName, 'quoteExactInputSingle');
+      assert.equal(tokenOut, sushi ? a : b);
+      assert.equal(amountIn, sushi ? scan.maxLoanWei : scan.maxLoanWei + 5n);
+      assert.equal(sqrtPriceLimitX96, 0n);
+      const limit = sushi ? 1461446703485210103287273052203988822378723970341n : 4295128740n;
+      return [amountIn + 5n, kind === stopAt ? limit : 1n << 96n, 0, 40000n];
+    }));
+    const result = await quoteEthereumPaths(scan, reader, [first, middle, exit], scan.maxLoanWei, labels);
+    assert.deepEqual(visited, stopAt === 3 ? [3] : [3,4]);
+    assert.equal(result.exactQuotes, stopAt ? 0 : 1);
+    assert.equal(result.candidates.length, stopAt ? 0 : 1);
+    if (!stopAt) assert.equal(result.candidates[0].amountOut, constantOut(exit, scan.maxLoanWei + 10n));
+  }
 });

@@ -2,7 +2,7 @@ import { parseEther, type Address, type Hex } from 'viem';
 import { mevPoolClient } from '../chain.js';
 import { ADDR } from '../config.js';
 import {
-  discoverPathPools, directQuoteCall, pathMarket, pathTokens, pinnedReads, type EthereumPathHop, type PathEdge,
+  discoverPathPools, directQuoteCall, isPathV3, pathMarket, pathTokens, pinnedReads, type EthereumPathHop, type PathEdge,
   type PathPool, type PathReader, type PathToken,
 } from './multihop-market.js';
 export type { EthereumPathHop } from './multihop-market.js';
@@ -107,7 +107,7 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
             edges: [...part.edges, edge], amountIn,
             amountOut: cpOut(edge, part.amountOut),
             // V2 reserves determine the exact monotone output. Concentrated pools may cross ticks.
-            upper: edge.hop.kind === 2 || edge.hop.kind === 5 ? marginalOut(edge, part.upper) : cpOut(edge, part.upper),
+            upper: isPathV3(edge.hop.kind) || edge.hop.kind === 5 ? marginalOut(edge, part.upper) : cpOut(edge, part.upper),
           })));
           next.sort((a, b) => compare(a.amountOut, b.amountOut) || compare(a.upper, b.upper));
           variants = next.slice(0, 2);
@@ -159,7 +159,7 @@ export async function quoteEthereumPaths(scan: EthereumPathScan, client: PathRea
       const edge = trial.edges[leg];
       const amount = amounts[i];
       if (!edge || !amount) return -1;
-      if (edge.hop.kind !== 2 && edge.hop.kind !== 5) {
+      if (!isPathV3(edge.hop.kind) && edge.hop.kind !== 5) {
         amounts[i] = cpOut(edge, amount);
         return -1;
       }
@@ -178,7 +178,7 @@ export async function quoteEthereumPaths(scan: EthereumPathScan, client: PathRea
     for (const [i, ref] of refs.entries()) {
       if (ref < 0) continue;
       const value = values[ref];
-      const v3 = trials[i].edges[leg].hop.kind === 2;
+      const v3 = isPathV3(trials[i].edges[leg].hop.kind);
       const fullFill = Array.isArray(value) && (!v3 || typeof value[1] === 'bigint'
         && value[1] > 4295128740n && value[1] < 1461446703485210103287273052203988822378723970341n);
       amounts[i] = fullFill && typeof value[0] === 'bigint' && value[0] > 0n ? value[0] : 0n;
