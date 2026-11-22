@@ -1,12 +1,12 @@
 import {
-  ContractFunctionExecutionError, createPublicClient, encodeAbiParameters, fallback, formatEther, http, keccak256, parseAbi, parseAbiParameters,
-  parseEther, zeroAddress, type Address,
+  ContractFunctionExecutionError, createPublicClient, encodeAbiParameters, fallback, formatEther, HttpRequestError, http,
+  keccak256, parseAbi, parseAbiParameters, parseEther, zeroAddress, type Address, type Hash,
 } from 'viem';
 import { arbitrum } from 'viem/chains';
 import { loanLimitWei } from '../mev/cadence.js';
 
 export const defaultArbitrumRpc = 'https://arb1.arbitrum.io/rpc';
-const alternateArbitrumReadRpc = 'https://arbitrum-one-rpc.publicnode.com';
+export const alternateArbitrumReadRpc = 'https://arbitrum-one-rpc.publicnode.com';
 const arbReadMethods = [
   'eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getCode', 'eth_getStorageAt',
   'eth_getBalance', 'eth_getTransactionCount', 'eth_getTransactionReceipt', 'eth_call',
@@ -73,6 +73,15 @@ export const arbitrumClient = (rpc = defaultArbitrumRpc) => {
   return createPublicClient({ chain: arbitrum, transport });
 };
 export type ArbitrumClient = ReturnType<typeof arbitrumClient>;
+type QuoteReader = Pick<ArbitrumClient, 'getBlock' | 'multicall'>;
+type QuoteRecoveryReaders = { primary: QuoteReader; alternate: QuoteReader };
+export function arbitrumQuoteRecoveryReaders(rpc: string): QuoteRecoveryReaders | undefined {
+  if (rpc.replace(/\/$/, '') !== defaultArbitrumRpc) return undefined;
+  const direct = (url: string) => createPublicClient({ chain: arbitrum, transport: http(url, {
+    timeout: 1200, retryCount: 0, methods: { include: ['eth_getBlockByNumber', 'eth_call'] },
+  }) });
+  return { primary: direct(defaultArbitrumRpc), alternate: direct(alternateArbitrumReadRpc) };
+}
 type Pool = { kind: 2 | 5; pool: Address; fee: number; tickSpacing: number; nativeEth: boolean };
 type Market = { symbol: string; token: Address; pools: Pool[] };
 export type ArbOrder = {
@@ -237,22 +246,51 @@ function aggregateFailure(error: unknown): error is ContractFunctionExecutionErr
   return error instanceof ContractFunctionExecutionError && error.functionName === 'aggregate3';
 }
 
-async function quoteArbitrumPools(client: ArbitrumClient, blockNumber: bigint, contracts: ReturnType<typeof quote>[]) {
+export function emptyArbitrumQuoteRecovery() {
+  return { before: 0, recovered: 0, remaining: 0, individualFailures: 0, resolvedIndividual: 0,
+    outOfGas: 0, rateLimited: 0, alternateAttempted: 0, alternateRecovered: 0 };
+}
+
+type QuotePin = { blockNumber: bigint } | { blockHash: Hash; requireCanonical: true };
+
+async function quoteArbitrumPools(client: ArbitrumClient, blockNumber: bigint, contracts: ReturnType<typeof quote>[],
+  pin: QuotePin, counts: ReturnType<typeof emptyArbitrumQuoteRecovery>, alternateForBlock: () => Promise<QuoteReader | undefined>) {
   if (!contracts.length) return [];
-  const rows = await client.multicall({ blockNumber, batchSize: 6000, contracts });
-  // A gas-limited aggregate supplies the same error for every leg in that RPC
-  // batch, including valid pools. A revert from an individual quoter is final.
-  const missing = rows.flatMap((row, index) => row.status === 'failure' && aggregateFailure(row.error)
-    && /\bout of gas\b/i.test(row.error.details ?? '') ? [index] : []);
-  if (missing.length) {
-    // Bound even a full-market audit to one recovery pass per leg. Vary the
-    // starting point so a repeatedly expensive early pool cannot starve later ones.
-    const start = missing.length > maxRetryQuoteLegs ? Number(blockNumber % BigInt(missing.length)) : 0;
-    const selected = Array.from({ length: Math.min(missing.length, maxRetryQuoteLegs) },
-      (_, i) => missing[(start + i) % missing.length]);
-    const retry = await client.multicall({ blockNumber, batchSize: 1400, contracts: selected.map((i) => contracts[i]) })
-      .catch(() => []);
-    for (const [j, row] of retry.entries()) rows[selected[j]] = row;
+  const rows = await client.multicall({ ...pin, batchSize: 6000, contracts });
+  const missing: number[] = [], gasLimited: number[] = [];
+  for (const [i, row] of rows.entries()) {
+    if (row.status === 'success') continue;
+    if (!aggregateFailure(row.error)) { counts.individualFailures++; continue; }
+    missing.push(i);
+    if (/\bout of gas\b/i.test(row.error.details ?? '')) gasLimited.push(i);
+    else if (/rate.?limit|too many requests/i.test(row.error.details ?? '')
+      || row.error.walk(cause => cause instanceof HttpRequestError && cause.status === 429)) counts.rateLimited++;
+  }
+  counts.before += missing.length;
+  counts.remaining += missing.length;
+  counts.outOfGas += gasLimited.length;
+  if (!missing.length) return rows;
+  const alternate = await alternateForBlock();
+  const eligible = alternate ? missing : gasLimited;
+  if (!eligible.length) return rows;
+  // Each failed leg gets at most one smaller retry, on a single reader.
+  const start = eligible.length > maxRetryQuoteLegs ? Number(blockNumber % BigInt(eligible.length)) : 0;
+  const selected = Array.from({ length: Math.min(eligible.length, maxRetryQuoteLegs) },
+    (_, i) => eligible[(start + i) % eligible.length]);
+  if (alternate) counts.alternateAttempted += selected.length;
+  const retry = await (alternate ?? client).multicall({ ...pin, batchSize: 1400, contracts: selected.map(i => contracts[i]) })
+    .catch(() => []);
+  for (const [j, row] of retry.entries()) {
+    rows[selected[j]] = row;
+    if (row.status === 'success') {
+      counts.recovered++;
+      counts.remaining--;
+      if (alternate) counts.alternateRecovered++;
+    } else if (!aggregateFailure(row.error)) {
+      counts.individualFailures++;
+      counts.resolvedIndividual++;
+      counts.remaining--;
+    }
   }
   return rows;
 }
@@ -268,9 +306,17 @@ export async function arbitrumEthUsd(client: ArbitrumClient, blockNumber?: bigin
 export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[],
   test: boolean | number = false, extraSize?: bigint, maxLoanUsd = 1_000_000,
   screenRoundTrips: boolean | { auditScan: number } = false,
-  price = arbitrumEthUsd(client, blockNumber)) {
+  price = arbitrumEthUsd(client, blockNumber), recovery?: QuoteRecoveryReaders & { blockHash: Hash }) {
+  let pin: QuotePin = recovery ? { blockHash: recovery.blockHash, requireCanonical: true } : { blockNumber };
+  const premiumRead = { address: aavePool, abi: aaveAbi, functionName: 'FLASHLOAN_PREMIUM_TOTAL' } as const;
+  // Check hash-pin support with an existing small read before issuing the large quote batches.
+  const premium = client.readContract({ ...premiumRead, ...pin }).catch(error => {
+    if (!recovery) throw error;
+    pin = { blockNumber };
+    return client.readContract({ ...premiumRead, blockNumber });
+  });
   const [premiumBps, config, available, ethUsd, spotRates] = await Promise.all([
-    client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'FLASHLOAN_PREMIUM_TOTAL', blockNumber }),
+    premium,
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'getConfiguration', args: [weth], blockNumber }),
     client.readContract({ address: weth, abi: balanceAbi, functionName: 'balanceOf', args: [aaveWeth], blockNumber }),
     price,
@@ -279,6 +325,15 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
   ]);
   const active = (config & (1n << 56n)) !== 0n && (config & (1n << 60n)) === 0n && (config & (1n << 63n)) !== 0n;
   if (!active) throw new Error('Aave WETH flash loans are disabled');
+  const quoteRecovery = emptyArbitrumQuoteRecovery();
+  let verified: Promise<QuoteReader | undefined> | undefined;
+  const alternateForBlock = async () => {
+    if (!recovery || !('blockHash' in pin)) return undefined;
+    // Use independent transports. A fallback client could otherwise confirm its own hash twice.
+    return verified ??= Promise.all([recovery.primary, recovery.alternate].map(reader => reader.getBlock({ blockNumber })))
+      .then(headers => headers.every(header => header.number === blockNumber && header.hash === recovery.blockHash)
+        ? recovery.alternate : undefined).catch(() => undefined);
+  };
   const usdLimit = loanLimitWei(maxLoanUsd, ethUsd) ?? 0n;
   const ladder = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
     : test ? testAmounts : extraSize === undefined || amounts.includes(extraSize) ? amounts : [...amounts, extraSize];
@@ -297,7 +352,7 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     return sellPools.length ? [{ market, pool, size, sellPools, auditSize }] : [];
   })));
   const bought = await quoteArbitrumPools(client, blockNumber,
-    buys.map(({ market, pool, size }) => quote(market.token, pool, true, size)));
+    buys.map(({ market, pool, size }) => quote(market.token, pool, true, size)), pin, quoteRecovery, alternateForBlock);
   let prunedAfterBuy = 0;
   const sells = buys.flatMap(({ market, pool, size, sellPools, auditSize }, i) => {
     const amount = bought[i].result?.[0] ?? 0n;
@@ -313,8 +368,7 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     });
   });
   const sold = await quoteArbitrumPools(client, blockNumber,
-    sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)));
-  const unavailableLegs = [...bought, ...sold].filter((row) => row.status === 'failure' && aggregateFailure(row.error)).length;
+    sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)), pin, quoteRecovery, alternateForBlock);
   const opportunities: ArbQuote[] = [];
   let bestQuote: SampledQuote | null = null;
   let largestQuote: SampledQuote | null = null;
@@ -344,7 +398,7 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     payoutUsd: Number(formatEther(quote.payout)) * ethUsd,
   } : null;
   return {
-    ethUsd, quotedRoutes, prunedRoutes: prunedRoutes + prunedAfterBuy, prunedAfterBuy, unavailableLegs,
+    ethUsd, quotedRoutes, prunedRoutes: prunedRoutes + prunedAfterBuy, prunedAfterBuy, unavailableLegs: quoteRecovery.remaining, quoteRecovery,
     opportunities, sizingAmount: sizingLead?.amount,
     best: best ? { symbol: best.symbol, payoutUsd: Number(formatEther(best.payout)) * ethUsd } : null,
     bestQuote: report(bestQuote), largestQuote: report(largestQuote),

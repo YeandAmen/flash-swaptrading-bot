@@ -15,7 +15,8 @@ import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.j
 import { reconcileArbitrumIntent, type ArbitrumIntent } from './settlement.js';
 import { arbitrumTestLeads } from './test-leads.js';
 import {
-  arbitrumChainId, arbitrumClient, arbitrumEthUsd, arbitrumProbeSize, defaultArbitrumRpc,
+  alternateArbitrumReadRpc, arbitrumChainId, arbitrumClient, arbitrumEthUsd, arbitrumProbeSize, arbitrumQuoteRecoveryReaders,
+  defaultArbitrumRpc, emptyArbitrumQuoteRecovery,
   refreshArbitrumPools, scanArbitrum, type ArbQuote, type RecentArbitrumSizingLead,
 } from './market.js';
 
@@ -68,8 +69,9 @@ function receiptStatus(broadcast?: ArbitrumBroadcast): string {
 export class ArbitrumWorker {
   private readonly rpcUrl = process.env.ARBITRUM_RPC_URL ?? defaultArbitrumRpc;
   private readonly client = arbitrumClient(this.rpcUrl);
+  private readonly quoteReaders = arbitrumQuoteRecoveryReaders(this.rpcUrl);
   private readonly alternateWriter = this.rpcUrl.replace(/\/$/, '') === defaultArbitrumRpc
-    ? arbitrumClient('https://arbitrum-one-rpc.publicnode.com') : null;
+    ? arbitrumClient(alternateArbitrumReadRpc) : null;
   private readonly executionEnabled = process.env.ARBITRUM_LIVE === 'on' && CONFIG.allowLiveTrading;
   private markets: Awaited<ReturnType<typeof refreshArbitrumPools>>['markets'] = [];
   private knownPools?: Awaited<ReturnType<typeof refreshArbitrumPools>>['knownPools'];
@@ -109,7 +111,9 @@ export class ArbitrumWorker {
     canArm: this.enabled && this.executionEnabled,
     status: this.enabled ? 'Starting' : 'Disabled',
     block: 0, pools: 0, routes: 0, simulated: 0, updatedAt: 0, netEstimateUsd: null as number | null,
-    prunedRoutes: 0, prunedAfterBuy: 0, unavailableLegs: 0, pathRoutes: 0, pathStatus: 'Awaiting implementation verification',
+    prunedRoutes: 0, prunedAfterBuy: 0, unavailableLegs: 0, quoteRecovery: emptyArbitrumQuoteRecovery(),
+    quoteRecoveryTotals: { scans: 0, ...emptyArbitrumQuoteRecovery() },
+    pathRoutes: 0, pathStatus: 'Awaiting implementation verification',
     pathPools: 0, pathBlock: 0, pathMarkets: 0, pathUnavailable: 0,
     pathBest: null as { route: string; payoutUsd: number; loanUsd: number } | null,
     bestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['bestQuote'],
@@ -244,7 +248,9 @@ export class ArbitrumWorker {
     }
     if (this.journal?.pending) await this.reconcile();
     const quoteAt = Date.now();
-    const block = await this.client.getBlockNumber({ cacheTime: 0 });
+    const header = this.quoteReaders && !activeFlashTest(this.journal?.test) ? await this.client.getBlock().catch(() => null) : null;
+    const block = header?.number ?? await this.client.getBlockNumber({ cacheTime: 0 });
+    const recovery = header?.hash && this.quoteReaders ? { ...this.quoteReaders, blockHash: header.hash } : undefined;
     if (Date.now() >= this.refreshAfter) {
       const discovery = await refreshArbitrumPools(this.client, block, this.knownPools);
       this.knownPools = discovery.knownPools;
@@ -275,7 +281,7 @@ export class ArbitrumWorker {
       this.observePaths(block, price, generation);
     }
     const result = await scanArbitrum(this.client, block, this.markets,
-      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize, MEV.maxLoanUsd, screenRoundTrips, price);
+      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize, MEV.maxLoanUsd, screenRoundTrips, price, recovery);
     const candidates = result.opportunities;
     if (test) test.checked += result.quotedRoutes;
     else this.sizingLead = result.sizingAmount === undefined ? null : { amount: result.sizingAmount, at: quoteAt };
@@ -285,6 +291,12 @@ export class ArbitrumWorker {
     this.summary.prunedRoutes = result.prunedRoutes;
     this.summary.prunedAfterBuy = result.prunedAfterBuy;
     this.summary.unavailableLegs = result.unavailableLegs;
+    this.summary.quoteRecovery = result.quoteRecovery;
+    const totals = this.summary.quoteRecoveryTotals;
+    totals.scans++;
+    for (const field of Object.keys(result.quoteRecovery) as (keyof typeof result.quoteRecovery)[]) {
+      totals[field] += result.quoteRecovery[field];
+    }
     this.summary.updatedAt = Date.now();
     this.summary.bestQuote = result.bestQuote;
     this.summary.largestQuote = result.largestQuote;

@@ -65,7 +65,7 @@ test('partial pool discovery preserves verified pools, includes new ones and ret
       });
     },
   };
-  Object.assign(worker, { verified: true, owner: '', client });
+  Object.assign(worker, { verified: true, owner: '', client, quoteReaders: undefined });
   await worker.scan();
   assert.equal(worker.summary.pools, 2, 'the first USDC.e pool alone cannot form a round trip');
   block = 101n;
@@ -134,7 +134,7 @@ function fixture(options: { simulate?: boolean; unavailable?: boolean } = {}) {
   };
   const markets = [{ symbol: 'A', token, pools: [token, contract].map((pool, i) =>
     ({ kind: 2, pool, fee: i === 0 ? 100 : 500, tickSpacing: 0, nativeEth: false })) }];
-  Object.assign(worker, { client, contract, owner: token, journal, deployment, markets,
+  Object.assign(worker, { client, contract, owner: token, journal, deployment, markets, quoteReaders: undefined,
     verified: true, halted: false, refreshAfter: Infinity, executorCheckAt: Infinity });
   Object.assign(worker.summary, { executor: contract, mode: 'live' });
   return { worker, foundPaths, twoSwapReads, releasePreparation, preparations, journal, deployment,
@@ -148,8 +148,16 @@ test('a truncated Arbitrum activity entry retains the numeric count of unavailab
   await f.worker.scan();
   const { logs, unavailableLegs } = f.worker.view();
   assert.equal(unavailableLegs, 2);
+  assert.equal(f.worker.view().quoteRecovery.before, 2);
+  assert.equal(f.worker.view().quoteRecovery.recovered, 0);
+  assert.equal(f.worker.view().quoteRecovery.remaining, unavailableLegs);
   assert.equal(logs[0].message.length, 280);
   assert.match(logs[0].message, /^Block 100: 0 two-swap quotes across 2 pools, 2 unavailable quote legs\./);
+  await f.worker.scan();
+  const latest = f.worker.view();
+  assert.equal(latest.quoteRecoveryTotals.scans, 2);
+  assert.equal(latest.quoteRecoveryTotals.before, 2 + latest.quoteRecovery.before);
+  assert.equal(latest.quoteRecoveryTotals.remaining, 2 + latest.quoteRecovery.remaining);
   f.worker.stop();
   f.foundPaths.resolve();
 });
