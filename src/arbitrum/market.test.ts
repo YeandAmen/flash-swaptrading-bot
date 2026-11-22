@@ -148,3 +148,96 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
   assert.equal(recovered.unavailableLegs, 1);
   assert.deepEqual(recovered.opportunities, []);
 });
+
+test('Arbitrum distributes the full audit without delaying eligible or unknown-price quotes', async (t) => {
+  const addr = (value: number) => `0x${value.toString(16).padStart(40, '0')}` as Address;
+  const markets: Parameters<typeof scanArbitrum>[2] = [13, 10, 9, 8, 7, 6, 4, 4, 4].map((count, market) => ({
+    token: addr(market + 1), symbol: `T${market}`,
+    pools: Array.from({ length: count }, (_, pool) => ({
+      kind: 2 as const, pool: addr(1_000 + market * 100 + pool), fee: 100 + market * 100 + pool,
+      tickSpacing: 0, nativeEth: false,
+    })),
+  }));
+  const watched = markets.at(-1)!;
+  const [high, low, , unknown] = watched.pools;
+  const weth = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
+  const key = (token: Address, buy: number, sell: number, size: bigint) => [token, buy, sell, size].join('/');
+  let legs = 0;
+  let spotReads = 0;
+  let combinations = new Set<string>();
+  const client = {
+    readContract: async ({ functionName }: { functionName: string }) => {
+      if (functionName === 'FLASHLOAN_PREMIUM_TOTAL') return 5n;
+      if (functionName === 'getConfiguration') return (1n << 56n) | (1n << 63n);
+      if (functionName === 'balanceOf') return parseEther('500');
+      throw new Error('Unexpected contract read');
+    },
+    multicall: async ({ blockNumber, batchSize, contracts }: {
+      blockNumber: bigint; batchSize?: number; contracts: {
+        address: Address; functionName: string;
+        args: [{ tokenIn: Address; tokenOut: Address; fee: number; amountIn: bigint }];
+      }[];
+    }) => {
+      assert.equal(blockNumber, 100n);
+      if (contracts[0].functionName === 'slot0') {
+        spotReads++;
+        return contracts.map(({ address }) => address === unknown.pool ? { status: 'failure' }
+          : { status: 'success', result: [address === high.pool ? 2n ** 97n : 2n ** 96n] });
+      }
+      assert.equal(batchSize, 6000);
+      legs += contracts.length;
+      return contracts.map(({ args: [{ tokenIn, fee, amountIn }] }) => {
+        // The tag on the mock buy output identifies its pool in the mock sell request.
+        if (tokenIn === weth) return { status: 'success', result: [amountIn + BigInt(fee)] };
+        const buy = amountIn % 10_000n;
+        const size = amountIn - buy;
+        combinations.add(key(tokenIn, Number(buy), fee, size));
+        return { status: 'success', result: [size] };
+      });
+    },
+  } as unknown as ArbitrumClient;
+  const run = async (screen: Parameters<typeof scanArbitrum>[6], scan = 0, manual = false) => {
+    legs = spotReads = 0;
+    combinations = new Set();
+    const extra = scan % 2 === 1 ? parseEther('0.1') : undefined;
+    const order = scan % 2 === 1 ? [...markets].reverse().map((market) => ({ ...market, pools: [...market.pools].reverse() })) : markets;
+    const result = await scanArbitrum(client, 100n, order, manual, extra, 1_000_000, screen, Promise.resolve(2_000));
+    assert.equal(result.quotedRoutes, combinations.size);
+    return { quotes: combinations, legs, spotReads };
+  };
+  const full = await run(false);
+  const regular = await run(true);
+  assert.equal(full.spotReads, 0);
+  assert.equal(regular.spotReads, 1);
+  const baseSize = parseEther('0.05');
+  assert.ok(regular.quotes.has(key(watched.token, low.fee, high.fee, baseSize)), 'the known favorable direction stays eligible');
+  assert.ok(regular.quotes.has(key(watched.token, high.fee, unknown.fee, baseSize)), 'unknown prices stay eligible');
+  const auditCounts = new Map([...full.quotes].filter((quote) => !regular.quotes.has(quote)).map((quote) => [quote, 0]));
+  assert.ok(auditCounts.size > 2_000);
+
+  let oldPeak = full.legs;
+  let newPeak = 0;
+  let oldTotal = 0;
+  let newTotal = 0;
+  for (let scan = 0; scan < 10; scan++) {
+    const old = scan === 0 ? full : await run(true, scan);
+    const spread = await run({ auditScan: scan }, scan);
+    for (const quote of scan === 0 ? regular.quotes : old.quotes) assert.ok(spread.quotes.has(quote));
+    for (const quote of spread.quotes) {
+      if (auditCounts.has(quote)) auditCounts.set(quote, auditCounts.get(quote)! + 1);
+      else assert.ok(regular.quotes.has(quote) || (scan % 2 === 1 && old.quotes.has(quote)));
+    }
+    oldPeak = Math.max(oldPeak, old.legs);
+    newPeak = Math.max(newPeak, spread.legs);
+    oldTotal += old.legs;
+    newTotal += spread.legs;
+  }
+  assert.ok([...auditCounts.values()].every((count) => count === 1));
+  assert.equal(newTotal, oldTotal);
+  assert.ok(newPeak < oldPeak / 4);
+  t.diagnostic(`Planned quote legs per pass peaked at ${oldPeak} before and ${newPeak} after, with ${newTotal} legs per full cycle in both cases`);
+
+  const manual = await run({ auditScan: 1 }, 1, true);
+  assert.equal(manual.spotReads, 0);
+  assert.equal(manual.quotes.size, full.quotes.size / 5 * 11);
+});

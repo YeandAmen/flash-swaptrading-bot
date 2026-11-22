@@ -41,6 +41,7 @@ const amounts = ['0.05', '0.25', '1', '4', '16'].map((size) => parseEther(size))
 const explorationSizes = ['0.01', '0.1', '0.5', '2', '8', '32', '64'].map((size) => parseEther(size));
 const refinementRatios = [[3n, 2n], [3n, 4n], [2n, 1n], [1n, 2n]] as const;
 const quoteLeadMaxAge = 30_000;
+const auditInterval = 10;
 const maxRetryQuoteLegs = 96;
 const profitTestAmounts = ['0.015', '0.05', '0.1', '0.25', '1', '4', '8', '16', '32', '64'].map((size) => parseEther(size));
 const testAmounts = ['0.0002', '0.0006', '0.0018', '0.005', '0.015', '0.05', '0.1', '0.25', '1', '4', '16'].map((size) => parseEther(size));
@@ -83,6 +84,23 @@ type SizingLead = { amount: bigint; payout: bigint };
 type SampledQuote = SizingLead & { symbol: string };
 export type RecentArbitrumSizingLead = { amount: bigint; at: number };
 type SpotRate = { tokenOut: bigint; baseIn: bigint; lpFee: bigint };
+
+function auditBuyPools(markets: Market[], scan: number): Set<Pool> {
+  const bucket = scan % auditInterval;
+  const loads = Array<number>(auditInterval).fill(0);
+  const selected = new Set<Pool>();
+  const ordered = markets.flatMap(({ token, pools }) => pools.map((pool) => ({
+    pool, weight: pools.length,
+    key: [token, pool.kind, pool.pool, pool.fee, pool.tickSpacing, pool.nativeEth].join('/'),
+  }))).sort((a, b) => b.weight - a.weight || a.key.localeCompare(b.key));
+  for (const { pool, weight } of ordered) {
+    // A buy shares its result across every other pool in the market. Count both the buy and its sells.
+    const lightest = loads.indexOf(Math.min(...loads));
+    loads[lightest] += weight;
+    if (lightest === bucket) selected.add(pool);
+  }
+  return selected;
+}
 
 export function arbitrumProbeSize(scan: number, lead: RecentArbitrumSizingLead | null, now: number): bigint | undefined {
   if (scan % 2 === 0) return undefined;
@@ -223,7 +241,8 @@ export async function arbitrumEthUsd(client: ArbitrumClient, blockNumber?: bigin
 }
 
 export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[],
-  test: boolean | number = false, extraSize?: bigint, maxLoanUsd = 1_000_000, screenRoundTrips = false,
+  test: boolean | number = false, extraSize?: bigint, maxLoanUsd = 1_000_000,
+  screenRoundTrips: boolean | { auditScan: number } = false,
   price = arbitrumEthUsd(client, blockNumber)) {
   const [premiumBps, config, available, ethUsd, spotRates] = await Promise.all([
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'FLASHLOAN_PREMIUM_TOTAL', blockNumber }),
@@ -239,11 +258,14 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
   const ladder = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
     : test ? testAmounts : extraSize === undefined || amounts.includes(extraSize) ? amounts : [...amounts, extraSize];
   const sizes = ladder.filter((size) => size > 0n && size <= available && size <= usdLimit);
+  const audit = test === false && typeof screenRoundTrips === 'object' ? auditBuyPools(markets, screenRoundTrips.auditScan) : undefined;
   let prunedRoutes = 0;
   const buys = markets.flatMap((market) => market.pools.flatMap((pool) => sizes.flatMap((size) => {
+    // The previous full audit ran on an even scan and covered only the base ladder.
+    const auditSize = audit?.has(pool) && amounts.includes(size);
     const sellPools = market.pools.filter((sell) => {
       if (sell === pool) return false;
-      if (mayProfitAtArbitrumSpot(size, premiumBps, spotRates?.get(pool), spotRates?.get(sell))) return true;
+      if (auditSize || mayProfitAtArbitrumSpot(size, premiumBps, spotRates?.get(pool), spotRates?.get(sell))) return true;
       prunedRoutes++;
       return false;
     });

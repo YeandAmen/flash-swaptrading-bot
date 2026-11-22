@@ -25,7 +25,6 @@ const dayMs = 86400_000;
 const txLimitUsd = Math.min(0.50, CONFIG.maxSwapNetworkFeeUsd);
 const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
-const fullMarketAuditInterval = 10;
 const transferAbi = [parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)')] as const;
 const morpho = '0x6c247b1F6182318877311737BaC0844bAa518F5e';
 const preparationStatus: Record<ArbitrumOrderRejection, string> = {
@@ -267,8 +266,8 @@ export class ArbitrumWorker {
     }
     const regularScan = test ? undefined : this.regularScans++;
     const extraSize = regularScan === undefined ? undefined : arbitrumProbeSize(regularScan, this.sizingLead, Date.now());
-    // Audit the complete book regularly, while ordinary scans can skip paths that cannot repay at marginal prices.
-    const screenRoundTrips = regularScan !== undefined && regularScan % fullMarketAuditInterval !== 0;
+    // Audit a different slice each regular scan while always quoting possible or unknown-price routes.
+    const screenRoundTrips = regularScan === undefined ? false : { auditScan: regularScan };
     const price = arbitrumEthUsd(this.client, block);
     const supportsPaths = this.deployment.verified && arbitrumSupportsPaths(this.deployment.releaseHash);
     if (regularScan !== undefined && !this.journal?.pending && (supportsPaths || regularScan % 10 === 1)) {
