@@ -52,7 +52,7 @@ export function startExpansion() {
     return arbitrum.summary.prunedRoutes > 0 && !arbitrum.summary.pending ? 4_000 : undefined;
   }, 6_000, (error) => arbitrum.scanError(error));
   if (solanaEnabled) void poll(async () => {
-    const { scanSolanaCycle, solanaScanConfig, solanaVenuePairs } = await import('./solana/scan.js');
+    const { scanSolanaCycle, solanaScanConfig, solanaDiscoveryPairs, solanaVenuePairs } = await import('./solana/scan.js');
     const config = solanaScanConfig();
     let liveError: string | null = null;
     if (solanaCanArm) {
@@ -81,9 +81,10 @@ export function startExpansion() {
         ? sizes[scan % sizes.length]
         : Math.min(100_000, test.minimumLoanUsd * solanaProfitTestMultipliers[scan % solanaProfitTestMultipliers.length]);
     } else if (config.loanUsdc !== undefined && config.loanUsdc >= 1 && config.loanUsdc <= 100_000) {
-      solanaMarket ??= new SolanaMarketPlanner(solanaVenuePairs.length);
+      solanaMarket ??= new SolanaMarketPlanner(solanaDiscoveryPairs.length);
       probe = solanaMarket.plan(config.loanUsdc, Date.now());
-      config.venuePair = solanaVenuePairs[probe.venue];
+      config.venuePair = solanaDiscoveryPairs[probe.venue];
+      config.compareReturnVenues = true;
       config.loanUsdc = probe.loanUsdc;
     }
     solanaResult = await scanSolanaCycle(config, execution ? (candidate) => execution.submit(candidate) : undefined, test ?? undefined);

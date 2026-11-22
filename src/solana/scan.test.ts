@@ -7,7 +7,7 @@ import {
 } from './protocol.js';
 import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
 import { queueFlashTest, validSolanaSwapLossUsdc } from '../network-test.js';
-import { scanSolanaCycle, solanaVenuePairs } from './scan.js';
+import { scanSolanaCycle, solanaDiscoveryPairs, solanaVenuePairs } from './scan.js';
 
 const wallet = address('23g1K6sr2bevNwLYPoB79jzEQtErioYQ8mpUa76xA6yu');
 const tokenProgram = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
@@ -51,6 +51,9 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   let reportedNativeDebit = fee;
   let checkLossGuards = false;
   let jupiterRequests = 0;
+  let groupedExit: string | undefined;
+  let groupedIssue: 'layout' | 'oversized' | 'accounts' | 'rate-limit' | undefined;
+  const requestedExits: string[][] = [];
   let slowQuote: Promise<void> | undefined;
   const [{ ata: usdcAta }, { ata: solAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
   const account = (owner: string, data: string, space: number, lamports = 10_000_000) =>
@@ -70,18 +73,24 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       const params = url.searchParams;
       const inputMint = params.get('inputMint');
       const outputMint = params.get('outputMint');
-      const venue = params.get('dexes');
+      const requested = params.get('dexes')!.split(',');
+      const paired = requested.includes('BisonFi') ? 'BisonFi' : 'SolFi V2';
+      const venue = requested.length === 1 ? requested[0] : groupedExit === 'paired' ? paired : groupedExit;
+      const issue = requested.length > 1 ? groupedIssue : undefined;
+      if (issue === 'rate-limit') return Response.json({}, { status: 429 });
+      if (requested.length > 1) requestedExits.push(requested);
       const first = inputMint === USDC;
       if (first && venue === 'Meteora DLMM') await slowQuote;
       assert.equal(params.get('wrapAndUnwrapSol'), 'false');
       assert.equal(first ? outputMint : inputMint, WRAPPED_SOL);
       if (!first) assert.equal(params.get('amount'), live ? '3498250000' : '3499000000');
       const outAmount = first ? '3500000000' : returnOut;
-      const bytes = Buffer.alloc(34);
+      const bytes = Buffer.alloc(issue === 'oversized' ? 1_500 : 34);
       Buffer.from('bb64facc31c4af14', 'hex').copy(bytes);
       bytes.writeBigUInt64LE(BigInt(params.get('amount')!), 8);
       bytes.writeBigUInt64LE(BigInt(outAmount), 16);
       bytes.writeUInt16LE(5, 24);
+      if (issue === 'layout') bytes[0] = 0;
       const destination = params.get('destinationTokenAccount');
       const metas = [
         { pubkey: wallet, isSigner: true, isWritable: false },
@@ -90,6 +99,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       const routeMetas = [metas[0], { pubkey: first ? usdcAta : solAta, isSigner: false, isWritable: true }, metas[1],
         ...[inputMint, outputMint, tokenProgram, tokenProgram, destination, JUPITER, JUPITER]
           .map((pubkey) => ({ pubkey, isSigner: false, isWritable: false }))];
+      if (issue === 'accounts') routeMetas[1] = metas[1];
       return Response.json({
         inputMint, outputMint, inAmount: params.get('amount'),
         outAmount,
@@ -222,6 +232,61 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     assert.equal(jupiterRequests, 4, 'query two legs in each direction for the selected venue pair');
     for (const route of guarded.routes) assert.equal(route.status, 'simulated', route.detail);
     assert.equal(submissions, 1, 'submit only the first qualifying guarded route');
+  });
+  await t.test('compares other direct exits and records the actual venue with one quote per leg', async () => {
+    groupedExit = 'PancakeSwap';
+    jupiterRequests = 0;
+    const settings = { ...config, venuePair: solanaDiscoveryPairs[2], compareReturnVenues: true };
+    let submissions = 0;
+    const direct = await scanSolanaCycle(settings, async () => { submissions++; });
+    assert.equal(jupiterRequests, 4);
+    assert.equal(submissions, 1);
+    assert.deepEqual(direct.routes.map((route) => [route.buy, route.sell, route.qualified]),
+      [['SolFi V2', 'PancakeSwap', true], ['BisonFi', 'PancakeSwap', true]]);
+    assert.equal(requestedExits.length, 2);
+    for (const allowed of requestedExits) {
+      assert.equal(new Set(allowed).size, 5);
+      assert.ok(allowed.includes('SolFi V2') !== allowed.includes('BisonFi'));
+    }
+
+    groupedExit = 'unexpected venue';
+    jupiterRequests = 0;
+    const fixed = await scanSolanaCycle(settings, async () => {});
+    assert.equal(jupiterRequests, 6);
+    assert.deepEqual(fixed.routes.map((route) => [route.buy, route.sell, route.qualified]),
+      [['SolFi V2', 'BisonFi', true], ['BisonFi', 'SolFi V2', true]]);
+    // The best grouped price may have an incompatible instruction or be too large to compose.
+    groupedExit = 'PancakeSwap';
+    for (const issue of ['layout', 'oversized'] as const) {
+      groupedIssue = issue;
+      jupiterRequests = 0;
+      submissions = 0;
+      const paired = await scanSolanaCycle(settings, async (candidate) => {
+        submissions++;
+        assert.equal(candidate.feeLamports, BigInt(fee));
+        assert.ok(candidate.net >= 50_000n);
+      });
+      assert.equal(jupiterRequests, 6, 'reuse both first legs and retry each return once');
+      assert.equal(submissions, 1);
+      assert.deepEqual(paired.routes.map((route) => [route.buy, route.sell, route.qualified]),
+        [['SolFi V2', 'BisonFi', true], ['BisonFi', 'SolFi V2', true]]);
+    }
+
+    groupedExit = 'paired';
+    jupiterRequests = 0;
+    const sameVenue = await scanSolanaCycle(settings, async () => assert.fail('Oversized paired route submitted'));
+    assert.equal(jupiterRequests, 4, 'no identical paired retry');
+    assert.ok(sameVenue.routes.every((route) => route.detail?.includes('size limit')));
+    groupedExit = 'PancakeSwap';
+    for (const issue of ['accounts', 'rate-limit'] as const) {
+      groupedIssue = issue;
+      jupiterRequests = 0;
+      const rejected = await scanSolanaCycle(settings, async () => assert.fail('Rejected route submitted'));
+      assert.equal(jupiterRequests, 4, 'account guard failures and upstream throttling do not start a retry');
+      assert.ok(rejected.routes.every((route) => route.status === 'quote-error'));
+    }
+    groupedIssue = undefined;
+    groupedExit = undefined;
   });
   reportedFee = fee + 1;
   const inconsistent = await scanSolanaCycle({ ...config, venuePair: solanaVenuePairs[2] },

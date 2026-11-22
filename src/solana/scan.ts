@@ -1,5 +1,5 @@
 import {
-  AccountRole, address, appendTransactionMessageInstructions, assertIsTransactionMessageWithinSizeLimit,
+  AccountRole, address, appendTransactionMessageInstructions, isTransactionMessageWithinSizeLimit,
   compileTransaction, compressTransactionMessageUsingAddressLookupTables, createSolanaRpc, createTransactionMessage,
   getBase64Decoder, getBase64EncodedWireTransaction, getAddressDecoder, getCompiledTransactionMessageDecoder,
   setTransactionMessageComputeUnitLimit, setTransactionMessageComputeUnitPrice,
@@ -30,12 +30,18 @@ export const solanaVenuePairs = [
   ['Whirlpool', 'Meteora DLMM'],
   ['Raydium CLMM', 'Meteora DLMM'],
 ] as const;
+export const solanaDiscoveryPairs = [
+  solanaVenuePairs[0],
+  ['Meteora DLMM', 'PancakeSwap'],
+  ['SolFi V2', 'BisonFi'],
+] as const;
+const discoveryVenues = solanaDiscoveryPairs.flat();
 const JUPITER_BUILD = 'https://api.jup.ag/swap/v2/build';
 const defaultLoanUsdc = 250;
 export const SOLANA_TEST_MAX_FEE_LAMPORTS = 50_000n;
 
 type Rpc = ReturnType<typeof createSolanaRpc>;
-type VenuePair = typeof solanaVenuePairs[number];
+type VenuePair = typeof solanaVenuePairs[number] | typeof solanaDiscoveryPairs[number];
 type Venue = VenuePair[number];
 type JupiterAccount = { pubkey: string; isWritable: boolean; isSigner: boolean };
 type JupiterInstruction = { programId: string; data: string; accounts: JupiterAccount[] };
@@ -63,6 +69,7 @@ export interface SolanaScanConfig {
   minNetUsdc?: number;
   maxFeeLamports?: number;
   venuePair?: VenuePair;
+  compareReturnVenues?: boolean;
 }
 
 export type SolanaFlashTest = Pick<FlashTest, 'id' | 'minimumNetUsd' | 'minimumLoanUsd' | 'maximumSwapLossUsdc'>;
@@ -113,7 +120,7 @@ export interface PreparedSolanaCycle {
 
 interface SolanaRoute {
   buy: Venue;
-  sell: Venue;
+  sell: string;
   status: 'no-route' | 'quote-error' | 'below-profit-floor' | 'simulation-failed' | 'simulated';
   quotedNetBeforeNetworkUsdc?: number;
   simulatedNetUsdc?: number;
@@ -191,13 +198,14 @@ function deadline() {
 
 export async function buildSwap(
   wallet: Address, input: Address, output: Address, destination: Address,
-  amount: bigint, venue: Venue, apiKey?: string,
+  amount: bigint, venues: Venue | readonly Venue[], apiKey?: string,
 ): Promise<JupiterBuild | null> {
+  const allowedVenues: readonly string[] = typeof venues === 'string' ? [venues] : venues;
   const url = new URL(JUPITER_BUILD);
   url.search = new URLSearchParams({
     inputMint: input, outputMint: output, taker: wallet, amount: amount.toString(),
     destinationTokenAccount: destination, wrapAndUnwrapSol: 'false',
-    slippageBps: String(SLIPPAGE_BPS), dexes: venue, maxAccounts: '22', transactionVersion: '0',
+    slippageBps: String(SLIPPAGE_BPS), dexes: allowedVenues.join(','), maxAccounts: '22', transactionVersion: '0',
   }).toString();
   const result = await fetch(url, {
     headers: apiKey ? { 'x-api-key': apiKey } : {},
@@ -219,7 +227,7 @@ export async function buildSwap(
     throw new Error('Jupiter returned incompatible swap terms');
   }
   if (!swap.routePlan?.length || swap.routePlan.some(({ swapInfo }) =>
-    swapInfo.label !== venue || swapInfo.inputMint !== input || swapInfo.outputMint !== output)) return null;
+    !allowedVenues.includes(swapInfo.label) || swapInfo.inputMint !== input || swapInfo.outputMint !== output)) return null;
   const instruction = swap.swapInstruction;
   if (instruction?.programId !== JUPITER
     || swap.cleanupInstruction || swap.tipInstruction || swap.otherInstructions?.length
@@ -257,11 +265,15 @@ export async function lookupTables(rpc: Rpc, swaps: JupiterBuild[]): Promise<Add
   }));
 }
 
+class RouteCompositionError extends Error {}
+
 export function routeMinimum(swap: JupiterBuild, wallet: Address, source: Address, destination: Address): bigint {
   const bytes = Buffer.from(swap.swapInstruction.data, 'base64');
   const accounts = swap.swapInstruction.accounts;
-  if (bytes.length < 34 || !bytes.subarray(0, 8).equals(routeV2)
-    || bytes.readBigUInt64LE(8) !== rawAmount(swap.inAmount)
+  if (bytes.length < 34 || !bytes.subarray(0, 8).equals(routeV2)) {
+    throw new RouteCompositionError('Jupiter returned an unsupported RouteV2 instruction layout');
+  }
+  if (bytes.readBigUInt64LE(8) !== rawAmount(swap.inAmount)
     || bytes.readBigUInt64LE(16) !== rawAmount(swap.outAmount)
     || bytes.readUInt16LE(24) !== SLIPPAGE_BPS || bytes.readUInt16LE(26) !== 0 || bytes.readUInt16LE(28) !== 0
     || accounts[0]?.pubkey !== wallet || !accounts[0].isSigner
@@ -355,16 +367,28 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   result.status = 'scanned';
 
   let submission: Promise<void> | undefined;
-  result.routes = await Promise.all(venues.map(async (buy, index): Promise<SolanaRoute> => {
-    const sell = venues[1 - index];
+  const scanRoute = async (buy: Venue, index: number, firstQuote?: JupiterBuild): Promise<SolanaRoute> => {
+    const pairedVenue = venues[1 - index];
+    const compareReturns = config.compareReturnVenues && !test && !firstQuote;
+    let reusableFirst = firstQuote;
+    let hasDifferentExit = false;
+    let sell: string = compareReturns ? 'Jupiter direct return' : pairedVenue;
     let quote: number | undefined;
     try {
-      const first = await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy, config.jupiterApiKey);
+      const first = firstQuote ?? await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy, config.jupiterApiKey);
       if (!first) return { buy, sell, status: 'no-route', detail: 'No direct first-leg route' };
+      reusableFirst = first;
       const firstMinimum = execute ? routeMinimum(first, wallet, usdcAta.ata, solAta.ata) : rawAmount(first.otherAmountThreshold);
       if (firstMinimum <= 0n) throw new Error('Jupiter did not guarantee any first-leg output');
-      const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, sell, config.jupiterApiKey);
-      if (!second) return { buy, sell, status: 'no-route', detail: 'No direct return route' };
+      const exits = compareReturns ? discoveryVenues.filter((venue) => venue !== buy) : pairedVenue;
+      const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, exits, config.jupiterApiKey);
+      if (!second) {
+        if (compareReturns && !submission) return scanRoute(buy, index, first);
+        return { buy, sell, status: 'no-route', detail: 'No direct return route' };
+      }
+      const labels = new Set(second.routePlan.map(({ swapInfo }) => swapInfo.label));
+      sell = [...labels].join(' + ');
+      hasDifferentExit = labels.size > 1 || !labels.has(pairedVenue);
       const usedPools = new Set(first.routePlan.map(({ swapInfo }) => address(swapInfo.ammKey)));
       if (second.routePlan.some(({ swapInfo }) => usedPools.has(address(swapInfo.ammKey)))) {
         return { buy, sell, status: 'no-route', detail: 'Routes share a liquidity pool' };
@@ -404,7 +428,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         const message = compressTransactionMessageUsingAddressLookupTables(
           appendTransactionMessageInstructions([borrow, swapInstruction(first), swapInstruction(second), repayment, ...after], prefix), tables,
         );
-        assertIsTransactionMessageWithinSizeLimit(message);
+        if (!isTransactionMessageWithinSizeLimit(message)) throw new RouteCompositionError('Composed Solana transaction exceeds the size limit');
         return compileTransaction(message);
       };
       let transaction = await assemble(createAccounts, []);
@@ -478,10 +502,15 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         qualified,
       };
     } catch (error) {
+      // A different, single-venue exit may fit when the router's best return cannot be composed.
+      if (error instanceof RouteCompositionError && compareReturns && hasDifferentExit && reusableFirst && !submission) {
+        return scanRoute(buy, index, reusableFirst);
+      }
       return { buy, sell, status: quote === undefined ? 'quote-error' : 'simulation-failed', quotedNetBeforeNetworkUsdc: quote,
         detail: summarizeFailure(error, config.jupiterApiKey) };
     }
-  }));
+  };
+  result.routes = await Promise.all(venues.map((buy, index) => scanRoute(buy, index)));
   await submission;
   return result;
 }
