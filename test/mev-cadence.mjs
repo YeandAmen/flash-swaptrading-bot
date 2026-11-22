@@ -65,6 +65,8 @@ try {
   const { mevReadClient } = await import('../dist/chain.js');
   const { CONFIG, MEV } = await import('../dist/config.js');
   const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
+  const { proxyReleaseHash } = await import('../dist/mev/proxy.js');
+  const { FLASH_ARB_LOGIC_V3_ABI } = await import('../dist/mev/artifact-logic-v3.js');
   const { fundingTrials } = await import('../dist/mev/flash-arb.js');
   const { MevSearcher } = await import('../dist/mev/searcher.js');
   const { rankRouteNet, routeInputSizes } = await import('../dist/mev/sizing.js');
@@ -194,7 +196,7 @@ try {
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
-    protectedDirect = false, beforeSimulate, atSign, pendingForToken }) {
+    protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -219,6 +221,19 @@ try {
       const number = staleHead || (headChangesDuringSigning && signed.length) ? 101n : 100n;
       return { number, hash: hash(number), timestamp: BigInt(block.timestamp) };
     };
+    if (pathRelease) {
+      searcher.file.proxyContract = address(2);
+      searcher.file.proxyRelease = pathRelease;
+      searcher.pathPlanner.scan = async (input) => {
+        assert.equal(input.blockHash, block.hash);
+        const hops = [address(10), address(11), address(12)].map((tokenOut, i) => ({
+          kind: 2, pool: address(40 + i), fee: 500, tickSpacing: 0, nativeEth: false, tokenOut,
+        }));
+        return { status: 'scanned', blockNumber: block.blockNumber, pools: 3, cycles: 1, exactQuotes: 1,
+          candidates: [{ hops, amountIn: oneEth, amountOut: oneEth + coversGas, grossProfit: coversGas,
+            estimatedNet: coversGas, label: 'WETH → A → B → WETH' }] };
+      };
+    }
     searcher.submitSignedDirect = async (pending) => { submitted.push(pending); };
     searcher.submitSignedBundle = async (pending) => { submitted.push(pending); };
     searcher.simulate = async (token, _buy, _sell, amount, _maxBlock, blockNumber) => {
@@ -242,6 +257,12 @@ try {
         assert.equal(blockNumber, undefined);
         finalStates.set('pending', call);
         if (pendingError) throw new Error('Pending state unavailable');
+        if (pathRelease) {
+          const decoded = decodeFunctionData({ abi: FLASH_ARB_LOGIC_V3_ABI, data });
+          assert.equal(decoded.functionName, 'executePath');
+          assert.equal(decoded.args[0], pathRelease);
+          return { data: hash(pendingProfit) };
+        }
         const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data }).args[0];
         return { data: hash(pendingForToken ? pendingForToken(order.token) : pendingProfit) };
       }
@@ -262,6 +283,7 @@ try {
         Date.now = () => Math.floor(now / 1_000) * 1_000;
       }
       MEV.submission = submission;
+      if (pathRelease) MEV.funding = 'morpho';
       MEV.directMaxGasUsd = maximumDirectGasUsd;
       MEV.directProtected = protectedDirect;
       if (maximumTestGasUsd !== undefined) {
@@ -277,6 +299,16 @@ try {
       Date.now = originalNow;
     }
   }
+
+  const pathOptions = { age: 31 * minute, profit: underGas, finalProfit: coversGas, pendingProfit: coversGas, pathRelease: proxyReleaseHash };
+  const pathRun = await scan(pathOptions);
+  assert.equal(pathRun.signed.length, 1, 'the live loop can submit a qualified three-hop candidate');
+  assert.equal(pathRun.submitted[0].opp.funding, 'Morpho Blue');
+  assert.deepEqual(pathRun.finalStates.get('pending'), pathRun.finalStates.get('pinned'));
+  assert.equal(decodeFunctionData({ abi: FLASH_ARB_LOGIC_V3_ABI, data: pathRun.signed[0].data }).functionName, 'executePath');
+  assert.equal((await scan({ ...pathOptions, pathRelease: hash(18) })).signed.length, 0, 'old releases are observation only');
+  assert.equal((await scan({ ...pathOptions, pendingProfit: 0n })).signed.length, 0, 'multi-hop pending state must cover costs');
+  assert.equal((await scan({ ...pathOptions, staleHead: true })).signed.length, 0, 'multi-hop orders use the current head guard');
 
   const opening = await scan({ age: 24 * minute, profit: underGas });
   assert.equal(opening.simulated.size, baseLimit);

@@ -11,6 +11,7 @@ import { FLASH_ARB_V3_ABI, FLASH_ARB_V3_BYTECODE, FLASH_ARB_V3_RUNTIME } from '.
 import { FLASH_ARB_LOGIC_BYTECODE, FLASH_ARB_LOGIC_RUNTIME } from './mev/artifact-logic.js';
 import { FLASH_ARB_LOGIC_V2_BYTECODE, FLASH_ARB_LOGIC_V2_RUNTIME } from './mev/artifact-logic-v2.js';
 import { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_BYTECODE, FLASH_ARB_PROXY_RUNTIME } from './mev/artifact-proxy.js';
+import { proxyReleaseHash, proxyUpgradeData, verifyFlashProxy } from './mev/proxy.js';
 import type { RouteFunding } from './mev/flash-arb.js';
 import { NextVenueKind } from './mev/next-pools.js';
 import { discoverArbPools, poolIdentity, toNextVenue, type ArbPool } from './mev/pools.js';
@@ -513,6 +514,12 @@ if (useProxy) {
   await fork.revert({ id: beforeSpark });
   if (curve) {
     await verifyCurveUpgrade(curve);
+    // Continue exercising the original ABI and venues against the current path-capable release.
+    await confirmed(await walletClient.sendTransaction({
+      account: owner, to: contract, data: proxyUpgradeData(implementationHash),
+    }));
+    implementationHash = proxyReleaseHash;
+    assert.ok(await verifyFlashProxy(contract, owner.address, implementationHash));
     const beforeCurve = await fork.snapshot();
     await buyFixtureTokens(sushiV2Router, parseEther('18'));
     await testRoute('Curve Tricrypto buy with SparkLend through the premium direct searcher', curve, sushiV2, 4, 'premium');

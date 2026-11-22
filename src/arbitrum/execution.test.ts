@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { decodeFunctionData, encodeFunctionResult, parseEther, type Address } from 'viem';
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
+import { ARBITRUM_FLASH_ARB_LOGIC_V2_ABI } from './artifact-logic-v2.js';
+import { arbitrumReleaseHash } from './proxy.js';
+import type { ArbPathQuote } from './paths.js';
 import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
 import type { ArbQuote, ArbitrumClient } from './market.js';
 
@@ -67,6 +70,28 @@ test('an explicit Arbitrum test isolates the network fee exception', async () =>
     { ok: false, reason: 'fee-cap' });
   assert.deepEqual(await prepareArbitrumOrder(clientFor({ payout: 0n }).client, contract, owner, tiny, 2_000, 0.05, 0.50, true),
     { ok: false, reason: 'net-floor' });
+});
+
+test('USDC multi-hop requires its reviewed release and protects dollar costs in six-decimal asset units', async () => {
+  const path: ArbPathQuote = { asset: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', amountIn: 100_000_000n,
+    decimals: 6, symbol: 'USDC', assetUsd: 0.95, loanUsd: 95, payout: 200_000n, payoutUsd: 0.19,
+    block: 100n, label: 'USDC cycle', legs: [owner, contract, owner].map((pool) => ({ kind: 2, pool, tokenOut: contract, tickSpacing: 0 })) };
+  let minimum = 0n;
+  const client = { ...clientFor().client, call: async ({ data }: { data: `0x${string}` }) => {
+    const parsed = decodeFunctionData({ abi: ARBITRUM_FLASH_ARB_LOGIC_V2_ABI, data });
+    assert.equal(parsed.functionName, 'executePath');
+    if (parsed.functionName !== 'executePath') throw new Error('unexpected selector');
+    assert.equal(parsed.args[0], arbitrumReleaseHash);
+    minimum = parsed.args[1].minProfit;
+    return { data: encodeFunctionResult({ abi: ARBITRUM_FLASH_ARB_LOGIC_V2_ABI, functionName: 'executePath', result: path.payout }) };
+  } } as unknown as ArbitrumClient;
+  assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5), { ok: false, reason: 'unsupported-path' });
+  assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5, true, arbitrumReleaseHash),
+    { ok: false, reason: 'unsupported-path' });
+  const prepared = await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5, false, arbitrumReleaseHash);
+  assert.ok(prepared.ok);
+  assert.equal(minimum, 105264n);
+  assert.ok(Math.abs(prepared.netUsd - 0.14) < 1e-10);
 });
 
 test('Arbitrum preparation reports the failing RPC stage without exposing provider errors', async () => {

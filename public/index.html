@@ -187,6 +187,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
     <section class="card network-anchor" id="ethereum-mev" aria-labelledby="ethereumMevHeading">
       <h3 id="ethereumMevHeading">Ethereum MEV &amp; flash loans <span id="mevMode"></span></h3>
       <div class="sub" id="mevStatus" style="margin:-4px 0 10px">Starting…</div>
+      <p class="sub" id="ethPathStatus" hidden></p>
       <div class="stats">
         <div class="stat"><div class="l">Blocks scanned</div><div class="v" id="mevBlocks">–</div></div>
         <div class="stat"><div class="l" title="Best successful on-chain simulation this hour, before transaction costs">Best simulation this hour</div><div class="v" id="mevGap">–</div></div>
@@ -235,6 +236,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
           <span id="arbitrumMode" class="pill wait">CONNECTING</span>
         </div>
         <p id="arbitrumStatus" class="network-status">Waiting for dashboard data…</p>
+        <p id="arbitrumPathStatus" class="sub" hidden></p>
         <dl class="network-stats">
           <div><dt>L2 block</dt><dd id="arbitrumBlock">–</dd></div>
           <div><dt>Routes in last scan</dt><dd id="arbitrumRoutes">–</dd></div>

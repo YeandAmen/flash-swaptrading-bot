@@ -16,9 +16,10 @@ import { sendBundle, submitPrivateDirect, type BuilderResult } from './bundles.j
 import { affordableDirectFees, directExecutionReserve, directFees, directPriorityFee, findNonceConsumer } from './direct.js';
 import { submitDirect } from './direct-broadcast.js';
 import { directCadence, extraRoutes, loanLimitWei } from './cadence.js';
+import { EthereumPathPlanner, type EthereumPathCandidate, type EthereumPathResult } from './multihop.js';
 import { HeadBackfill } from './head-backfill.js';
 import { createHeadWake } from './head-wake.js';
-import { pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
+import { encodePathArbitrage, releaseSupportsPath, pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
 import { comparableRouteQuote, rankRouteNet, routeInputSizes, type RouteQuoteSample } from './sizing.js';
 import { NextVenueKind, UNISWAP_V4_MANAGER } from './next-pools.js';
 import { arbGas, bestCycle, buildStateReads, inventoryCanCoverV2Floor, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
@@ -244,8 +245,7 @@ interface Candidate {
   gasUnits: number;
 }
 
-interface Offer {
-  candidate: Candidate;
+type Offer = ({ candidate: Candidate; path?: undefined } | { path: EthereumPathCandidate; candidate?: undefined; release: Hex }) & {
   amount: bigint;
   profit: bigint;
   funding: RouteFunding;
@@ -350,6 +350,14 @@ export class MevSearcher {
   private readonly startedAt = Date.now();
   private scanWindow: { at: number; candidates: number; simulated: number; bestNetUsd: number | null }[] = [];
   private readonly backfill = new HeadBackfill();
+  private readonly pathPlanner = new EthereumPathPlanner();
+  private pathReadInFlight = false;
+  private pathMarket: { block: number; status: string; pools: number; cycles: number; exactQuotes: number;
+    candidates: number; bestNetUsd: number | null; bestRoute?: string } | null = null;
+  private get pathRelease() {
+    const release = this.file.proxyRelease;
+    return this.contractReady && release && releaseSupportsPath(release) ? release : null;
+  }
   private headWake: ReturnType<typeof createHeadWake> = null;
 
   constructor(private host: MevHost, private persist = true) {
@@ -703,6 +711,8 @@ export class MevSearcher {
     const cadence = historical ? null : this.cadence(now);
     const broadenSizes = Boolean(cadence && cadence.routeLimit > cadence.baseRouteLimit);
     const minimumNet = validPrice(ethUsd) ? this.minimumNet(ethUsd, policy) : 20_000_000_000_000n;
+    const pathScan = !historical && !test && validPrice(ethUsd)
+      ? this.scanPaths(r, ethUsd, minimumNet, screeningFee) : undefined;
     const nextInventory = new Map<string, number>();
     let inventoryPruned = 0;
     let est: { net: number; gross: number; gas: number; symbol: string } | null = null;
@@ -781,9 +791,69 @@ export class MevSearcher {
     if (test && !prioritizeTest && enoughTime && canTest()) {
       await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
     }
+    if (pathScan && this.pathRelease && this.liveArmed(generation) && !this.walletPending() && this.canMeetSendDeadline(r)) {
+      // The two-swap search runs alongside the path quotes. Signing stays in this decision loop.
+      const remaining = CONFIG.forkMode ? SLOT_MS : r.timestamp * 1000 + SLOT_MS - DIRECT_SEND_LEAD_MS - Date.now();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), Math.max(0, remaining)); });
+      const paths = await Promise.race([pathScan, timeout]).finally(() => clearTimeout(timer));
+      if (paths?.blockNumber === r.blockNumber) await this.tryPaths(paths.candidates, r, policy, generation);
+    }
     block.decisionMs = Math.round(performance.now() - started);
     this.recordScan(now, cands.length, this.file.stats.simulated - simulatedBefore, shortlistNet.length ? Math.max(...shortlistNet) : null);
     if (this.file.stats.blocks % 20 === 0) this.save();
+  }
+
+  private scanPaths(r: BlockRead, ethUsd: number, minNetWei: bigint, gasPriceWei: bigint): Promise<EthereumPathResult | null> | undefined {
+    if (!this.persist || this.stopping || this.pathReadInFlight || MEV.submission !== 'direct'
+      || (MEV.funding !== 'auto' && MEV.funding !== 'morpho')) return;
+    const maxLoanWei = loanLimitWei(MEV.maxLoanUsd, ethUsd);
+    const deadlineMs = CONFIG.forkMode ? Date.now() + SLOT_MS : r.timestamp * 1000 + SLOT_MS - DIRECT_SEND_LEAD_MS;
+    if (!maxLoanWei || deadlineMs <= Date.now()) return;
+    this.pathReadInFlight = true;
+    return this.pathPlanner.scan({ blockNumber: r.blockNumber, blockHash: r.hash, tokens: r.tokens.map((token) => token.token),
+      maxLoanWei, minNetWei, gasPriceWei, deadlineMs }).then((result) => {
+      this.pathMarket = { block: Number(result.blockNumber), status: result.status, pools: result.pools, cycles: result.cycles,
+        exactQuotes: result.exactQuotes, candidates: result.candidates.length, bestRoute: result.bestQuote?.label,
+        bestNetUsd: result.bestQuote ? eth(result.bestQuote.estimatedNet) * ethUsd : null };
+      return result;
+    }).catch((error) => {
+      this.pathMarket = { block: Number(r.blockNumber), status: errMsg(error), pools: 0, cycles: 0, exactQuotes: 0,
+        candidates: 0, bestNetUsd: null };
+      return null;
+    }).finally(() => { this.pathReadInFlight = false; });
+  }
+
+  private async tryPaths(paths: EthereumPathCandidate[], r: BlockRead, policy: ProfitPolicy, generation: number) {
+    const release = this.pathRelease;
+    const contract = this.file.proxyContract;
+    if (!release || !contract) return;
+    for (const path of paths) {
+      const price = this.host.ethUsd();
+      if (!validPrice(price) || !this.liveArmed(generation) || this.pathRelease !== release || this.walletPending()
+        || this.activeGasOnlyTest() || !this.canMeetSendDeadline(r)) return;
+      const opp: MevOpp = { t: Date.now(), block: Number(r.blockNumber), symbol: path.label,
+        buy: 'Morpho flash loan', sell: path.hops.length + ' swaps', sizeEth: eth(path.amountIn),
+        grossEth: 0, gasEth: 0, tipEth: 0, netEth: 0, netUsd: 0, funding: FUNDING_NAMES[2], status: 'would send' };
+      try {
+        this.file.stats.simulated++;
+        this.file.stats.rpcCalls++;
+        const data = encodePathArbitrage(path.hops, path.amountIn, 1n, r.blockNumber + 1n, release);
+        const simulated = await mevReadClient.call({ account: this.host.account, to: contract, data, blockNumber: r.blockNumber });
+        if (!simulated.data) continue;
+        const profit = decodeArbitrage(simulated.data);
+        if (profit < this.minimumNet(price, policy)) continue;
+        opp.grossEth = eth(profit);
+        const prepared = await this.prepareLive({ path, release, funding: 2, amount: path.amountIn, profit, score: path.estimatedNet, opp }, r, policy);
+        if (prepared) {
+          this.file.stats.profitable++;
+          await this.sendLive(prepared, r, generation);
+          if (opp.hash) return;
+        }
+      } catch (error) {
+        this.record({ ...opp, status: 'failed', note: 'Multi-hop simulation: ' + reasonOf(error) });
+      }
+    }
   }
 
   private async scanShortlist(selected: Candidate[], r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy,
@@ -855,7 +925,7 @@ export class MevSearcher {
           fallback = bestFallback.offer;
           const extra = await this.prepareLive(bestFallback.offer, r, policy);
           if (extra && canTryLive() && !this.host.tradePending()) {
-            if (!bestFallback.route.primary) {
+            if (!bestFallback.route.primary && extra.offer.candidate) {
               this.file.stats.profitable++;
               const { A, B } = extra.offer.candidate;
               this.cooldown.delete(`${poolIdentity(A)}|${poolIdentity(B)}`);
@@ -1163,6 +1233,7 @@ export class MevSearcher {
     const contract = this.selectedContract;
     const { candidate: c, opp } = offer;
     const gasOnly = test?.requireGasCoverage === false;
+    if (offer.path && (test || MEV.submission !== 'direct' || offer.release !== this.pathRelease)) return null;
     if (test && (this.activeGasOnlyTest() !== test || MEV.submission !== 'direct'
       || (gasOnly && !test.privateSubmission && !test.publicFunctional && offer.funding === 0) || offer.profit < 1n)) return null;
     if (!contract) return this.skipOpportunity(opp, `verified ${this.contractLabel} unavailable`);
@@ -1187,8 +1258,10 @@ export class MevSearcher {
       : privateGasOnly || profitTest ? PRIVATE_FUNCTIONAL_TEST_WINDOW
         : privateLive ? PRIVATE_LIVE_WINDOW : privateSubmission ? PRIVATE_DIRECT_WINDOW : DIRECT_WINDOW;
     let target = r.blockNumber + BigInt(horizon);
-    const encode = (tip: bigint, minProfit: bigint) => this.liveData(encodeArbitrage(offer.funding, {
-      buy: c.A, sell: c.B, token: c.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
+    const encode = (tip: bigint, minProfit: bigint) => offer.path !== undefined
+      ? encodePathArbitrage(offer.path.hops, offer.amount, minProfit, target, offer.release)
+      : this.liveData(encodeArbitrage(offer.funding, {
+        buy: offer.candidate.A, sell: offer.candidate.B, token: offer.candidate.t.token.address, amountIn: offer.amount, minProfit, tip, maxBlock: target,
     }));
     try {
       // Estimate the applicable payment path before simulating exact calldata and gas.
@@ -1200,7 +1273,7 @@ export class MevSearcher {
       const [estimate, preferredTip, previousQuotes] = await Promise.all([
         mevReadClient.estimateGas({ account: this.host.account, to: contract, data: encode(direct ? 0n : 1n, 1n), blockNumber: r.blockNumber }),
         direct ? directPriorityFee(premiumAvailable ? PREMIUM_QUOTE_CAP_WEI : priorityCap, true) : 0n,
-        Promise.all(earlier.map((height) => this.simulate(c.t, c.A, c.B, offer.amount, target, height, offer.funding))),
+        c ? Promise.all(earlier.map((height) => this.simulate(c.t, c.A, c.B, offer.amount, target, height, offer.funding))) : [],
       ]);
       if (test?.publicFunctional && (previousQuotes.length !== 2
         || previousQuotes.some((quote) => !quote.ok || quote.profit * 2n < offer.profit))) {
@@ -1316,7 +1389,7 @@ export class MevSearcher {
     const skip = (note: string) => { this.skipOpportunity(opp, note); };
     const stillLive = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
       && !this.deploying && !this.host.tradePending() && this.canMeetSendDeadline(r);
-    const canSend = () => stillLive() && (!test || this.activeGasOnlyTest() === test);
+    const canSend = () => stillLive() && (!offer.path || (this.pathRelease === offer.release && !this.activeGasOnlyTest())) && (!test || this.activeGasOnlyTest() === test);
     if (!canSend()) return skip('target slot passed or MEV became unavailable before signing');
     if (this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
     try {
@@ -2012,6 +2085,7 @@ export class MevSearcher {
       pools: this.tokens.reduce((s, t) => s + t.pools.length, 0),
       venues,
       coverage: this.universe.view(),
+      multiHop: { supported: Boolean(this.pathRelease), market: this.pathMarket },
       lastBlock: this.lastBlock,
       cadence: this.cadence(now),
       gasOnlyTest: this.gasOnlyTestView(),

@@ -1,0 +1,167 @@
+import { formatUnits, parseAbi, zeroAddress, type Address } from 'viem';
+import { loanLimitWei } from '../mev/cadence.js';
+import type { ArbitrumClient } from './market.js';
+
+const weth: Address = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
+const usdc: Address = '0xaf88d065e77c8cc2239327c5edb3a432268e5831';
+const arb: Address = '0x912ce59144191c1204e64559fe8253a0e49e6548';
+const usdg: Address = '0x004b506865409877c9fa29bfb1eba929984b9bbc';
+const morpho = '0x6c247b1f6182318877311737bac0844baa518f5e';
+const usdcUsdFeed = '0x50834f3163758fcc1df9973b6e91f0f0f0434ad3';
+const uniFactory: Address = '0x1f98431c8ad98523631ae4a59f267346ea31f984';
+const aeroFactory: Address = '0x88a60ee77392577c355c0acb2a8d476d5a4ec03a';
+const uniQuoter = '0x61ffe014ba17989e743c5f6cb21bf9697530b21e';
+const aeroQuoter = '0x1ddfec5058180c207f55bb77d95acdd0d8227868';
+const uniFactoryAbi = parseAbi(['function getPool(address,address,uint24) view returns (address)']);
+const aeroFactoryAbi = parseAbi(['function getPool(address,address,int24) view returns (address)']);
+const poolAbi = parseAbi(['function slot0() view returns (uint160 sqrtPriceX96)', 'function liquidity() view returns (uint128)']);
+const balanceAbi = parseAbi(['function balanceOf(address) view returns (uint256)']);
+const clockAbi = parseAbi(['function getCurrentBlockTimestamp() view returns (uint256)']);
+const feedAbi = parseAbi(['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)']);
+const uniQuoteAbi = parseAbi(['function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256,uint160,uint32,uint256)']);
+const aeroQuoteAbi = parseAbi(['function quoteExactInputSingleV3(address pool,address tokenIn,uint256 amountIn,uint160 sqrtPriceLimitX96) returns (uint256,uint160,uint32)']);
+const assets = [weth, usdc, arb, usdg] as const;
+const symbols = new Map<Address, string>([[weth, 'WETH'], [usdc, 'USDC'], [arb, 'ARB'], [usdg, 'USDG']]);
+type Pool = { kind: 2 | 6; pool: Address; token0: Address; token1: Address; tier: number };
+type Edge = { pool: Pool; input: Address; output: Address; rate: number };
+const marketCache = new WeakMap<ArbitrumClient, { block: bigint; pools: Pool[] }>();
+export type ArbPathLeg = { kind: 2 | 6; pool: Address; tokenOut: Address; tickSpacing: number };
+export interface ArbPathQuote {
+  asset: Address; symbol: 'WETH' | 'USDC'; decimals: number; assetUsd: number;
+  amountIn: bigint; payout: bigint; legs: ArbPathLeg[]; block: bigint;
+  loanUsd: number; payoutUsd: number; label: string;
+}
+
+async function discoverPathPools(client: ArbitrumClient, block: bigint) {
+  const cached = marketCache.get(client);
+  if (cached && block >= cached.block && block - cached.block < 1_000n) return cached.pools;
+  const keys: Omit<Pool, 'pool'>[] = [];
+  for (const [i, a] of assets.entries()) for (const b of assets.slice(i + 1)) {
+    const [token0, token1] = a < b ? [a, b] : [b, a];
+    for (const tier of [100, 500, 3000]) keys.push({ kind: 2, token0, token1, tier });
+    for (const tier of [1, 10, 50, 100]) keys.push({ kind: 6, token0, token1, tier });
+  }
+  const rows = await client.multicall({ blockNumber: block, contracts: keys.map(({ token0, token1, kind, tier }) => ({
+    address: kind === 2 ? uniFactory : aeroFactory, abi: kind === 2 ? uniFactoryAbi : aeroFactoryAbi,
+    functionName: 'getPool' as const, args: [token0, token1, tier] as const,
+  })) });
+  const unique = new Set<string>();
+  const pools = keys.flatMap((key, i) => {
+    const pool = rows[i]?.result?.toLowerCase() as Address | undefined;
+    if (!pool || pool === zeroAddress || unique.has(pool)) return [];
+    unique.add(pool);
+    return [{ ...key, pool }];
+  });
+  if (pools.length && rows.every((r) => r.status === 'success')) marketCache.set(client, { pools, block });
+  return pools;
+}
+
+// Spot ranks distinct cycles. Only amount-dependent quotes and a full execution simulation can authorize execution.
+function pathCandidates(base: Address, edges: Edge[], block: bigint) {
+  const cycles: { path: Edge[]; margin: number }[] = [];
+  const walk = (current: Address, path: Edge[], seen: Set<Address>, rate: number) => {
+    for (const edge of edges) {
+      if (edge.input !== current || path.some((step) => step.pool.pool === edge.pool.pool)) continue;
+      const next = [...path, edge];
+      const margin = rate * edge.rate;
+      if (edge.output === base) {
+        if (next.length >= 3 && margin >= 1 - 1e-10) cycles.push({ path: next, margin });
+      } else if (next.length < 4 && !seen.has(edge.output)) {
+        walk(edge.output, next, new Set([...seen, edge.output]), margin);
+      }
+    }
+  };
+  walk(base, [], new Set([base]), 1);
+  cycles.sort((a, b) => b.margin - a.margin);
+  const first = cycles.slice(0, 3);
+  if (cycles.length > 3) first.push(cycles[3 + Number(block % BigInt(cycles.length - 3))]);
+  return first;
+}
+
+function quoteLeg(edge: Edge, amount: bigint) {
+  const { pool, input, output } = edge;
+  if (pool.kind === 6) return { address: aeroQuoter, abi: aeroQuoteAbi, functionName: 'quoteExactInputSingleV3',
+    args: [pool.pool, input, amount, 0n] } as const;
+  return { address: uniQuoter, abi: uniQuoteAbi, functionName: 'quoteExactInputSingle',
+    args: [{ tokenIn: input, tokenOut: output, amountIn: amount, fee: pool.tier, sqrtPriceLimitX96: 0n }] } as const;
+}
+
+export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, ethUsd: number, maxLoanUsd: number) {
+  const result = { opportunities: [] as ArbPathQuote[], best: null as { route: string; payoutUsd: number; loanUsd: number } | null, pools: 0, paths: 0, quotedRoutes: 0, unavailableLegs: 0 };
+  if (!Number.isFinite(ethUsd) || ethUsd <= 0 || !Number.isFinite(maxLoanUsd) || maxLoanUsd <= 0) return result;
+  const [pools, funding] = await Promise.all([
+    discoverPathPools(client, block),
+    client.multicall({ blockNumber: block, contracts: [
+      { address: weth, abi: balanceAbi, functionName: 'balanceOf', args: [morpho] },
+      { address: usdc, abi: balanceAbi, functionName: 'balanceOf', args: [morpho] },
+      { address: usdcUsdFeed, abi: feedAbi, functionName: 'latestRoundData' },
+      { address: '0xca11bde05977b3631167028862be2a173976ca11', abi: clockAbi, functionName: 'getCurrentBlockTimestamp' },
+    ] }),
+  ]);
+  result.pools = pools.length;
+  if (!pools.length) return result;
+  const [prices, liquidity] = await Promise.all((['slot0', 'liquidity'] as const).map((functionName) =>
+    client.multicall({ blockNumber: block, contracts: pools.map(({ pool }) => ({ address: pool, abi: poolAbi, functionName })) })));
+  const edges: Edge[] = [];
+  for (const [i, pool] of pools.entries()) {
+    const sqrt = prices[i]?.result;
+    if (sqrt === undefined || liquidity[i]?.result === undefined) { result.unavailableLegs++; continue; }
+    if (!sqrt || !liquidity[i].result) continue;
+    const spot = (Number(sqrt) / 2 ** 96) ** 2;
+    const keep = pool.kind === 2 ? 1 - pool.tier / 1e6 : 1;
+    edges.push({ pool, input: pool.token0, output: pool.token1, rate: spot * keep },
+      { pool, input: pool.token1, output: pool.token0, rate: keep / spot });
+  }
+  const feed = funding[2].result;
+  const now = funding[3].result;
+  const stableUsd = now && feed && feed[1] > 0n && feed[3] <= now && now - feed[3] <= 3600n && feed[4] >= feed[0] ? Number(feed[1]) / 1e8 : 0;
+  type Trial = { path: Edge[]; asset: Address; symbol: 'WETH' | 'USDC'; usd: number; decimals: number; amountIn: bigint; out: bigint };
+  let trials: Trial[] = [];
+  for (const [i, asset] of [weth, usdc].entries()) {
+    const usd = i === 0 ? ethUsd : stableUsd;
+    const available = funding[i].result as bigint | undefined;
+    if (!available || !usd) continue;
+    const decimals = i === 0 ? 18 : 6;
+    const symbol = i === 0 ? 'WETH' : 'USDC';
+    const cycles = pathCandidates(asset, edges, block);
+    result.paths += cycles.length;
+    const sizes = [50, 250, 1000, 2500, [10_000, 50_000, 250_000, 1_000_000][Number(block % 4n)]];
+    const amounts = [...new Set(sizes.map((size) => {
+      const loan = (loanLimitWei(Math.min(size, maxLoanUsd), usd) ?? 0n) / 10n ** BigInt(18 - decimals);
+      return loan < available ? loan : available;
+    }))].filter((amount) => amount > 0n);
+    for (const { path } of cycles) for (const amountIn of amounts) {
+      trials.push({ path, asset, symbol, usd, decimals, amountIn, out: amountIn });
+    }
+  }
+  for (let hop = 0; trials.length && hop < 4; hop++) {
+    const keys = trials.map((t) => t.path[hop].pool.pool + '/' + t.path[hop].input + '/' + t.out);
+    const reads = new Map(keys.map((key, i) => [key, quoteLeg(trials[i].path[hop], trials[i].out)]));
+    const rows = await client.multicall({ blockNumber: block, batchSize: 900, contracts: [...reads.values()] });
+    const replies = new Map([...reads.keys()].map((key, i) => [key, rows[i]]));
+    trials = trials.filter((trial, i) => {
+      const quoted = replies.get(keys[i])?.result;
+      if (!quoted || quoted[0] <= 0n) { if (!quoted) result.unavailableLegs++; return false; }
+      // Reject a partial concentrated-liquidity fill stopped at the tick range boundary.
+      if (quoted[1] <= 4295128740n || quoted[1] >= 1461446703485210103287273052203988822378723970341n) return false;
+      trial.out = quoted[0];
+      if (hop + 1 < trial.path.length) return true;
+      result.quotedRoutes++;
+      const payout = trial.out - trial.amountIn;
+      const payoutUsd = Number(formatUnits(payout, trial.decimals)) * trial.usd;
+      const loanUsd = Number(formatUnits(trial.amountIn, trial.decimals)) * trial.usd;
+      const label = [trial.symbol, ...trial.path.map((leg) => symbols.get(leg.output))].join(' → ');
+      if (!result.best || payoutUsd > result.best.payoutUsd) result.best = { route: label, payoutUsd, loanUsd };
+      if (payout > 0n) {
+        const legs = trial.path.map(({ pool, output }) => ({ kind: pool.kind, pool: pool.pool,
+          tokenOut: output, tickSpacing: pool.kind === 6 ? pool.tier : 0 }));
+        result.opportunities.push({ asset: trial.asset, symbol: trial.symbol, assetUsd: trial.usd,
+          decimals: trial.decimals, amountIn: trial.amountIn, payout, legs, block,
+          payoutUsd, loanUsd, label });
+      }
+      return false;
+    });
+  }
+  result.opportunities.sort((a, b) => b.payoutUsd - a.payoutUsd);
+  return result;
+}

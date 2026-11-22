@@ -60,7 +60,8 @@ export async function deployArbitrum(publish: boolean, maxFeeUsd: number, owner:
   const feeUsd = Number(formatEther(gasBudget)) * ethUsd;
   const contract = proxy ?? getContractAddress({ from: owner, nonce: BigInt(nonce) });
   if (!publish) return { action, status: 'quote', owner, contract, releaseHash: arbitrumReleaseHash,
-    previousRelease: previous?.releaseHash ?? null, maxFeeEth: formatEther(gasBudget), maxFeeUsd: feeUsd, balanceEth: formatEther(balance) };
+    previousRelease: previous?.releaseHash ?? null, estimatedGas: estimatedGas.toString(), gasLimit: gas.toString(),
+    maxFeePerGasWei: fees.maxFeePerGas.toString(), maxFeeEth: formatEther(gasBudget), maxFeeUsd: feeUsd, balanceEth: formatEther(balance) };
   if (nonce !== pending) throw new Error('Arbitrum wallet already has a pending transaction');
   if (feeUsd > maxFeeUsd) throw new Error('Arbitrum operation exceeds the requested fee cap');
   if (balance < gasBudget) throw new Error('Arbitrum wallet needs native ETH for the operation');

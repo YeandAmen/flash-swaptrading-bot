@@ -206,6 +206,12 @@ function renderArbitrum(arb) {
   const screened = Number.isSafeInteger(arb?.prunedRoutes) && arb.prunedRoutes > 0
     ? ` · ${networkNumber(arb.prunedRoutes)} quotes screened out` : '';
   $('arbitrumStatus').textContent = status + quoteDetail + depth + screened + (scanned ? networkAge(arb.updatedAt) : '');
+  const pathStatus = $('arbitrumPathStatus');
+  pathStatus.hidden = !arb?.pathStatus || arb.mode === 'off';
+  const pathBlock = arb?.pathBlock > 0 ? ' · L2 block ' + networkNumber(arb.pathBlock) : '';
+  const pathBest = Number.isFinite(arb?.pathBest?.payoutUsd)
+    ? ' · ' + arb.pathBest.route + ' ' + networkUsd(arb.pathBest.payoutUsd) + ' before gas' : '';
+  pathStatus.textContent = (arb?.pathStatus ?? '') + pathBlock + pathBest;
   $('arbitrumBlock').textContent = scanned ? networkNumber(arb.block) : '–';
   $('arbitrumRoutes').textContent = scanned ? networkNumber(arb.routes) : '–';
   $('arbitrumGas').textContent = networkGas(arb?.balanceEth, 'ETH');
@@ -507,6 +513,15 @@ function render() {
     const transport = X.mode === 'live' ? '' : direct ? 'Direct Ethereum transactions · ' : 'Private bundles · ';
     $('mevStatus').textContent = (staleScan ? 'Scan is stale · ' : '') + `${transport}${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
       coverage + loanCap + bidding + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
+    const path = X.multiHop?.market;
+    $('ethPathStatus').hidden = !path;
+    if (path) {
+      const routeMode = X.multiHop.supported && X.mode === 'live' ? 'Live' : 'Quote only';
+      const best = Number.isFinite(path.bestNetUsd) ? ' · best estimated net ' + networkUsd(path.bestNetUsd) : '';
+      const release = X.multiHop.supported ? '' : ' · execution requires a verified multi-hop proxy';
+      $('ethPathStatus').textContent = routeMode + ' · 3–4 swaps · block ' + networkNumber(path.block) + ' · '
+        + networkNumber(path.pools) + ' pools · ' + networkNumber(path.exactQuotes) + ' exact quotes · ' + path.status + best + release;
+    }
     const st = X.stats;
     $('mevBlocks').textContent = st.blocks.toLocaleString();
     const B = X.bestThisHour?.exact ? X.bestThisHour : null;

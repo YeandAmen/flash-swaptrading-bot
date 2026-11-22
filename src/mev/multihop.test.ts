@@ -1,0 +1,132 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { getAddress, parseEther, zeroAddress, type Address, type Hex } from 'viem';
+import type { PathEdge, PathReader } from './multihop-market.js';
+import type { EthereumPathScan } from './multihop.js';
+
+process.env.RPC_URL ??= 'http://127.0.0.1:8545';
+const { ADDR } = await import('../config.js');
+const { pathTokens, discoverPathPools } = await import('./multihop-market.js');
+const { quoteEthereumPaths, EthereumPathPlanner } = await import('./multihop.js');
+const a = getAddress('0x0000000000000000000000000000000000000001');
+const b = getAddress('0x0000000000000000000000000000000000000002');
+const c = getAddress('0x0000000000000000000000000000000000000003');
+const WETH = ADDR.weth;
+const labels = new Map([[WETH, 'WETH'], [a, 'A'], [b, 'B'], [c, 'C']]);
+const currentBlock = 100n;
+const settings = (): EthereumPathScan => ({ blockNumber: currentBlock, maxLoanWei: parseEther('0.1'), minNetWei: 1n,
+  gasPriceWei: 10n ** 8n, deadlineMs: Date.now() + 10_000 });
+function edge(from: Address, to: Address, kind: 0 | 2 | 5, rate = 1n, nativeEth = false): PathEdge {
+  const reserveIn = parseEther('1000000');
+  const pool = getAddress('0x' + (BigInt(from) ^ BigInt(to)).toString(16).padStart(40,'0'));
+  const zeroForOne = nativeEth ? from === WETH : BigInt(from) < BigInt(to);
+  const hop = { kind, pool, fee: 0, tickSpacing: kind === 5 ? 1 : 0, nativeEth, tokenOut: to };
+  return { hop, pool: { ...hop, token0: zeroForOne ? from : to, token1: zeroForOne ? to : from }, zeroForOne,
+    tokenIn: from, reserveIn, reserveOut: reserveIn * rate, fee: 0n, rateN: rate, rateD: 1n };
+}
+
+interface Read { address: Address; functionName: string; args?: unknown[] }
+function client(handler: (calls: Read[], block: bigint) => unknown[]): PathReader {
+  return { multicall: async ({ contracts, blockNumber }: { contracts: Read[]; blockNumber: bigint }) => {
+    const results = handler(contracts, blockNumber);
+    return results.map(result => result === undefined ? { status: 'failure' } : { status: 'success', result });
+  } } as unknown as PathReader;
+}
+function constantOut(edge: PathEdge, amount: bigint) {
+  return edge.reserveOut * amount / (edge.reserveIn + amount);
+}
+
+test('path quotes chain exact amounts, cap by Morpho liquidity and gas, rank three and four steps', async () => {
+  const first = edge(WETH,a,2), middle = edge(a,b,5), last = edge(b,WETH,0,2n);
+  const extra = edge(b,c,0), extraLast = edge(c,WETH,0,2n);
+  const edges = [first,middle,last,extra,extraLast];
+  const calls = new Set<bigint>();
+  const reader = client((reads, block) => {
+    assert.equal(block, currentBlock);
+    assert.equal(reads[0].functionName, 'getBlockNumber');
+    return reads.map((r, i) => {
+      if (i === 0) return block;
+      const p = r.args![0] as { amountIn?: bigint; exactAmount?: bigint; tokenIn: Address; poolKey?: { hooks: Address } };
+      if (p.amountIn !== undefined) {
+        assert.equal(p.tokenIn, WETH);
+        calls.add(p.amountIn + 17n);
+        return [p.amountIn + 17n, 1n << 96n];
+      }
+      assert.equal(p.poolKey?.hooks, zeroAddress);
+      assert.ok(calls.has(p.exactAmount!));
+      return [p.exactAmount! * 3n / 4n];
+    });
+  });
+  const liquidity = parseEther('0.02');
+  const out = await quoteEthereumPaths(settings(), reader, edges, liquidity, labels);
+  assert.equal(out.cycles, 2);
+  assert.ok(out.exactQuotes > 0 && out.exactQuotes <= 12);
+  assert.deepEqual(new Set(out.candidates.map(x => x.hops.length)), new Set([3,4]));
+  for (const item of out.candidates) {
+    assert.ok(item.amountIn <= liquidity);
+    assert.equal(item.hops.at(-1)?.tokenOut, WETH);
+    assert.equal(new Set(item.hops.map(h => h.tokenOut)).size, item.hops.length);
+    const got = (item.amountIn + 17n) * 3n / 4n;
+    const final = item.hops.length === 3 ? constantOut(last, got) : constantOut(extraLast, constantOut(extra, got));
+    assert.equal(item.amountOut, final);
+    assert.equal(item.grossProfit, final - item.amountIn);
+    assert.ok(item.estimatedNet < item.grossProfit);
+  }
+  assert.deepEqual(out.candidates.map(x => x.estimatedNet), out.candidates.map(x => x.estimatedNet).sort((l,r) => l < r ? 1 : -1));
+  const costly = await quoteEthereumPaths({ ...settings(), minNetWei: parseEther('1') }, reader, edges, liquidity, labels);
+  assert.deepEqual(costly.candidates, []);
+});
+
+test('failed or mismatched pinned reads, expired scans and nonclosing paths never yield candidates', async () => {
+  const edges = [edge(WETH,a,2),edge(a,b,2),edge(b,WETH,2,2n)];
+  const mismatch = client((reads, block) => reads.map((_,i) => i === 0 ? block - 1n : [parseEther('2')]));
+  const out = await quoteEthereumPaths(settings(), mismatch, edges, parseEther('1'), labels);
+  assert.equal(out.status, 'partial');
+  assert.equal(out.exactQuotes, 0);
+  assert.deepEqual(out.candidates, []);
+  const failed = client((reads, block) => reads.map((_,i) => i === 0 ? block : undefined));
+  assert.deepEqual((await quoteEthereumPaths(settings(), failed, edges, parseEther('1'), labels)).candidates, []);
+  const never = client(() => assert.fail('unexpected RPC read'));
+  assert.equal((await new EthereumPathPlanner().scan({ ...settings(), deadlineMs: 0 }, never)).status, 'stale');
+  assert.equal((await quoteEthereumPaths(settings(), never, edges.slice(0,2), parseEther('1'), labels)).cycles, 0);
+  // Two intermediate visits to A or an early WETH return cannot make a valid four-hop path.
+  assert.equal((await quoteEthereumPaths(settings(), never, [edge(WETH,a,0),edge(a,b,0),edge(b,a,0),edge(a,WETH,0)],
+    parseEther('1'), labels)).cycles, 0);
+});
+
+test('discovers the three known hookless stablecoin crossover keys and rotates extra markets', async () => {
+  const verified = new Set<Hex>(['0x89a3d4f0e5dd5413745f0a79ab29fbb6f12b430ac0b3804aab271c53027ef083',
+    '0x8ed5f4ed25cbd883b62b0880cfd8d8af560cd77fc5cf06d94999f919035c849e',
+    '0x35fd769d8345c2925154e2b19f35d33504c53ad88974d496f73219c958107b11']);
+  const reader = client((calls, block) => calls.map(({ functionName, args }) => {
+    if (functionName === 'getBlockNumber') return block;
+    if (functionName === 'getLiquidity') return verified.has(args![0] as Hex) ? 1n : 0n;
+    return zeroAddress;
+  }));
+  const tokens = pathTokens(currentBlock, []);
+  const result = await discoverPathPools(reader, currentBlock, tokens, settings().deadlineMs);
+  assert.ok(result.complete);
+  assert.deepEqual(new Set(result.pools.map(p => p.id)), verified);
+  assert.ok(result.pools.every(p => p.kind === 5 && !p.nativeEth));
+  const active = [{ address: a, symbol: 'A' }, { address: b, symbol: 'B' }, { address: c, symbol: 'C' }];
+  assert.deepEqual(pathTokens(0n, active).slice(-2).map(t => t.address), [a,b]);
+  assert.deepEqual(pathTokens(32n, active).slice(-2).map(t => t.address), [c,a]);
+});
+
+test('a hash-pinned blocked RPC cannot occupy the worker beyond the scan deadline', async () => {
+  const hash = ('0x' + 'aa'.repeat(32)) as Hex;
+  let reads = 0;
+  const blocked = { multicall: async (request: { blockHash: Hex; requireCanonical: boolean; blockNumber?: bigint }) => {
+    assert.equal(request.blockHash, hash);
+    assert.equal(request.requireCanonical, true);
+    assert.equal(request.blockNumber, undefined);
+    reads++;
+    return new Promise(() => {});
+  } } as unknown as PathReader;
+  const started = Date.now();
+  const out = await new EthereumPathPlanner().scan({ ...settings(), blockHash: hash, deadlineMs: started + 50 }, blocked);
+  assert.ok(reads > 0);
+  assert.equal(out.status, 'stale');
+  assert.ok(Date.now() - started < 1000);
+  assert.deepEqual(out.candidates, []);
+});

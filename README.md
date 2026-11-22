@@ -160,15 +160,18 @@ Paper scanning is available after startup. The default `ALLOW_LIVE_TRADING=off` 
 3. The bot disarms Spot and MEV before signing. It selects the proxy after verifying the receipt, proxy bytecode, ERC-1967 slots, implementation bytecode, and wallet ownership. Use **Arm MEV** separately when you want live arbitrage. An existing standalone deployment remains selected until the proxy passes verification.
 4. When a later bot release includes a new approved implementation, choose **Upgrade FlashArb implementation** and confirm with `UPGRADE`. One transaction creates and activates the new implementation at the same proxy address. The gas quote covers the implementation deployment and switch. An upgrade also disarms both live modes.
 
+The current Ethereum implementation can borrow WETH from Morpho Blue and execute a cycle of three or four swaps. The scanner quotes each leg at the same block, checks the full transaction against the proxy, and applies the configured net profit floor and fee limits before signing. The dashboard shows the pools and exact quotes checked. Proxies running an older implementation can observe these routes and continue executing supported two-swap routes.
+
 Profitable trades repay the lender and forward proceeds and relevant route leftovers to the bot wallet in one transaction. Call the owner-only `sweep` function on the proxy to recover assets transferred to it outside a route.
 
 For maintainers, keep the trading owner in persistent slot zero, the execution lock in transient slot zero, and the existing execution and settlement interfaces compatible. Keep previously supported implementation runtimes in the bot's release list so existing proxies can still operate after a software update. Rebuild with solc 0.8.26, then verify the upgrade on a pinned Ethereum fork using fake funds.
 
 ```sh
-npm run build:contract -- logic-v2
+npm run build:contract -- logic-v3
 npm run build
 npm run wallet:local-test
 FORK_BLOCK_NUMBER=26451239 npm run mev-proxy-fork-test
+FORK_BLOCK_NUMBER=26468992 npm run mev-path-fork-test
 ```
 
 The proxy uses standardized implementation and admin slots. [ERC-1967](https://eips.ethereum.org/EIPS/eip-1967) · [SparkLend Ethereum deployment verification](https://docs.spark.fi/assets/Chainsecurity-SparkLend-Deployment-Verification.pdf)
@@ -234,10 +237,15 @@ With `ARBITRUM_LIVE=on` and global signing enabled, the worker submits qualifyin
 
 Arbitrum uses same-block quotes at several loan sizes. It skips paths whose starting pool prices and LP fees bound the return below a positive payout after repayment. It checks the complete market periodically and falls back to exact quoting when pool prices are unavailable. Its additional size probe explores up to 64 WETH and refines around recent competitive quotes. Quotes respect the configured USD loan cap and Aave's available liquidity. The dashboard reports the best completed quote after the lender fee and before gas.
 
+The current Arbitrum implementation also supports three- and four-swap cycles funded by Morpho Blue in native USDC or WETH. The scanner checks Uniswap v3 and Aero Slipstream pools among WETH, USDC, ARB and USDG. The proxy repays the loan and sends the surplus in the borrowed token to the trading wallet. The dashboard shows completed quotes and the implementation status while older releases continue scanning.
+
 To test with fake funds, use an Arbitrum archive endpoint with state access at the selected L2 block.
 
 ```sh
+npm run build:contract -- arbitrum-logic-v2
+npm run build
 FORK_RPC_URL='<Arbitrum archive RPC URL>' FORK_BLOCK_NUMBER='<L2 block number>' node scripts/fork-test.mjs cli-arbitrum-contract-forktest
+FORK_RPC_URL='<Arbitrum archive RPC URL>' FORK_BLOCK_NUMBER=526440238 npm run arbitrum:path-fork-test
 ```
 
 ### Solana

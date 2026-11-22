@@ -223,12 +223,13 @@ export async function arbitrumEthUsd(client: ArbitrumClient, blockNumber?: bigin
 }
 
 export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[],
-  test: boolean | number = false, extraSize?: bigint, maxLoanUsd = 1_000_000, screenRoundTrips = false) {
+  test: boolean | number = false, extraSize?: bigint, maxLoanUsd = 1_000_000, screenRoundTrips = false,
+  price = arbitrumEthUsd(client, blockNumber)) {
   const [premiumBps, config, available, ethUsd, spotRates] = await Promise.all([
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'FLASHLOAN_PREMIUM_TOTAL', blockNumber }),
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'getConfiguration', args: [weth], blockNumber }),
     client.readContract({ address: weth, abi: balanceAbi, functionName: 'balanceOf', args: [aaveWeth], blockNumber }),
-    arbitrumEthUsd(client, blockNumber),
+    price,
     screenRoundTrips && test === false
       ? readArbitrumSpotRates(client, blockNumber, markets).catch(() => undefined) : undefined,
   ]);
