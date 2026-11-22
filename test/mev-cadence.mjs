@@ -9,6 +9,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'eth-mev-cadence-'));
 const loopback = 'http://127.0.0.1:18647';
 Object.assign(process.env, {
   ALLOW_LIVE_TRADING: 'off',
+  ETHEREUM_AUTO_ARM: 'on',
   FORK_MODE: '1',
   DATA_DIR: temporary,
   WALLET_KEY_FILE: join(temporary, 'disposable-wallet.json'),
@@ -63,9 +64,11 @@ function snapshot(now) {
 
 try {
   const { directCadence, extraRoutes, loanLimitWei } = await import('../dist/mev/cadence.js');
-  const { mevReadClient } = await import('../dist/chain.js');
+  const { mevReadClient, publicClient } = await import('../dist/chain.js');
   const { CONFIG, MEV } = await import('../dist/config.js');
   const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
+  const { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_RUNTIME } = await import('../dist/mev/artifact-proxy.js');
+  const { FLASH_ARB_LOGIC_V3_RUNTIME } = await import('../dist/mev/artifact-logic-v3.js');
   const { proxyReleaseHash } = await import('../dist/mev/proxy.js');
   const { FLASH_ARB_LOGIC_V3_ABI } = await import('../dist/mev/artifact-logic-v3.js');
   const { fundingTrials } = await import('../dist/mev/flash-arb.js');
@@ -197,7 +200,7 @@ try {
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
-    protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport }) {
+    protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport, startup }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -207,7 +210,7 @@ try {
     const block = snapshot(nearingNextBlock ? Math.floor(now / 1_000) * 1_000 - 11_000 : now);
     const searcher = newSearcher(async (tx) => {
       signed.push(tx);
-      seenAtSign.push(...simulated);
+      seenAtSign.push(...simulated, ...liveQuoteTokens);
       atSign?.(tx);
       return '0xc0';
     });
@@ -216,6 +219,13 @@ try {
     searcher.file.armed = !paper;
     searcher.contractReady = !paper;
     searcher.file.v2Contract = address(2);
+    const paperInputs = new Set();
+    const liveQuoteTokens = new Set();
+    const paperQuoteTokens = new Set();
+    if (startup) {
+      searcher.file.proxyContract = address(2);
+      searcher.file.proxyRelease = proxyReleaseHash;
+    }
     searcher.reconcileWallet = async () => {};
     searcher.writeState = () => { if (searcher.file.pending) journaled.push(searcher.file.pending); };
     searcher.head = async () => {
@@ -241,7 +251,7 @@ try {
       if (privateTransport) await submitDirect(pending, bytes, canSend, privateTransport);
     };
     searcher.submitSignedBundle = async (pending) => { submitted.push(pending); };
-    searcher.simulate = async (token, _buy, _sell, amount, _maxBlock, blockNumber) => {
+    if (!startup) searcher.simulate = async (token, _buy, _sell, amount, _maxBlock, blockNumber) => {
       assert.equal(blockNumber, 100n);
       assert.ok(amount <= 500n * oneEth, 'every simulated amount stays under the $1m WETH cap');
       await beforeSimulate?.(token.token.symbol);
@@ -256,7 +266,18 @@ try {
       assert.equal(blockNumber, 100n);
       return estimatedGas;
     };
-    mevReadClient.call = async ({ blockNumber, blockTag, to, data, gas, maxFeePerGas }) => {
+    mevReadClient.call = async ({ blockNumber, blockTag, to, data, gas, maxFeePerGas, stateOverride }) => {
+      if (startup && !gas && !blockTag) {
+        // Exercise the actual simulate() branch for the paper overlay and real proxy.
+        const order = stateOverride ? data : decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data }).args[1];
+        if (!stateOverride) assert.equal(to, address(2));
+        const decoded = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: order }).args[0];
+        const trial = [decoded.token, decoded.buy.pool, decoded.sell.pool, decoded.amountIn, decoded.funding].join('/');
+        if (stateOverride) paperInputs.add(trial);
+        else assert.ok(paperInputs.has(trial), 'only an actual prior paper size, lender and pool combination is retried');
+        (stateOverride ? paperQuoteTokens : liveQuoteTokens).add(decoded.token);
+        return { data: hash(!stateOverride && startup === 'lost' ? underGas : coversGas) };
+      }
       const call = { to, data, gas };
       if (blockTag === 'pending') {
         assert.equal(blockNumber, undefined);
@@ -269,7 +290,8 @@ try {
           assert.equal(decoded.args[0], pathRelease);
           return { data: hash(pendingProfit) };
         }
-        const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data }).args[0];
+        const inner = startup ? decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data }).args[1] : data;
+        const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: inner }).args[0];
         return { data: hash(pendingForToken ? pendingForToken(order.token) : pendingProfit) };
       }
       assert.equal(blockNumber, 100n);
@@ -297,14 +319,70 @@ try {
         searcher.file.proxyContract = address(2);
         searcher.queueGasOnlyTest(testId, maximumTestGasUsd);
       }
+      if (startup === 'disarmed-before') searcher.disarm();
       await searcher.onBlock(block, historical);
-      return { searcher, simulated, signed, submitted, journaled, seenAtSign, finalStates, test: searcher.view().gasOnlyTest };
+      if (startup) {
+        assert.ok(paperQuoteTokens.size > 0 && liveQuoteTokens.size === 0);
+        const originals = Object.fromEntries(['getBlockNumber', 'getCode', 'getStorageAt', 'readContract'].map(k => [k, publicClient[k]]));
+        let unblock;
+        const pendingVerification = new Promise(resolve => { unblock = resolve; });
+        publicClient.getBlockNumber = async () => { await pendingVerification; return block.blockNumber; };
+        publicClient.getCode = async ({ address: addr }) => addr === address(2) ? FLASH_ARB_PROXY_RUNTIME : FLASH_ARB_LOGIC_V3_RUNTIME;
+        publicClient.getStorageAt = async ({ slot }) => hash(slot.startsWith('0xb531') ? 1 : 3);
+        publicClient.readContract = async () => address(1);
+        try {
+          const head = { number: block.blockNumber, hash: block.hash };
+          const verify = searcher.verifyForArm.bind(searcher);
+          let verification;
+          searcher.verifyForArm = (...args) => { verification = verify(...args); return verification; };
+          searcher.headWake = { wait: () => new Promise(() => {}) };
+          const waiting = startup === 'restore' ? searcher.waitForHead(60_000) : null;
+          searcher.arm(startup !== 'manual');
+          await searcher.reconsiderStartupHead(head);
+          assert.equal(liveQuoteTokens.size, 0, 'a pending identity check cannot run the replay');
+          unblock();
+          await verification;
+          assert.ok(searcher.contractReady, 'verified facade, owner, admin and runtime');
+          if (waiting) {
+            let timer;
+            try { await Promise.race([waiting, new Promise((_, reject) => { timer = setTimeout(() => reject(Error('verification did not wake the head loop')), 500); })]); }
+            finally { clearTimeout(timer); }
+          }
+          if (startup === 'rearm') {
+            searcher.disarm();
+            searcher.arm(true);
+            await verification;
+          }
+          if (startup === 'test') searcher.queueGasOnlyTest(testId, 2);
+          if (startup === 'expired') searcher.canMeetSendDeadline = () => false;
+          await searcher.reconsiderStartupHead(startup === 'reorg' ? { ...head, hash: hash(101) } : head);
+          await searcher.reconsiderStartupHead(head);
+        } finally { unblock(); Object.assign(publicClient, originals); }
+      }
+      return { searcher, simulated, signed, liveQuoteTokens, submitted, journaled, seenAtSign, finalStates, test: searcher.view().gasOnlyTest };
     } finally {
       Object.assign(MEV, original);
       Object.assign(CONFIG, originalConfig);
       Date.now = originalNow;
     }
   }
+
+  const warm = { age: minute, profit: coversGas, paper: true, protectedDirect: true };
+  const resumed = await scan({ ...warm, startup: 'restore' });
+  assert.equal(resumed.signed.length, 1, 'verified auto-restore can retry the same head once');
+  assert.equal(resumed.liveQuoteTokens.size, 2, 'only the two strongest ordinary startup routes are retried');
+  assert.equal(new Set(resumed.seenAtSign).size, 2, 'both fresh sibling quotes finish before the wallet is reserved for signing');
+  assert.ok(resumed.finalStates.has('pinned') && resumed.finalStates.has('pending'), 'same signed payload must still clear live checks');
+  for (const startup of ['manual', 'disarmed-before', 'rearm', 'test', 'reorg', 'expired']) {
+    const skipped = await scan({ ...warm, startup });
+    assert.equal(skipped.liveQuoteTokens.size, 0, startup);
+    assert.equal(skipped.signed.length, 0, startup);
+  }
+  const lostWarm = await scan({ ...warm, startup: 'lost' });
+  assert.ok(lostWarm.liveQuoteTokens.size > 0);
+  assert.equal(lostWarm.signed.length, 0, 'an expired paper edge cannot authorize the actual proxy');
+  const lostWarmPending = await scan({ ...warm, startup: 'restore', pendingProfit: underGas });
+  assert.equal(lostWarmPending.signed.length, 0, 'warm replay also honors pending repricing');
 
   const pathOptions = { age: 31 * minute, profit: underGas, finalProfit: coversGas, pendingProfit: coversGas, pathRelease: proxyReleaseHash };
   const pathRun = await scan(pathOptions);

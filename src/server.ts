@@ -358,7 +358,7 @@ const server = app.listen(CONFIG.port, CONFIG.host, () => {
     spotArmed: () => engine.state.armed,
     mevMode: () => engine.mev?.view().mode,
     armSpot: () => engine.arm(),
-    armMev: () => engine.mev?.arm(),
+    armMev: () => engine.mev?.arm(true),
   });
 });
 

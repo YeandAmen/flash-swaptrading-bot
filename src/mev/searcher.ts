@@ -343,6 +343,10 @@ export class MevSearcher {
   private bundleReserved = false;
   private contractReady = false;
   private armGeneration = 0;
+  private startupCapture = process.env.ETHEREUM_AUTO_ARM === 'on';
+  private restoredGeneration: number | null = null;
+  private startupHint: { block: BlockRead; nextMaxBase: bigint; proxy: Address; release: Hex; offers: Offer[] } | null = null;
+  private wakeAfterVerification?: () => void;
   private cooldown = new Map<string, RouteCooldown>();
   private routeQuotes = new Map<string, RouteQuoteSample & { amount: bigint; funding: RouteFunding }>();
   private stopping = false;
@@ -569,8 +573,30 @@ export class MevSearcher {
     }
   }
 
-  private waitForHead(ms: number) {
-    return this.headWake?.wait(ms) ?? sleep(ms);
+  private async waitForHead(ms: number): Promise<void> {
+    if (this.startupHint && this.contractReady && this.restoredGeneration === this.armGeneration) return;
+    const nextHead = this.headWake?.wait(ms) ?? sleep(ms);
+    if (!this.startupHint) { await nextHead; return; }
+    const verified = new Promise<void>(resolve => { this.wakeAfterVerification = resolve; });
+    try { await Promise.race([nextHead, verified]); }
+    finally { this.wakeAfterVerification = undefined; }
+  }
+
+  // Called by the head loop only, after the preceding block's ordinary candidates have finished.
+  private async reconsiderStartupHead(head: Pick<BlockRead, 'hash'> & { number: bigint }) {
+    const hint = this.startupHint;
+    const generation = this.restoredGeneration;
+    if (!hint || !this.contractReady || generation === null || !this.liveArmed(generation)) return;
+    this.startupCapture = false;
+    this.startupHint = null;
+    this.restoredGeneration = null;
+    if (head.hash !== hint.block.hash || head.number !== hint.block.blockNumber || !this.canMeetSendDeadline(hint.block)
+      || this.walletPending() || this.host.tradePending() || this.activeGasOnlyTest()
+      || this.file.proxyContract !== hint.proxy || this.file.proxyRelease !== hint.release) return;
+    const hints = new Map(hint.offers.flatMap(offer => offer.candidate ? [[offer.candidate, offer] as const] : []));
+    this.host.log(`[mev] Rechecking ${hints.size} startup route(s) against the verified proxy at block ${head.number}.`);
+    // Retry only the exact previously quoted loan/venue combinations; wait for both fresh siblings.
+    await this.scanShortlist([...hints.keys()], hint.block, hint.nextMaxBase, this.profitPolicy(Date.now()), generation, () => {}, false, hints);
   }
 
   private async loop() {
@@ -581,6 +607,7 @@ export class MevSearcher {
         if (!this.universe.broad && Date.now() - this.poolsAt > 24 * HOUR) await this.refreshPools();
         const head = await this.head();
         if (head.hash === last?.hash || (last && head.number < last.number)) {
+          await this.reconsiderStartupHead(head);
           const ageMs = Date.now() - Number(head.timestamp) * 1000;
           await this.waitForHead(ageMs < SLOT_MS + 3000 ? HEAD_RETRY_MS : 1000);
           continue;
@@ -686,6 +713,8 @@ export class MevSearcher {
     const generation = this.armGeneration;
     this.file.stats.blocks++;
     if (!historical) {
+      this.startupHint = null;
+      if (this.file.armed && this.contractReady) this.startupCapture = false;
       const recovery = this.reconcileWallet(r.blockNumber);
       if (CONFIG.forkMode) await recovery;
     }
@@ -856,14 +885,32 @@ export class MevSearcher {
     }
   }
 
+  private async recheckStartupOffer(candidate: Candidate, hint: Offer, block: BlockRead, nextMaxBase: bigint): Promise<EvaluatedRoute | null> {
+    const price = this.host.ethUsd();
+    const limit = loanLimitWei(MEV.maxLoanUsd, price);
+    if (!this.contractReady || !validPrice(price) || limit === null || hint.amount > limit) return null;
+    this.file.stats.rpcCalls++;
+    this.file.stats.simulated++;
+    const quote = await this.simulate(candidate.t, candidate.A, candidate.B, hint.amount, block.blockNumber + 1n, block.blockNumber, hint.funding);
+    if (!quote.ok || quote.profit <= 0n) return null;
+    const gasWei = BigInt(candidate.gasUnits + EXECUTION_GAS_ADDON[hint.funding]) * nextMaxBase;
+    const score = quote.profit - gasWei;
+    return { primary: { ...hint, profit: quote.profit, score, opp: {
+      ...hint.opp, t: Date.now(), grossEth: eth(quote.profit), gasEth: eth(gasWei), netEth: eth(score), netUsd: eth(score) * price,
+      note: 'verified startup route',
+    } } };
+  }
+
   private async scanShortlist(selected: Candidate[], r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy,
-    generation: number, observedNet: (usd: number) => void, broadenSizes: boolean): Promise<boolean> {
-    const canTryLive = () => this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending()
-      && (MEV.directProtected || !this.activeGasOnlyTest()?.privateSubmission);
+    generation: number, observedNet: (usd: number) => void, broadenSizes: boolean, startup?: ReadonlyMap<Candidate, Offer>): Promise<boolean> {
+    // If verification finishes during this batch, its earlier simulations still used paper overrides.
+    const startedInPaper = this.startupCapture && !this.contractReady;
+    const canTryLive = () => !startedInPaper && this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending()
+      && (!startup || !this.activeGasOnlyTest()) && (MEV.directProtected || !this.activeGasOnlyTest()?.privateSubmission);
     const canTryFallback = () => canTryLive() && !this.host.tradePending()
       && (CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS);
     const allowFallback = canTryFallback();
-    const pipeline = MEV.submission === 'direct' && canTryLive();
+    const pipeline = !startup && MEV.submission === 'direct' && canTryLive();
     const ready = new Map<number, PreparedOffer>();
     const estimated = new Set<number>();
     let notifyReady!: () => void;
@@ -886,13 +933,15 @@ export class MevSearcher {
       for (const [index, offer] of ranked) {
         if (signed || !canTryLive()) break;
         ready.delete(index);
-        await this.sendLive(offer, r, generation);
+        await this.sendLive(offer, r, generation, Boolean(startup));
         signed = Boolean(offer.offer.opp.hash);
       }
     };
     const finished = Promise.all(selected.map(async (candidate, index) => {
       try {
-        const route = await this.evaluate(candidate, r, nextMaxBase, policy, allowFallback, observedNet, broadenSizes);
+        const hint = startup?.get(candidate);
+        const route = hint ? await this.recheckStartupOffer(candidate, hint, r, nextMaxBase)
+          : await this.evaluate(candidate, r, nextMaxBase, policy, allowFallback, observedNet, broadenSizes);
         if (route?.primary && pipeline && canTryLive()) await preparePrimary(route.primary, index);
         return route;
       } catch (error) {
@@ -930,11 +979,19 @@ export class MevSearcher {
               const { A, B } = extra.offer.candidate;
               this.cooldown.delete(`${poolIdentity(A)}|${poolIdentity(B)}`);
             }
-            await this.sendLive(extra, r, generation);
+            await this.sendLive(extra, r, generation, Boolean(startup));
           }
         }
       }
     } else if (!signed) {
+      const { proxyContract, proxyRelease } = this.file;
+      if (offers.length && this.startupCapture && this.persist && MEV.submission === 'direct' && proxyContract && proxyRelease
+        && !this.activeGasOnlyTest() && !this.walletPending() && startedInPaper
+        && this.canMeetSendDeadline(r)) {
+        const previous = this.startupHint?.block === r ? this.startupHint.offers : [];
+        const best = [...previous, ...offers].sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0).slice(0, 2);
+        this.startupHint = { block: r, nextMaxBase, proxy: proxyContract, release: proxyRelease, offers: best };
+      }
       for (const offer of offers.reverse()) this.record(offer.opp);
     }
     return Boolean(fallback?.opp.hash || offers.some((offer) => offer.opp.hash));
@@ -1380,7 +1437,7 @@ export class MevSearcher {
     }
   }
 
-  private async sendLive(prepared: PreparedOffer, r: BlockRead, generation: number) {
+  private async sendLive(prepared: PreparedOffer, r: BlockRead, generation: number, startup = false) {
     const exec = this.host.exec;
     const account = this.host.account;
     const { offer, contract, ethUsd, data, gas, gasBudget, tip, fees, target, minimumProfit, net, test, premium, privateSubmission } = prepared;
@@ -1389,7 +1446,7 @@ export class MevSearcher {
     const skip = (note: string) => { this.skipOpportunity(opp, note); };
     const stillLive = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
       && !this.deploying && !this.host.tradePending() && this.canMeetSendDeadline(r);
-    const canSend = () => stillLive() && (!offer.path || (this.pathRelease === offer.release && !this.activeGasOnlyTest())) && (!test || this.activeGasOnlyTest() === test);
+    const canSend = () => stillLive() && (!startup || !this.activeGasOnlyTest()) && (!offer.path || (this.pathRelease === offer.release && !this.activeGasOnlyTest())) && (!test || this.activeGasOnlyTest() === test);
     if (!canSend()) return skip('target slot passed or MEV became unavailable before signing');
     if (this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
     try {
@@ -1797,7 +1854,7 @@ export class MevSearcher {
   }
 
   // ------------------------------------------------------------------ arming & the contract
-  arm() {
+  arm(restoreStartupQuotes = false) {
     if (!MEV.enabled) throw new Error('MEV is turned off in .env (MEV=off)');
     if (!CONFIG.allowLiveTrading && !CONFIG.forkMode) throw new Error('Live execution is disabled (ALLOW_LIVE_TRADING=off).');
     if (MEV.submission === 'bundle' && !CONFIG.forkMode && MEV.builders.length === 0) throw new Error('MEV requires at least one configured builder.');
@@ -1816,7 +1873,10 @@ export class MevSearcher {
     const address = existing ?? configured;
     if (!address) throw new Error('Deploy FlashArb Proxy from the dashboard before arming MEV.');
     if (this.file.armed) return;
+    this.startupCapture = this.startupCapture && restoreStartupQuotes && this.armGeneration === 0;
+    if (!this.startupCapture) this.startupHint = null;
     const generation = ++this.armGeneration;
+    this.restoredGeneration = this.startupCapture ? generation : null;
     this.contractReady = false;
     this.file.armed = true;
     this.file.armedAt = Date.now();
@@ -1826,6 +1886,9 @@ export class MevSearcher {
   }
 
   disarm(reason = 'by user') {
+    this.startupCapture = false;
+    this.startupHint = null;
+    this.restoredGeneration = null;
     this.queuedTest = null;
     if (!this.file.armed && !this.deploying) return;
     this.armGeneration++;
@@ -1959,6 +2022,7 @@ export class MevSearcher {
         }
       }
       this.contractReady = true;
+      if (this.restoredGeneration === generation) this.wakeAfterVerification?.();
       this.status = this.modeText();
       this.host.log(`[mev] Verified ${this.contractLabel} at ${address}`);
     } catch (error) {
