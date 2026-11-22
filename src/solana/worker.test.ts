@@ -153,7 +153,7 @@ test('Solana journals before raw send and restores one pending signature across 
     }
   });
 
-  const makeWorker = () => new SolanaLiveWorker({ rpcUrl, wallet }, keyFile, dataDir, async () => {});
+  const makeWorker = () => new SolanaLiveWorker({ rpcUrl, wallet }, keyFile, dataDir, 5, async () => {});
   const original = makeWorker();
   await original.initialize();
   assert.equal(original.summary.ready, true);
@@ -165,12 +165,16 @@ test('Solana journals before raw send and restores one pending signature across 
 
   await original.submit({ ...candidate, net: 49_999n });
   await original.submit({ ...candidate, simulationSlot: 70n });
+  // This first-leg minimum values the network fee at exactly 5 USDC. Rent stays in its own guards.
+  const feeBoundary = { ...candidate, firstMinimum: 320_000n };
+  await original.submit({ ...feeBoundary, loan: feeBoundary.loan + 1n });
+  assert.match(original.summary.status, /network fee USD cap/);
   assert.equal(simulationCount, 0);
   assert.equal(rawSendCount, 0);
   let releaseSimulation!: () => void;
   holdSimulation = new Promise((resolve) => { releaseSimulation = resolve; });
   const waitForSimulation = new Promise<void>((resolve) => { reachedSimulation = resolve; });
-  const disarmedCandidate = original.submit(candidate);
+  const disarmedCandidate = original.submit(feeBoundary);
   const reached = await Promise.race([waitForSimulation.then(() => true), disarmedCandidate.then(() => false)]);
   assert.equal(reached, true, original.summary.status);
   original.disarm();

@@ -1130,7 +1130,7 @@ export class Engine {
   private onTradeFailure(pf: PortfolioState, what: string, e: unknown, isExit: boolean) {
     if (pf.kind === 'live') this.discardUnsigned();
     if (e instanceof LiveSendBlocked) {
-      this.log(`[${pf.kind}] ${what} canceled before broadcast. Any signed approvals will be reconciled.`, 'warn');
+      this.log(`[${pf.kind}] ${what}: ${errMsg(e)}. Any signed approvals will be reconciled.`, 'warn');
       this.saveState();
       return;
     }

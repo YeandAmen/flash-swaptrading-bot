@@ -47,7 +47,7 @@ export class UncertainTxError extends Error {
 }
 
 export class LiveSendBlocked extends Error {
-  constructor() { super('Live transaction canceled before broadcast'); }
+  constructor(message = 'Live transaction canceled before broadcast') { super(message); }
 }
 
 export class DeploymentGasError extends Error {
@@ -59,6 +59,26 @@ export class DeploymentGasError extends Error {
 export class DeploymentFeeLimitError extends Error {
   constructor(minimum: bigint) {
     super(`Deployment now needs at least ${formatEther(minimum)} ETH for gas. Review the refreshed quote before confirming.`);
+  }
+}
+
+// Ethereum mainnet Chainlink ETH/USD publishes eight decimals and has a one-hour heartbeat.
+const ethUsdFeed = '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419';
+const ethUsdFeedAbi = parseAbi(['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)']);
+
+/** One spot swap or top-up, including all mined allowance resets and approvals. */
+export class SwapNetworkBudget {
+  spentWei = 0n;
+  private highestEthUsd = 0n;
+
+  feeLimit(gas: bigint, price: bigint, updatedAt: bigint, blockTime: bigint): bigint {
+    if (price <= 0n || updatedAt <= 0n || updatedAt > blockTime || blockTime - updatedAt > 3600n) {
+      throw new LiveSendBlocked('Ethereum swap paused because the ETH/USD network-fee quote is stale or invalid');
+    }
+    if (price > this.highestEthUsd) this.highestEthUsd = price;
+    const capMicroUsd = BigInt(Math.floor(CONFIG.maxSwapNetworkFeeUsd * 1_000_000));
+    const maximumWei = capMicroUsd * 10n ** 20n / this.highestEthUsd;
+    return maximumWei > this.spentWei && gas > 0n ? (maximumWei - this.spentWei) / gas : 0n;
   }
 }
 
@@ -289,8 +309,10 @@ export class LiveExecutor implements Executor {
     return { balance, minimumWei, estimatedWei, gas, maxFeePerGas, maxPriorityFeePerGas };
   }
 
-  private async transactionFees(to: Address | null, data: Hex, maximumGasWei?: bigint) {
-    if (to === null || maximumGasWei !== undefined) {
+  private async transactionFees(to: Address | null, data: Hex, options?: DeploymentOptions | SwapNetworkBudget) {
+    if (!(options instanceof SwapNetworkBudget)) {
+      if (to !== null && !options) throw new LiveSendBlocked('Ethereum swap network-fee budget is unavailable');
+      const maximumGasWei = options?.maximumGasWei;
       const quote = await this.quoteDeployment(data, to ?? undefined);
       if (quote.balance < quote.minimumWei) throw new DeploymentGasError(quote.balance, quote.minimumWei);
       if (maximumGasWei !== undefined) {
@@ -304,8 +326,20 @@ export class LiveExecutor implements Executor {
       }
       return quote;
     }
-    const { base, tip, estimatedGas } = await this.estimateFees(data, to);
-    return { gas: (estimatedGas * 130n) / 100n, maxFeePerGas: base * 2n + tip, maxPriorityFeePerGas: tip };
+    const { block, base, tip, estimatedGas } = await this.estimateFees(data, to ?? undefined);
+    const round = await publicClient.readContract({
+      address: ethUsdFeed, abi: ethUsdFeedAbi, functionName: 'latestRoundData', blockNumber: block.number,
+    }).catch(() => { throw new LiveSendBlocked('Ethereum swap paused because its ETH/USD network-fee quote is unavailable'); });
+    const gas = (estimatedGas * 130n + 99n) / 100n;
+    const limit = options.feeLimit(gas, round[1], round[3], block.timestamp);
+    const nextBase = block.baseFeePerGas === null ? base : nextBaseFee(block);
+    if (limit < nextBase + MIN_PRIORITY_FEE_WEI) {
+      throw new LiveSendBlocked(`Ethereum swap paused because its total network fee would exceed $${CONFIG.maxSwapNetworkFeeUsd}`);
+    }
+    const plannedFee = base * 2n + tip;
+    const maxFeePerGas = limit < plannedFee ? limit : plannedFee;
+    const tipRoom = maxFeePerGas - nextBase;
+    return { gas, maxFeePerGas, maxPriorityFeePerGas: tip < tipRoom ? tip : tipRoom };
   }
 
   /** Deploys a contract from the bot wallet (privately, like every transaction). */
@@ -325,28 +359,24 @@ export class LiveExecutor implements Executor {
     });
   }
 
-  /** Approve the router for exactly `amount` (resetting a partial allowance first). Returns gas spent in wei. */
-  private async ensureAllowance(token: Address, amount: bigint, hashes: Hex[], log: (m: string) => void, onSigned?: (hash: Hex) => void, canSend?: () => boolean): Promise<bigint> {
+  /** Approve the router for exactly `amount` (resetting a partial allowance first). */
+  private async ensureAllowance(token: Address, amount: bigint, hashes: Hex[], budget: SwapNetworkBudget, log: (m: string) => void, onSigned?: (hash: Hex) => void, canSend?: () => boolean): Promise<void> {
     checkSendAllowed(canSend);
     const owner = this.account.address;
-    let gasWei = 0n;
     const allowance = await publicClient.readContract({
       address: token, abi: erc20Abi, functionName: 'allowance', args: [owner, ADDR.swapRouter02],
     });
-    if (allowance === amount || (RISK.approvalMode === 'unlimited' && allowance >= amount)) return 0n;
+    if (allowance === amount || (RISK.approvalMode === 'unlimited' && allowance >= amount)) return;
     // Some tokens (e.g. LDO, USDT) refuse to change a non-zero allowance directly: reset to 0 first.
     if (allowance > 0n) {
       const zero = encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [ADDR.swapRouter02, 0n] });
-      const z = await this.sendTx(token, zero, 'approve-reset', log, onSigned, canSend);
+      const z = await this.sendTx(token, zero, 'approve-reset', log, onSigned, canSend, budget);
       hashes.push(z.hash);
-      gasWei += z.receipt.gasUsed * z.receipt.effectiveGasPrice;
     }
     const value = RISK.approvalMode === 'unlimited' ? maxUint256 : amount;
     const data = encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [ADDR.swapRouter02, value] });
-    const a = await this.sendTx(token, data, 'approve', log, onSigned, canSend);
+    const a = await this.sendTx(token, data, 'approve', log, onSigned, canSend, budget);
     hashes.push(a.hash);
-    gasWei += a.receipt.gasUsed * a.receipt.effectiveGasPrice;
-    return gasWei;
   }
 
   /**
@@ -360,7 +390,8 @@ export class LiveExecutor implements Executor {
   private async topUpGasNow(usdcIn: bigint, path: Hex, slippageBps: number, ethUsd: number, onSigned: (hash: Hex, deadline: number) => void, log: (m: string) => void, onApprovalSigned?: (hash: Hex) => void, canSend?: () => boolean, minimumEthOut?: bigint) {
     const owner = this.account.address;
     const hashes: Hex[] = [];
-    let gasWei = await this.ensureAllowance(ADDR.usdc, usdcIn, hashes, log, onApprovalSigned, canSend);
+    const budget = new SwapNetworkBudget();
+    await this.ensureAllowance(ADDR.usdc, usdcIn, hashes, budget, log, onApprovalSigned, canSend);
     const q = await quoteExactIn(path, usdcIn);
     const minOut = (q.amountOut * BigInt(10_000 - slippageBps)) / 10_000n;
     if (minimumEthOut !== undefined && minOut < minimumEthOut) {
@@ -373,12 +404,11 @@ export class LiveExecutor implements Executor {
     });
     const unwrap = encodeFunctionData({ abi: swapRouter02Abi, functionName: 'unwrapWETH9', args: [minOut, owner] });
     const data = encodeFunctionData({ abi: swapRouter02Abi, functionName: 'multicall', args: [BigInt(deadline), [swap, unwrap]] });
-    const { hash, receipt } = await this.sendTx(ADDR.swapRouter02, data, 'gas-topup', log, (h) => onSigned(h, deadline), canSend);
+    const { hash, receipt } = await this.sendTx(ADDR.swapRouter02, data, 'gas-topup', log, (h) => onSigned(h, deadline), canSend, budget);
     hashes.push(hash);
     const t = topUpFromReceipt(receipt, owner);
-    gasWei += t.gasWei;
     if (t.ethOut === 0n || t.usdcIn === 0n) throw new Error(`gas top-up ${hash} mined but receipt amounts could not be verified`);
-    return { usdcIn: t.usdcIn, ethOut: t.ethOut, gasUsd: (Number(gasWei) / 1e18) * ethUsd, txHashes: hashes, blockNumber: receipt.blockNumber };
+    return { usdcIn: t.usdcIn, ethOut: t.ethOut, gasUsd: (Number(budget.spentWei) / 1e18) * ethUsd, txHashes: hashes, blockNumber: receipt.blockNumber };
   }
 
   async swap(r: SwapRequest, log: (m: string) => void): Promise<Fill> {
@@ -388,7 +418,8 @@ export class LiveExecutor implements Executor {
   private async swapNow(r: SwapRequest, log: (m: string) => void): Promise<Fill> {
     const owner = this.account.address;
     const hashes: Hex[] = [];
-    let gasWei = await this.ensureAllowance(r.tokenIn, r.amountIn, hashes, log, r.onApprovalSigned, r.canSend);
+    const budget = new SwapNetworkBudget();
+    await this.ensureAllowance(r.tokenIn, r.amountIn, hashes, budget, log, r.onApprovalSigned, r.canSend);
 
     const q = await quoteExactIn(r.path, r.amountIn);
     const minOut = (q.amountOut * BigInt(10_000 - r.slippageBps)) / 10_000n;
@@ -399,27 +430,26 @@ export class LiveExecutor implements Executor {
       args: [{ path: r.path, recipient: owner, amountIn: r.amountIn, amountOutMinimum: minOut }],
     });
     const data = encodeFunctionData({ abi: swapRouter02Abi, functionName: 'multicall', args: [BigInt(deadline), [inner]] });
-    const { hash, receipt } = await this.sendTx(ADDR.swapRouter02, data, 'swap', log, (h) => r.onSwapSigned?.(h, deadline), r.canSend);
+    const { hash, receipt } = await this.sendTx(ADDR.swapRouter02, data, 'swap', log, (h) => r.onSwapSigned?.(h, deadline), r.canSend, budget);
     hashes.push(hash);
     const f = fillFromReceipt(receipt, r.tokenIn, r.tokenOut, owner);
-    gasWei += f.gasWei;
     if (f.amountOut === 0n || f.amountIn === 0n) throw new Error(`swap ${hash} mined but receipt amounts could not be verified`);
 
-    return { amountIn: f.amountIn, amountOut: f.amountOut, gasUsd: (Number(gasWei) / 1e18) * r.ethUsd, txHashes: hashes, blockNumber: receipt.blockNumber };
+    return { amountIn: f.amountIn, amountOut: f.amountOut, gasUsd: (Number(budget.spentWei) / 1e18) * r.ethUsd, txHashes: hashes, blockNumber: receipt.blockNumber };
   }
 
   /** `to: null` deploys a contract (`data` = creation code). */
-  private async sendTx(to: Address | null, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean, options?: DeploymentOptions) {
+  private async sendTx(to: Address | null, data: Hex, label: string, log: (m: string) => void, onSigned?: (hash: Hex, nonce: number) => void, canSend?: () => boolean, options?: DeploymentOptions | SwapNetworkBudget) {
     checkSendAllowed(canSend);
     const from = this.account.address;
     const [chainNonce, { gas, maxFeePerGas, maxPriorityFeePerGas }] = await Promise.all([
       this.chainNonce(),
-      this.transactionFees(to, data, options?.maximumGasWei),
+      this.transactionFees(to, data, options),
     ]);
     // a lagging RPC node may not know our previous tx yet: never reuse a nonce we already got mined
     const nonce = Math.max(chainNonce, this.nextNonce);
     checkSendAllowed(canSend);
-    if (options?.beforeSign) {
+    if (options && !(options instanceof SwapNetworkBudget) && options.beforeSign) {
       options.beforeSign();
       checkSendAllowed(canSend);
     }
@@ -453,6 +483,7 @@ export class LiveExecutor implements Executor {
     this.clearIntent(intent);
     if (result.status === 'dropped') throw new Error(`Flashbots dropped ${label} transaction ${hash}`);
     const { receipt } = result;
+    if (options instanceof SwapNetworkBudget) options.spentWei += receipt.gasUsed * receipt.effectiveGasPrice;
     if (receipt.status !== 'success') throw new Error(`${label} tx reverted: ${hash}`);
     log(`${label} confirmed in block ${receipt.blockNumber}`);
     return { hash, receipt };

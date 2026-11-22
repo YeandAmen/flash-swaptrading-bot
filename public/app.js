@@ -582,7 +582,7 @@ function renderMevWindow(scanWindow, gas) {
   }
   const costs = $('mevDirectGas');
   costs.hidden = !gas;
-  if (gas) costs.textContent = `Direct gas · ${usd(gas.spentGasUsd)} spent in 24 hours · limits ${usd(gas.maxGasUsd)} per attempt and ${usd(gas.dailyGasUsd)} per 24 hours`;
+  if (gas) costs.textContent = `Direct gas · ${usd(gas.spentGasUsd)} spent in 24 hours · ${mevGasLimits(gas)}`;
 }
 
 function renderMevCadence(cadence) {
@@ -833,11 +833,17 @@ $('mevDeployConfirm').onclick = async () => {
   }
 };
 const mevDlg = $('mevDlg');
+function mevGasLimits(gas) {
+  const regular = `standard limits ${usd(gas.maxGasUsd)} per attempt and ${usd(gas.dailyGasUsd)} per 24 hours`;
+  if (!(gas.premiumMaxGasUsd > 0)) return regular;
+  const daily = gas.premiumDailyGasUsd ?? gas.premiumMaxGasUsd;
+  return `${regular} · high-profit limits ${usd(gas.premiumMaxGasUsd)} per attempt and ${usd(daily)} per 24 hours`;
+}
 let reviewedMevArm = null;
 function mevArmSettings() {
   const settings = S?.mev?.settings;
   const gas = settings?.direct;
-  return isDirectMev(S?.mev) ? `direct/${gas?.maxGasUsd}/${gas?.dailyGasUsd}/${settings.activeProfitPolicy?.minNetUsd}` : 'bundle';
+  return isDirectMev(S?.mev) ? `direct/${gas?.maxGasUsd}/${gas?.dailyGasUsd}/${gas?.premiumMaxGasUsd}/${gas?.premiumDailyGasUsd}/${settings.activeProfitPolicy?.minNetUsd}` : 'bundle';
 }
 
 function updateMevArmConfirm() {
@@ -855,7 +861,7 @@ $('mevArmBtn').onclick = () => {
     ? 'The bot can publish qualifying flash-loan trades directly to Ethereum.'
     : 'The bot can submit qualifying flash-loan trades privately to configured builders.';
   $('mevArmGas').textContent = direct
-    ? `Wallet gas limits are ${usd(gas.maxGasUsd)} per attempt and ${usd(gas.dailyGasUsd)} per 24 hours. A confirmed revert still costs gas.`
+    ? `Wallet gas · ${mevGasLimits(gas)}. A confirmed revert still costs gas.`
     : 'A bundle that lands can spend wallet gas and the configured builder bid.';
   $('mevInput').value = '';
   updateMevArmConfirm();

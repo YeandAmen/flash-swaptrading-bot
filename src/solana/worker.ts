@@ -282,6 +282,7 @@ export class SolanaLiveWorker {
   private readonly journalPath: string;
   private readonly minimumNet: bigint;
   private readonly feeCap: bigint;
+  private readonly networkFeeCapUsdc: bigint;
   private signer: KeyPairSigner | null = null;
   private journal: Journal | null = null;
   private lease: string | null = null;
@@ -292,6 +293,7 @@ export class SolanaLiveWorker {
   private status = 'Initializing Solana live worker';
 
   constructor(config: SolanaScanConfig, private readonly keyPath: string, private readonly dataDir: string,
+    maximumNetworkFeeUsd: number,
     private readonly verifyDeployment = verifyLighthouseDeployment) {
     this.wallet = address(config.wallet);
     const rpcUrl = new URL(config.rpcUrl ?? SOLANA_PUBLIC_RPC);
@@ -302,12 +304,15 @@ export class SolanaLiveWorker {
     this.journalPath = path.join(dataDir, 'solana-live.json');
     const minimum = config.minNetUsdc ?? 0.05;
     const cap = config.maxFeeLamports ?? 50_000;
+    const usdCapInMicroUsdc = Math.floor(maximumNetworkFeeUsd * 1_000_000);
     if (!Number.isFinite(minimum) || minimum < 0.000001 || minimum > 1_000
-      || !Number.isSafeInteger(cap) || cap < 5_000 || cap > 5_000_000) {
+      || !Number.isSafeInteger(cap) || cap < 5_000 || cap > 5_000_000
+      || !Number.isSafeInteger(usdCapInMicroUsdc) || usdCapInMicroUsdc <= 0) {
       throw new Error('Invalid Solana live profit or fee limits');
     }
     this.minimumNet = BigInt(Math.round(minimum * 1_000_000));
     this.feeCap = BigInt(cap);
+    this.networkFeeCapUsdc = BigInt(usdCapInMicroUsdc);
   }
 
   get summary() {
@@ -454,7 +459,14 @@ export class SolanaLiveWorker {
         this.status = 'Solana candidate skipped by profit or fee budget';
         return;
       }
-      const allowedLoss = gasOnlyTest ? nativeCostUsdc(candidate.feeLamports, candidate.loan, candidate.firstMinimum) : 0n;
+      // Use guaranteed first-leg output for the conservative USDC value of base and priority fees.
+      // The simulated fee must match this exact quote. Account rent is checked separately.
+      const feeUsdc = nativeCostUsdc(candidate.feeLamports, candidate.loan, candidate.firstMinimum);
+      if (feeUsdc > this.networkFeeCapUsdc) {
+        this.status = 'Solana candidate skipped by network fee USD cap';
+        return;
+      }
+      const allowedLoss = gasOnlyTest ? feeUsdc : 0n;
       if (candidate.net < minimum - allowedLoss) {
         this.status = 'Solana candidate skipped by profit or fee budget';
         return;

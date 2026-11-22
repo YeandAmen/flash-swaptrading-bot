@@ -52,6 +52,7 @@ export const CONFIG = {
   loopSeconds: num('LOOP_SECONDS', 30),
   historyDays: num('HISTORY_DAYS', 60),
   paperStartUsd: num('PAPER_START_USD', 50),
+  maxSwapNetworkFeeUsd: num('MAX_SWAP_NETWORK_FEE_USD', 5),
   /** Mainnet signing requires this opt-in in addition to an explicit arming action. */
   allowLiveTrading: liveTradingSetting === 'on',
   keychainService: str('KEYCHAIN_SERVICE', 'eth-token-bot'),
@@ -265,6 +266,8 @@ check(RISK.approvalMode === 'exact' || RISK.approvalMode === 'unlimited', 'APPRO
 check(CONFIG.loopSeconds >= 5, 'LOOP_SECONDS must be >= 5');
 check(CONFIG.historyDays >= 15 && CONFIG.historyDays <= 365, 'HISTORY_DAYS must be 15..365');
 check(CONFIG.paperStartUsd > 0, 'PAPER_START_USD must be > 0');
+check(CONFIG.maxSwapNetworkFeeUsd >= 0.000001 && Number.isSafeInteger(Math.ceil(CONFIG.maxSwapNetworkFeeUsd * 1e6)),
+  'MAX_SWAP_NETWORK_FEE_USD must be a positive USD amount representable in microdollars');
 check(Number.isInteger(CONFIG.port) && CONFIG.port >= 1024 && CONFIG.port <= 65535, 'PORT must be 1024..65535');
 check(TOKENS.mode === 'all' || TOKENS.mode === 'core', 'TOKEN_MODE must be all or core');
 check(TOKENS.minPoolUsd >= 1000, 'MIN_POOL_USD must be >= 1000');

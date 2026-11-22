@@ -22,7 +22,7 @@ import {
 const journalFile = path.join(DATA_DIR, 'arbitrum-trades.json');
 const haltedFile = path.join(DATA_DIR, 'arbitrum-disarmed.json');
 const dayMs = 86400_000;
-const txLimitUsd = 0.50;
+const txLimitUsd = Math.min(0.50, CONFIG.maxSwapNetworkFeeUsd);
 const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
 const fullMarketAuditInterval = 10;

@@ -17,6 +17,7 @@ Object.assign(process.env, {
   MEV: 'on',
   MEV_SUBMISSION: 'direct',
   MEV_FUNDING: 'pool',
+  MAX_SWAP_NETWORK_FEE_USD: '5',
   MEV_DIRECT_MAX_GAS_USD: '10',
   MEV_DIRECT_DAILY_GAS_USD: '25',
   MEV_DIRECT_MIN_NET_USD: '0.05',
@@ -509,6 +510,14 @@ try {
     'a normal-level profit opportunity consumes the request without lowering its profit floor');
 
   const journal = newSearcher(async () => assert.fail('receipt settlement must not sign'));
+  const priorPremium = MEV.directPremiumMaxGasUsd;
+  MEV.directPremiumMaxGasUsd = 20;
+  assert.equal(journal.availableDirectGasUsd(now), 5);
+  assert.equal(journal.availableDirectGasUsd(now, true), 5, 'fresh premium gas cannot spend more than the single-swap fee cap');
+  journal.file.directGas = [{ hour: Math.floor(now / 3_600_000), usd: 18 }];
+  assert.equal(journal.availableDirectGasUsd(now, true), 2, 'previous premium spend reduces the distinct daily allowance');
+  journal.file.directGas = [];
+  MEV.directPremiumMaxGasUsd = priorPremium;
   const previousFill = now - 31 * minute;
   journal.file.stats.lastDirectLandedAt = previousFill;
   function settle(nonce, kind, status, included) {

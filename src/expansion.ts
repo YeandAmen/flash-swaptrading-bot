@@ -60,7 +60,7 @@ export function startExpansion() {
         if (!solanaLive) {
           const { SolanaLiveWorker } = await import('./solana/worker.js');
           if (stopping) return;
-          solanaLive = new SolanaLiveWorker(config, process.env.SOLANA_WALLET_KEY_FILE ?? '', DATA_DIR);
+          solanaLive = new SolanaLiveWorker(config, process.env.SOLANA_WALLET_KEY_FILE ?? '', DATA_DIR, CONFIG.maxSwapNetworkFeeUsd);
         }
         await solanaLive.initialize();
         if (solanaStopBeforeInit && solanaLive.summary.armed) solanaLive.disarm();

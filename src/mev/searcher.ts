@@ -1219,10 +1219,11 @@ export class MevSearcher {
   }
 
   private availableDirectGasUsd(now: number, premium = false, test?: GasOnlyTest): number {
-    if (test && (test.publicFunctional || test.minimumNetUsd !== undefined)) return test.maximumGasUsd;
+    const cap = CONFIG.maxSwapNetworkFeeUsd;
+    if (test && (test.publicFunctional || test.minimumNetUsd !== undefined)) return Math.min(cap, test.maximumGasUsd);
     const spent = this.directGasSpent(now);
-    if (premium) return MEV.directPremiumMaxGasUsd - spent;
-    return Math.min(MEV.directMaxGasUsd, MEV.directDailyGasUsd - spent, test?.maximumGasUsd ?? Infinity);
+    if (premium) return Math.min(cap, MEV.directPremiumMaxGasUsd - spent);
+    return Math.min(cap, MEV.directMaxGasUsd, MEV.directDailyGasUsd - spent, test?.maximumGasUsd ?? Infinity);
   }
 
   private withinDirectGasBudget(gasUsd: number, now: number, premium = false, test?: GasOnlyTest): boolean {
@@ -1368,7 +1369,10 @@ export class MevSearcher {
       if (!gasOnly && afterGas < minimumNet) {
         return this.skipOpportunity(opp, test ? 'test payout does not cover padded gas' : 'below configured profit floor with padded gas');
       }
-      const tip = direct ? 0n : this.builderTip(afterGas, minimumNet, policy);
+      const swapFeeCap = loanLimitWei(CONFIG.maxSwapNetworkFeeUsd, ethUsd);
+      if (swapFeeCap === null || gasBudget > swapFeeCap) return this.skipOpportunity(opp, 'network fee exceeds the per-swap USD limit');
+      const desiredTip = direct ? 0n : this.builderTip(afterGas, minimumNet, policy);
+      const tip = desiredTip < swapFeeCap - gasBudget ? desiredTip : swapFeeCap - gasBudget;
       if (!direct && tip === 0n) return this.skipOpportunity(opp, 'profit does not cover a builder payment above the configured floor');
       const minimumProfit = gasOnly ? 1n : tip + gasBudget + minimumNet;
       return { offer, contract, ethUsd, gas, gasBudget, tip, fees, target, minimumProfit, test, premium, privateSubmission, data: encode(tip, minimumProfit), net: afterGas - tip };
@@ -1433,6 +1437,8 @@ export class MevSearcher {
         || minimumProfit - gasBudget < BigInt(Math.ceil(test.minimumNetUsd / currentEthUsd * 1e18)))) {
         return skip('test route falls below its required net profit at signing');
       }
+      const currentFeeCap = loanLimitWei(CONFIG.maxSwapNetworkFeeUsd, currentEthUsd);
+      if (currentFeeCap === null || gasBudget + tip > currentFeeCap) return skip('network fee exceeds the per-swap USD limit at signing');
       const currentLoanCap = loanLimitWei(MEV.maxLoanUsd, currentEthUsd);
       if (currentLoanCap === null || offer.amount > currentLoanCap) return skip('flash loan exceeds the USD cap at signing');
       if (test?.minimumLoanUsd !== undefined && (!validPrice(currentEthUsd) || eth(offer.amount) * currentEthUsd < test.minimumLoanUsd)) {
@@ -2115,8 +2121,8 @@ export class MevSearcher {
       settings: {
         submission: MEV.submission,
         maxLoanUsd: MEV.maxLoanUsd,
-        direct: { maxGasUsd: MEV.directMaxGasUsd, dailyGasUsd: MEV.directDailyGasUsd, protected: MEV.directProtected,
-          premiumMaxGasUsd: MEV.directPremiumMaxGasUsd, premiumMinNetUsd: PREMIUM_MIN_NET_USD,
+        direct: { maxGasUsd: Math.min(CONFIG.maxSwapNetworkFeeUsd, MEV.directMaxGasUsd), dailyGasUsd: MEV.directDailyGasUsd, protected: MEV.directProtected,
+          premiumMaxGasUsd: Math.min(CONFIG.maxSwapNetworkFeeUsd, MEV.directPremiumMaxGasUsd), premiumDailyGasUsd: MEV.directPremiumMaxGasUsd, premiumMinNetUsd: PREMIUM_MIN_NET_USD,
           broadcastRpcCount: 1 + MEV.directBroadcastRpcUrls.length, spentGasUsd: this.directGasSpent(now), enabled: directBudgetConfigured() },
         tipPct: MEV.builderTipPct, minNetUsd: MEV.minNetUsd, minPoolWeth: MEV.minPoolWeth,
         activeProfitPolicy: this.profitPolicy(Date.now()),

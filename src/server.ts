@@ -176,7 +176,7 @@ app.get('/api/state', (_req, res) => {
       lastError: mev.lastError && redactDiagnostic(mev.lastError),
       recent: mev.recent.map((opportunity) => ({ ...opportunity, note: opportunity.note && redactDiagnostic(opportunity.note) })),
     } : null,
-    params: { risk: RISK, strategy: STRATEGY, tokens: { ...TOKENS, listUrls: TOKENS.listUrls.map(endpointOrigin) } },
+    params: { maxSwapNetworkFeeUsd: CONFIG.maxSwapNetworkFeeUsd, risk: RISK, strategy: STRATEGY, tokens: { ...TOKENS, listUrls: TOKENS.listUrls.map(endpointOrigin) } },
   });
 });
 
