@@ -3,7 +3,7 @@ import path from 'node:path';
 import { BaseError, ExecutionRevertedError, keccak256, pad, parseEventLogs, TransactionReceiptNotFoundError, type Address, type Hex } from 'viem';
 import type { PrivateKeyAccount } from 'viem/accounts';
 import { CONFIG, CORE_TOKENS, DATA_DIR, MEV, type TokenCfg } from '../config.js';
-import { mevPoolClient, mevReadClient, MIN_PRIORITY_FEE_WEI, nextBaseFee, publicClient } from '../chain.js';
+import { erc20Abi, mevPoolClient, mevReadClient, MIN_PRIORITY_FEE_WEI, nextBaseFee, publicClient } from '../chain.js';
 import { redactDiagnostic } from '../diagnostics.js';
 import { transactionSettlement, UncertainTxError, type LiveExecutor } from '../executor.js';
 import type { McResult } from '../market.js';
@@ -20,8 +20,8 @@ import { HeadBackfill } from './head-backfill.js';
 import { createHeadWake } from './head-wake.js';
 import { pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
 import { comparableRouteQuote, rankRouteNet, routeInputSizes, type RouteQuoteSample } from './sizing.js';
-import { NextVenueKind } from './next-pools.js';
-import { arbGas, bestCycle, buildStateReads, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
+import { NextVenueKind, UNISWAP_V4_MANAGER } from './next-pools.js';
+import { arbGas, bestCycle, buildStateReads, inventoryCanCoverV2Floor, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
 import { MevUniverse } from './universe.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'mev.json');
@@ -39,6 +39,7 @@ const GAS_ONLY_TEST_ROUTES = 4;
 const TEST_ID = /^[A-Za-z0-9_-]{8,80}$/;
 const HEAD_RETRY_MS = 400;
 const POOL_READS_PER_CHUNK = 160;
+const MAX_INVENTORY_PROBES = 3;
 const RECEIPT_CONFIRMATIONS = 2n;
 const RECENT_LIMIT = 60;
 const RECENT_BUNDLE_LIMIT = 10;
@@ -214,6 +215,11 @@ interface HourBest {
   simSymbol: string | null;
 }
 
+interface InventoryProbe {
+  token: Address;
+  sell: ArbPool;
+}
+
 interface BlockRead {
   blockNumber: bigint;
   timestamp: number;
@@ -222,6 +228,7 @@ interface BlockRead {
   tokens: ArbToken[];
   at: number[][];
   results: McResult[];
+  v4Inventory?: Map<ArbPool, bigint>;
   readMs: number;
   headAgeMs?: number;
   failedChunks: number;
@@ -324,9 +331,10 @@ export class MevSearcher {
   tokens: ArbToken[] = [];
   status = 'starting';
   lastError: string | null = null;
-  lastBlock: { number: number; at: number; candidates: number; readMs: number; headAgeMs?: number; decisionMs: number | null; failedChunks: number } | null = null;
+  lastBlock: { number: number; at: number; candidates: number; readMs: number; headAgeMs?: number; decisionMs: number | null; failedChunks: number; inventoryPruned?: number } | null = null;
   private deploying = false;
   private reads: ReturnType<typeof buildStateReads> | null = null;
+  private inventoryExits = new Set<string>();
   private poolsAt = 0;
   private universe: MevUniverse;
   private refreshingPools: Promise<void> | null = null;
@@ -592,7 +600,7 @@ export class MevSearcher {
     this.file.stats.rpcCalls++;
     const header = await mevReadClient.getBlock({ blockNumber: height });
     if (header.number !== height) throw new Error('historical block did not match the expected height');
-    const snapshot = await this.read(header);
+    const snapshot = await this.read(header, true);
     if (this.stopping || snapshot.failedChunks) throw new Error('historical snapshot incomplete');
     await this.onBlock(snapshot, true);
   }
@@ -611,7 +619,7 @@ export class MevSearcher {
     return head;
   }
 
-  private async read(head: Awaited<ReturnType<MevSearcher['head']>>): Promise<BlockRead> {
+  private async read(head: Awaited<ReturnType<MevSearcher['head']>>, historical = false): Promise<BlockRead> {
     const reads = this.reads;
     const tokens = this.tokens;
     if (!reads) throw new Error('pools not loaded');
@@ -620,12 +628,39 @@ export class MevSearcher {
     const headers = reads.contracts.slice(0, 2);
     const chunks = Array.from({ length: Math.max(1, Math.ceil((reads.contracts.length - 2) / POOL_READS_PER_CHUNK)) }, (_, i) =>
       reads.contracts.slice(2 + i * POOL_READS_PER_CHUNK, 2 + (i + 1) * POOL_READS_PER_CHUNK));
-    this.file.stats.rpcCalls += chunks.length;
-    const checks = await Promise.allSettled(chunks.map((chunk) =>
-      mevPoolClient.multicall({ contracts: [...headers, ...chunk] as any, allowFailure: true, blockNumber: head.number, batchSize: 0 }) as Promise<McResult[]>));
+    const probes = chunks.map((): InventoryProbe[] => []);
+    if (!historical && this.inventoryExits.size) {
+      for (const [ti, token] of tokens.entries()) {
+        for (const [pi, sell] of token.pools.entries()) {
+          if (!sell.v2 || !this.inventoryExits.has(sell.address.toLowerCase())) continue;
+          const chunk = Math.floor((reads.at[ti][pi] - 2) / POOL_READS_PER_CHUNK);
+          probes[chunk].push({ token: token.token.address, sell });
+        }
+      }
+    }
+    const stampedAtHead = (rows: McResult[]) => rows[0]?.status === 'success' && rows[0].result === head.number
+      && rows[1]?.status === 'success' && rows[1].result === head.timestamp;
+    const readChunk = (contracts: object[]) => {
+      this.file.stats.rpcCalls++;
+      return mevPoolClient.multicall({ contracts: [...headers, ...contracts] as any, allowFailure: true,
+        blockNumber: head.number, batchSize: 0 }) as Promise<McResult[]>;
+    };
+    const v4Inventory = new Map<ArbPool, bigint>();
+    const checks = await Promise.allSettled(chunks.map(async (chunk, i) => {
+      const extra = probes[i];
+      if (!extra.length) return readChunk(chunk);
+      // Keep the balance and its exit reserves in the very same EVM call. All probes share existing request slots.
+      const balances = extra.map(({ token }) => ({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [UNISWAP_V4_MANAGER] }));
+      const rows = await readChunk([...chunk, ...balances]).catch(() => []);
+      if (rows.length !== 2 + chunk.length + extra.length || !stampedAtHead(rows)) return readChunk(chunk);
+      for (const [j, probe] of extra.entries()) {
+        const balance = rows[2 + chunk.length + j];
+        if (balance.status === 'success' && typeof balance.result === 'bigint') v4Inventory.set(probe.sell, balance.result);
+      }
+      return rows.slice(0, 2 + chunk.length);
+    }));
     const valid = checks.map((check, index) => check.status === 'fulfilled' && check.value.length === 2 + chunks[index].length
-      && check.value[0]?.status === 'success' && check.value[0].result === head.number
-      && check.value[1]?.status === 'success' && check.value[1].result === head.timestamp ? check.value : null);
+      && stampedAtHead(check.value) ? check.value : null);
     const stamped = valid.find((chunk) => chunk !== null);
     if (!stamped) {
       throw new Error('pool snapshot did not match the block header');
@@ -633,7 +668,7 @@ export class MevSearcher {
     const results = [...stamped.slice(0, 2), ...valid.flatMap((chunk, i) => chunk?.slice(2) ?? chunks[i].map((): McResult => ({ status: 'failure' })))];
     return {
       blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash,
-      tokens, at: reads.at, results, readMs: Math.round(performance.now() - start), headAgeMs,
+      tokens, at: reads.at, results, v4Inventory, readMs: Math.round(performance.now() - start), headAgeMs,
       failedChunks: valid.filter((chunk) => chunk === null).length,
     };
   }
@@ -668,6 +703,8 @@ export class MevSearcher {
     const cadence = historical ? null : this.cadence(now);
     const broadenSizes = Boolean(cadence && cadence.routeLimit > cadence.baseRouteLimit);
     const minimumNet = validPrice(ethUsd) ? this.minimumNet(ethUsd, policy) : 20_000_000_000_000n;
+    const nextInventory = new Map<string, number>();
+    let inventoryPruned = 0;
     let est: { net: number; gross: number; gas: number; symbol: string } | null = null;
     for (const [ti, t] of r.tokens.entries()) {
       const res = t.pools.map((p, pi) => reservesOf(t, p, r.results, r.at[ti][pi]));
@@ -677,11 +714,21 @@ export class MevSearcher {
         const gasUnits = arbGas(A, B);
         const gasEth = gasUnits * gasPriceEth;
         const estimatedNet = cycle.profit - gasEth;
-        if (!est || estimatedNet > est.net) est = { net: estimatedNet, gross: cycle.profit, gas: gasEth, symbol: t.token.symbol };
         if (test && cycle.profit > 0 && (t.token.core || (test.minimumNetUsd !== undefined && estimatedNet > 0))) {
           testCandidates.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet, gasUnits });
         }
-        if (cycle.profit <= gasUnits * screeningGasPriceEth * (broadenSizes ? 0.65 : 0.8)) continue;
+        const aboveScreen = cycle.profit > gasUnits * screeningGasPriceEth * (broadenSizes ? 0.65 : 0.8);
+        if (!historical && aboveScreen && A.v4 && B.v2 && validPrice(ethUsd)) {
+          const reserveIndex = r.at[ti][cycle.sell];
+          const exit = B.address.toLowerCase();
+          nextInventory.set(exit, Math.max(estimatedNet, nextInventory.get(exit) ?? -Infinity));
+          if (!inventoryCanCoverV2Floor(r.v4Inventory?.get(B), r.results[reserveIndex], t.wethIs0, minimumNet)) {
+            inventoryPruned++;
+            continue;
+          }
+        }
+        if (!est || estimatedNet > est.net) est = { net: estimatedNet, gross: cycle.profit, gas: gasEth, symbol: t.token.symbol };
+        if (!aboveScreen) continue;
         const key = `${poolIdentity(A)}|${poolIdentity(B)}`;
         const cd = this.cooldown.get(key);
         if (cd && now < cd.until && !estimateChanged(cycle.profit, cd)) {
@@ -699,7 +746,9 @@ export class MevSearcher {
       this.recordScan(r.timestamp * 1000, cands.length, 0, null);
       return;
     }
-    const block = { number: Number(r.blockNumber), at: now, candidates: cands.length, readMs: r.readMs, headAgeMs: r.headAgeMs, decisionMs: null as number | null, failedChunks: r.failedChunks };
+    this.inventoryExits = new Set([...nextInventory].sort((a, b) => b[1] - a[1])
+      .slice(0, MAX_INVENTORY_PROBES).map(([address]) => address));
+    const block = { number: Number(r.blockNumber), at: now, inventoryPruned, candidates: cands.length, readMs: r.readMs, headAgeMs: r.headAgeMs, decisionMs: null as number | null, failedChunks: r.failedChunks };
     this.lastBlock = block;
     if (est) {
       const hb = this.hourBest();

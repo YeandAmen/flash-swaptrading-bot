@@ -256,6 +256,16 @@ export function buildStateReads(tokens: ArbToken[]) {
   return { contracts, at };
 }
 
+/** Ignore fees, impact, debt and gas: even selling the entire v4 inventory at v2 spot must cover the net floor. */
+export function inventoryCanCoverV2Floor(balance: bigint | undefined, reserves: McResult | undefined,
+  wethIs0: boolean, floor: bigint): boolean {
+  if (balance === undefined || balance < 0n || floor <= 0n || reserves?.status !== 'success' || !Array.isArray(reserves.result)) return true;
+  const [r0, r1] = reserves.result;
+  if (typeof r0 !== 'bigint' || typeof r1 !== 'bigint' || r0 <= 0n || r1 <= 0n) return true;
+  const [weth, token] = wethIs0 ? [r0, r1] : [r1, r0];
+  return balance * weth >= floor * token;
+}
+
 function measuredQuotes(probes: readonly bigint[], reads: McResult[], offset: number, inputScale: number, outputScale: number) {
   const points: QuotePoint[] = [];
   for (const [index, amount] of probes.entries()) {

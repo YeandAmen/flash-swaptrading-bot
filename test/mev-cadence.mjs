@@ -116,6 +116,80 @@ try {
     });
   }
 
+  // A virtual v4 reserve can imply a large trade even when the manager holds only token dust.
+  // Both pool states and the optional exit-specific balance are returned by the same pinned call.
+  {
+    const { buildStateReads, inventoryCanCoverV2Floor } = await import('../dist/mev/pools.js');
+    const { mevPoolClient } = await import('../dist/chain.js');
+    const { UNISWAP_V4_MANAGER } = await import('../dist/mev/next-pools.js');
+    const searcher = newSearcher(() => assert.fail('Inventory checks must never submit'));
+    const [subject, other] = snapshot(now).tokens;
+    subject.pools[0] = { kind: 5, v2: false, address: UNISWAP_V4_MANAGER, venue: 'Uniswap v4 ETH', fee: 0.0001,
+      v4: { id: hash(900), fee: 100, tickSpacing: 1, nativeEth: true, quoteIs0: true } };
+    searcher.tokens = [subject, other];
+    searcher.reads = buildStateReads(searcher.tokens);
+    searcher.reconcileWallet = async () => {};
+    searcher.scanShortlist = async () => false;
+    const previous = mevPoolClient.multicall;
+    const feeHistory = mevReadClient.getFeeHistory;
+    let height = 100;
+    let balance = 0n;
+    let error;
+    let calls;
+    mevReadClient.getFeeHistory = async () => ({ reward: [[100_000_000n, 300_000_000n]] });
+    mevPoolClient.multicall = async ({ contracts, blockNumber }) => {
+      assert.equal(blockNumber, BigInt(height));
+      const checked = contracts.some((call) => call.functionName === 'balanceOf');
+      calls.push(checked);
+      if (checked && error === 'aggregate') throw new Error('aggregate rejected');
+      return contracts.map((call) => {
+        let result;
+        switch (call.functionName) {
+          case 'getBlockNumber': result = blockNumber; break;
+          case 'getCurrentBlockTimestamp': result = BigInt(Math.floor(now / 1000)); break;
+          case 'getSlot0': result = [2n ** 96n, 0, 0, 100]; break;
+          case 'getLiquidity': result = 100n * oneEth; break;
+          case 'getReserves': result = [call.address === other.pools[0].address ? 100n * oneEth : 200n * oneEth, 100n * oneEth, 0]; break;
+          case 'balanceOf':
+            assert.equal(call.address, subject.token.address);
+            assert.deepEqual(call.args, [UNISWAP_V4_MANAGER]);
+            if (error === 'balance') return { status: 'failure' };
+            result = balance;
+            break;
+          default: assert.fail('Unexpected snapshot call');
+        }
+        return { status: 'success', result };
+      });
+    };
+    async function check(checked, pruned) {
+      calls = [];
+      const head = { number: BigInt(++height), timestamp: BigInt(Math.floor(now / 1000)), hash: hash(height),
+        baseFeePerGas: 1_000_000_000n, gasUsed: 15_000_000n, gasLimit: 30_000_000n };
+      const row = await searcher.read(head);
+      await searcher.onBlock(row);
+      assert.deepEqual(calls, checked);
+      assert.equal(searcher.lastBlock.inventoryPruned, pruned);
+      assert.equal(searcher.lastBlock.candidates, 2 - pruned, 'the unrelated V2-to-V2 route stays eligible');
+    }
+    try {
+      await check([false], 0); // new route is considered immediately
+      await check([true], 1); // the manager cannot deliver any token for the sale
+      error = 'balance';
+      await check([true], 0); // per-call failure must not reuse a previous zero balance
+      error = 'aggregate';
+      await check([true, false], 0); // recover original pool snapshot if optional read breaks its batch
+      error = undefined;
+      balance = oneEth / 10n;
+      await check([true], 0); // smaller sizes can cover the floor after inventory is replenished
+      const reserves = { status: 'success', result: [100n, 1_000n, 0] };
+      assert.ok(inventoryCanCoverV2Floor(1n, reserves, false, 10n), 'keep equality at the optimistic upper bound');
+      assert.ok(!inventoryCanCoverV2Floor(1n, reserves, true, 10n), 'use the token ordering supplied by the exit pair');
+    } finally {
+      mevPoolClient.multicall = previous;
+      mevReadClient.getFeeHistory = feeHistory;
+    }
+  }
+
   const testId = 'cadence-gas-test';
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
