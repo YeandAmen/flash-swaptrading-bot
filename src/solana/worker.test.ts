@@ -73,6 +73,7 @@ test('Solana journals before raw send and restores one pending signature across 
   let slot = 91;
   let height = 80;
   let blockhashValid = true;
+  let balanceLamports = walletBalance;
   let finalizedReceipt: 'none' | 'failed' | 'success' = 'none';
   let simulationCount = 0;
   let rawSendCount = 0;
@@ -98,7 +99,7 @@ test('Solana journals before raw send and restores one pending signature across 
     switch (method) {
       case 'getGenesisHash': return reply(MAINNET_GENESIS);
       case 'getEpochInfo': return reply({ absoluteSlot: slot, blockHeight: height, epoch: 8, slotIndex: 21, slotsInEpoch: 200 });
-      case 'getBalance': return context(walletBalance);
+      case 'getBalance': return context(balanceLamports);
       case 'isBlockhashValid': return context(blockhashValid);
       case 'simulateTransaction': {
         simulationCount++;
@@ -167,10 +168,77 @@ test('Solana journals before raw send and restores one pending signature across 
   await original.submit({ ...candidate, simulationSlot: 70n });
   // This first-leg minimum values the network fee at exactly 5 USDC. Rent stays in its own guards.
   const feeBoundary = { ...candidate, firstMinimum: 320_000n };
-  await original.submit({ ...feeBoundary, loan: feeBoundary.loan + 1n });
+  assert.equal(await original.submit({ ...feeBoundary, loan: feeBoundary.loan + 1n }), undefined);
   assert.match(original.summary.status, /network fee USD cap/);
   assert.equal(simulationCount, 0);
   assert.equal(rawSendCount, 0);
+
+  await t.test('scan handoff expires on rearm or a newly queued manual test', async () => {
+    const beforeRearm = original.scanHandoff();
+    const stale = { ...candidate, simulationSlot: 70n };
+    const first = await beforeRearm(stale);
+    assert.equal(first?.status, 'route-declined');
+    assert.equal(first?.canTryAlternate(), true);
+    original.disarm();
+    original.arm();
+    assert.equal(first?.canTryAlternate(), false);
+    assert.equal(await beforeRearm(candidate), undefined);
+
+    const beforeTest = original.scanHandoff();
+    const second = await beforeTest(stale);
+    assert.equal(second?.canTryAlternate(), true);
+    original.queueTest('manual-scan-change');
+    assert.equal(second?.canTryAlternate(), false);
+    assert.equal(await beforeTest(candidate), undefined);
+    assert.equal(await original.submit(candidate), undefined);
+    original.disarm();
+    original.arm();
+    assert.equal(await beforeTest(candidate), undefined);
+    assert.equal(simulationCount, 0);
+    assert.equal(rawSendCount, 0);
+  });
+
+  await t.test('a stale quote grants no alternate when the wallet is under its reserve', async () => {
+    balanceLamports = original.summary.nativeReserveLamports + fee + rent - 1;
+    try {
+      assert.equal(await original.submit({ ...candidate, simulationSlot: 70n }), undefined);
+      assert.match(original.summary.status, /native reserve/);
+      assert.equal(simulationCount, 0);
+      assert.equal(rawSendCount, 0);
+    } finally {
+      balanceLamports = walletBalance;
+    }
+  });
+
+  await t.test('a completed final simulation can explicitly decline a route below the profit floor', async () => {
+    const previous = simulationMeta.postTokenBalances;
+    simulationMeta.postTokenBalances = preTokens;
+    try {
+      const declined = await original.submit(candidate);
+      assert.equal(declined?.status, 'route-declined');
+      assert.equal(declined?.canTryAlternate(), true);
+      assert.equal(rawSendCount, 0);
+      assert.equal(original.summary.pending, null);
+    } finally {
+      simulationMeta.postTokenBalances = previous;
+    }
+  });
+
+  await t.test('missing or reduced WSOL balance after final simulation grants no alternate', async () => {
+    const previous = simulationMeta.postTokenBalances;
+    try {
+      for (const balances of [[postTokens[0]], [postTokens[0], token(WRAPPED_SOL, '89999999', 9)]]) {
+        simulationMeta.postTokenBalances = balances;
+        assert.equal(await original.submit(candidate), undefined);
+        assert.match(original.summary.status, /profit and cost guards/);
+        assert.equal(rawSendCount, 0);
+        assert.equal(original.summary.pending, null);
+      }
+    } finally {
+      simulationMeta.postTokenBalances = previous;
+    }
+  });
+
   let releaseSimulation!: () => void;
   holdSimulation = new Promise((resolve) => { releaseSimulation = resolve; });
   const waitForSimulation = new Promise<void>((resolve) => { reachedSimulation = resolve; });
@@ -186,7 +254,7 @@ test('Solana journals before raw send and restores one pending signature across 
   assert.equal(original.summary.armed, false);
 
   original.arm();
-  await original.submit(candidate);
+  assert.equal(await original.submit(candidate), undefined, 'uncertain sends cannot grant an alternate');
   assert.equal(rawSendCount, 1);
   assert.ok(pendingSignature);
   assert.equal(original.summary.pending, pendingSignature);

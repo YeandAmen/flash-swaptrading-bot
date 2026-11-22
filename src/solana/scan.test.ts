@@ -233,6 +233,61 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     for (const route of guarded.routes) assert.equal(route.status, 'simulated', route.detail);
     assert.equal(submissions, 1, 'submit only the first qualifying guarded route');
   });
+  await t.test('tries the alternate only after an explicit route decline', async () => {
+    let submissions = 0;
+    const scanned = await scanSolanaCycle(config, async () => {
+      if (++submissions === 1) return { status: 'route-declined', canTryAlternate: () => true };
+      return undefined;
+    });
+    assert.ok(scanned.routes.every((route) => route.qualified));
+    assert.equal(submissions, 2);
+  });
+  await t.test('does not retry if a route decline is invalidated before the other quote arrives', async () => {
+    let submissions = 0;
+    let resolveQuote!: () => void;
+    let resolveDecline!: () => void;
+    let validPermit = true;
+    slowQuote = new Promise<void>((resolve) => { resolveQuote = resolve; });
+    const firstDeclined = new Promise<void>((resolve) => { resolveDecline = resolve; });
+    const pending = scanSolanaCycle({ ...config, venuePair: solanaVenuePairs[1] }, async () => {
+      submissions++;
+      resolveDecline();
+      return { status: 'route-declined', canTryAlternate: () => validPermit };
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        firstDeclined,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('First decision waited for the delayed quote')), 1000);
+        }),
+      ]);
+      validPermit = false;
+    } finally {
+      clearTimeout(timeout);
+      resolveQuote();
+      slowQuote = undefined;
+    }
+    const scanned = await pending;
+    assert.ok(scanned.routes.every((route) => route.qualified));
+    assert.equal(submissions, 1);
+  });
+  await t.test('does not try an alternate after an error or during a manual test', async () => {
+    let submissions = 0;
+    await assert.rejects(scanSolanaCycle(config, async () => {
+      submissions++;
+      throw new Error('Submission acknowledgment unavailable');
+    }), /Submission acknowledgment unavailable/);
+    assert.equal(submissions, 1);
+
+    submissions = 0;
+    const manual = await scanSolanaCycle(config, async () => {
+      submissions++;
+      return { status: 'route-declined', canTryAlternate: () => true };
+    }, 'manual-test');
+    assert.ok(manual.routes.every((route) => route.qualified));
+    assert.equal(submissions, 1);
+  });
   await t.test('compares other direct exits and records the actual venue with one quote per leg', async () => {
     groupedExit = 'PancakeSwap';
     jupiterRequests = 0;

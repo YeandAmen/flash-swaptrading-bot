@@ -118,6 +118,11 @@ export interface PreparedSolanaCycle {
   swapLossGuard?: SolanaSwapLossGuard;
 }
 
+export interface SolanaRouteDecline {
+  status: 'route-declined';
+  canTryAlternate(): boolean;
+}
+
 interface SolanaRoute {
   buy: Venue;
   sell: string;
@@ -324,7 +329,7 @@ function summarizeFailure(error: unknown, apiKey?: string): string {
 
 /** Build and simulate an unsigned mainnet transaction. Only the live worker can authorize a qualified candidate. */
 export async function scanSolanaCycle(config: SolanaScanConfig,
-  execute?: (candidate: PreparedSolanaCycle) => Promise<void>, requestedTest?: SolanaFlashTest | string): Promise<SolanaScanResult> {
+  execute?: (candidate: PreparedSolanaCycle) => Promise<void | SolanaRouteDecline>, requestedTest?: SolanaFlashTest | string): Promise<SolanaScanResult> {
   if (!config.wallet) throw new Error('Set SOLANA_WALLET_ADDRESS to the public address of your Solana wallet');
   const wallet = address(config.wallet);
   const test = execute && requestedTest ? (typeof requestedTest === 'string' ? { id: requestedTest } : requestedTest) : null;
@@ -366,7 +371,8 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   if (repay === null || loan > reserve.available) return result;
   result.status = 'scanned';
 
-  let submission: Promise<void> | undefined;
+  let submission: Promise<void | SolanaRouteDecline> | undefined;
+  let alternate: PreparedSolanaCycle | undefined;
   const scanRoute = async (buy: Venue, index: number, firstQuote?: JupiterBuild): Promise<SolanaRoute> => {
     const pairedVenue = venues[1 - index];
     const compareReturns = config.compareReturnVenues && !test && !firstQuote;
@@ -487,13 +493,17 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       const qualified = fee <= maxFeeLamports && postUsdc - preUsdc >= protectedCost + minimumNet
         && beforeNetwork >= protectedCost + minimumNet && lossBalancesMatch
         && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
-      if (qualified && execute && !submission && baseline && exactFee !== null) {
+      if (qualified && execute && baseline && exactFee !== null) {
         const candidate = { ...(test ? { testId: test.id } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight,
           simulationSlot: execution.slot, maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports: baseline.rent,
           firstMinimum, loan, net, ...(swapLossGuard ? { swapLossGuard } : {}) };
-        // Give the first qualifying route to the signer while the opposite direction finishes.
-        submission = Promise.resolve().then(() => execute(candidate));
-        void submission.catch(() => undefined); // Observe early failures during the remaining quote.
+        if (!submission) {
+          // Give the first qualifying route to the signer while the opposite direction finishes.
+          submission = Promise.resolve().then(() => execute(candidate));
+          void submission.catch(() => undefined); // Observe early failures during the remaining quote.
+        } else if (!test) {
+          alternate = candidate;
+        }
       }
       return {
         buy, sell, status: 'simulated', quotedNetBeforeNetworkUsdc: quote, simulatedNetUsdc: usdcUnits(net),
@@ -511,6 +521,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
     }
   };
   result.routes = await Promise.all(venues.map((buy, index) => scanRoute(buy, index)));
-  await submission;
+  const initial = await submission;
+  if (alternate && initial?.status === 'route-declined' && initial.canTryAlternate()) await execute?.(alternate);
   return result;
 }

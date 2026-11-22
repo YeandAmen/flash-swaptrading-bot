@@ -14,7 +14,7 @@ import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmou
 import { createWalletAta, JUPITER, KAMINO, MAINNET_GENESIS, SOLANA_PUBLIC_RPC, USDC, WRAPPED_SOL } from './protocol.js';
 import {
   matchesSolanaSwapLossBalances, solanaTestMinimums, SOLANA_TEST_MAX_FEE_LAMPORTS,
-  type PreparedSolanaCycle, type SolanaScanConfig, type SolanaSwapLossGuard,
+  type PreparedSolanaCycle, type SolanaRouteDecline, type SolanaScanConfig, type SolanaSwapLossGuard,
 } from './scan.js';
 
 const DAILY_FEE_CAP = 2_000_000n;
@@ -378,6 +378,7 @@ export class SolanaLiveWorker {
     solanaTestMinimums(test);
     if (test === previous) return flashTestView(test)!;
     this.save({ ...this.journal, test });
+    this.generation++;
     return test;
   }
 
@@ -434,7 +435,12 @@ export class SolanaLiveWorker {
       .reduce((sum, spend) => sum + BigInt(spend.feeLamports), 0n);
   }
 
-  async submit(candidate: PreparedSolanaCycle): Promise<void> {
+  scanHandoff() {
+    const generation = this.generation;
+    return async (candidate: PreparedSolanaCycle) => this.generation === generation ? this.submit(candidate) : undefined;
+  }
+
+  async submit(candidate: PreparedSolanaCycle): Promise<void | SolanaRouteDecline> {
     if (!this.signer || this.stopped || this.busy || !this.journal?.armed || this.journal.pending) return;
     const test = candidate.testId === undefined ? null : this.activeTest();
     if (candidate.testId !== undefined && test?.id !== candidate.testId) return;
@@ -446,8 +452,13 @@ export class SolanaLiveWorker {
     this.busy = true;
     const generation = this.generation;
     const canSend = () => !this.stopped && generation === this.generation && this.journal?.armed && !this.journal.pending
-      && (!test || this.activeTest()?.id === test.id);
+      && (test ? this.activeTest()?.id === test.id : !this.activeTest());
+    const decline = (): SolanaRouteDecline | undefined => test || !canSend() ? undefined : {
+      status: 'route-declined',
+      canTryAlternate: () => !this.busy && Boolean(canSend()),
+    };
     try {
+      if (!canSend()) return;
       if (candidate.feeLamports <= 0n || candidate.feeLamports > this.feeCap || (test && candidate.feeLamports > SOLANA_TEST_MAX_FEE_LAMPORTS)
         || candidate.rentLamports < 0n || candidate.rentLamports > MAX_ATA_RENT || candidate.firstMinimum <= 0n || candidate.loan <= 0n
         || candidate.maximumLamportDebit !== candidate.feeLamports + candidate.rentLamports
@@ -501,11 +512,14 @@ export class SolanaLiveWorker {
       ]);
       const blocksToExpiry = candidate.lastValidBlockHeight - head.blockHeight;
       if (!canSend()) return;
-      if (!valid || blocksToExpiry < MIN_BLOCKS_TO_EXPIRY || blocksToExpiry > MAX_BLOCKS_TO_EXPIRY
-        || head.absoluteSlot < candidate.simulationSlot || head.absoluteSlot - candidate.simulationSlot > MAX_CANDIDATE_AGE_SLOTS
+      if (blocksToExpiry > MAX_BLOCKS_TO_EXPIRY || head.absoluteSlot < candidate.simulationSlot
         || balance < NATIVE_RESERVE + candidate.maximumLamportDebit) {
         this.status = 'Solana candidate stale or wallet below its native reserve';
         return;
+      }
+      if (!valid || blocksToExpiry < MIN_BLOCKS_TO_EXPIRY || head.absoluteSlot - candidate.simulationSlot > MAX_CANDIDATE_AGE_SLOTS) {
+        this.status = 'Solana candidate stale before final simulation';
+        return decline();
       }
 
       const { value: simulation, context } = await this.rpc.simulateTransaction(getBase64EncodedWireTransaction(unsigned), {
@@ -514,14 +528,17 @@ export class SolanaLiveWorker {
       }).send(rpcDeadline());
       if (!canSend()) return;
       const measured = simulation.err ? null : accountOutcome(simulation, this.wallet, candidate.loan, candidate.firstMinimum);
-      if (context.slot < head.absoluteSlot || context.slot - candidate.simulationSlot > MAX_CANDIDATE_AGE_SLOTS
-        || !measured || measured.fee !== candidate.feeLamports || measured.cost > candidate.maximumLamportDebit
+      if (context.slot < head.absoluteSlot || !measured || measured.net === null || !measured.wsolPreserved
+        || measured.fee !== candidate.feeLamports || measured.cost > candidate.maximumLamportDebit
         || (simulation.postBalances?.[0] ?? 0n) < NATIVE_RESERVE
-        || !meetsOutcomeFloor(measured, minimum, gasOnlyTest)
         || (lossGuard && atas && !matchesSolanaSwapLossBalances(simulation, compiled.staticAccounts,
           this.wallet, ...atas, lossGuard, measured.fee))) {
         this.status = 'Solana final simulation did not satisfy the profit and cost guards';
         return;
+      }
+      if (context.slot - candidate.simulationSlot > MAX_CANDIDATE_AGE_SLOTS || !meetsOutcomeFloor(measured, minimum, gasOnlyTest)) {
+        this.status = 'Solana final simulation did not satisfy the profit and cost guards';
+        return decline();
       }
       const signer = this.signer;
       if (!signer) return;

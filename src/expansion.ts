@@ -87,7 +87,7 @@ export function startExpansion() {
       config.compareReturnVenues = true;
       config.loanUsdc = probe.loanUsdc;
     }
-    solanaResult = await scanSolanaCycle(config, execution ? (candidate) => execution.submit(candidate) : undefined, test ?? undefined);
+    solanaResult = await scanSolanaCycle(config, execution?.scanHandoff(), test ?? undefined);
     if (test) execution?.recordTestScan(test.id, solanaResult.routes.length);
     const quoteFailure = solanaResult.routes.length > 0 && solanaResult.routes.every((route) => route.status === 'quote-error')
       ? solanaResult.routes[0].detail ?? 'The venue quotes are unavailable' : null;
