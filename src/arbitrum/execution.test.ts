@@ -88,6 +88,10 @@ test('USDC multi-hop requires its reviewed release and protects dollar costs in 
   assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5), { ok: false, reason: 'unsupported-path' });
   assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5, true, arbitrumReleaseHash),
     { ok: false, reason: 'unsupported-path' });
+  for (const observedBlock of [49n, 101n]) {
+    assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, { ...path, block: observedBlock },
+      2_000, 0.05, 0.5, false, arbitrumReleaseHash), { ok: false, reason: 'stale-quote' });
+  }
   const prepared = await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5, false, arbitrumReleaseHash);
   assert.ok(prepared.ok);
   assert.equal(minimum, 105264n);

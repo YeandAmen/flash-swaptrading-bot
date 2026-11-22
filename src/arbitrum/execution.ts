@@ -28,8 +28,9 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
     const minNet = gasOnlyTest ? 0n : ceil(BigInt(Math.ceil(minimumNetUsd * 1e8)) * scale, assetPrice);
     if (candidate.payout <= minNet) return reject('net-floor');
     const head = await client.getBlock();
-    const quoteDeadline = 'legs' in candidate ? candidate.block + 10n : candidate.order.maxBlock;
-    if (head.number > quoteDeadline + 50n || Math.abs(Date.now() - Number(head.timestamp) * 1000) > 5_000) {
+    const stale = 'legs' in candidate ? head.number < candidate.block || head.number - candidate.block > 50n
+      : head.number > candidate.order.maxBlock + 50n;
+    if (stale || Math.abs(Date.now() - Number(head.timestamp) * 1000) > 5_000) {
       return reject('stale-quote');
     }
     // Broad snapshot quotes can take several L2 blocks. Refresh the deadline only for an exact live check.
