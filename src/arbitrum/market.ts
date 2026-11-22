@@ -248,67 +248,50 @@ function aggregateFailure(error: unknown): error is ContractFunctionExecutionErr
 
 export function emptyArbitrumQuoteRecovery() {
   return { before: 0, recovered: 0, remaining: 0, individualFailures: 0, resolvedIndividual: 0,
-    outOfGas: 0, rateLimited: 0, primaryAttempted: 0, primaryRecovered: 0, alternateAttempted: 0, alternateRecovered: 0 };
+    outOfGas: 0, rateLimited: 0, alternateAttempted: 0, alternateRecovered: 0 };
 }
 
 type QuotePin = { blockNumber: bigint } | { blockHash: Hash; requireCanonical: true };
 
 async function quoteArbitrumPools(client: ArbitrumClient, blockNumber: bigint, contracts: ReturnType<typeof quote>[],
-  pin: QuotePin, counts: ReturnType<typeof emptyArbitrumQuoteRecovery>, readersForBlock: () => Promise<QuoteRecoveryReaders | undefined>) {
+  pin: QuotePin, counts: ReturnType<typeof emptyArbitrumQuoteRecovery>, alternateForBlock: () => Promise<QuoteReader | undefined>) {
   if (!contracts.length) return [];
   const rows = await client.multicall({ ...pin, batchSize: 6000, contracts });
-  const missing: number[] = [], gasLimited = new Set<number>();
+  const missing: number[] = [], gasLimited: number[] = [];
   for (const [i, row] of rows.entries()) {
     if (row.status === 'success') continue;
     if (!aggregateFailure(row.error)) { counts.individualFailures++; continue; }
     missing.push(i);
-    if (/\bout of gas\b/i.test(row.error.details ?? '')) gasLimited.add(i);
+    if (/\bout of gas\b/i.test(row.error.details ?? '')) gasLimited.push(i);
     else if (/rate.?limit|too many requests/i.test(row.error.details ?? '')
       || row.error.walk(cause => cause instanceof HttpRequestError && cause.status === 429)) counts.rateLimited++;
   }
   counts.before += missing.length;
   counts.remaining += missing.length;
-  counts.outOfGas += gasLimited.size;
+  counts.outOfGas += gasLimited.length;
   if (!missing.length) return rows;
-  const readers = await readersForBlock();
-  const eligible = readers ? missing : [...gasLimited];
+  const alternate = await alternateForBlock();
+  const eligible = alternate ? missing : gasLimited;
   if (!eligible.length) return rows;
   // Each failed leg gets at most one smaller retry, on a single reader.
   const start = eligible.length > maxRetryQuoteLegs ? Number(blockNumber % BigInt(eligible.length)) : 0;
   const selected = Array.from({ length: Math.min(eligible.length, maxRetryQuoteLegs) },
     (_, i) => eligible[(start + i) % eligible.length]);
-  const primary: number[] = [], alternate: number[] = [];
-  // Alternate only the gas-limited legs so a run of rate limits cannot skew the split.
-  let nextGasOnPrimary = blockNumber % 2n === 0n;
-  for (const i of selected) {
-    if (!readers) primary.push(i);
-    else if (gasLimited.has(i)) {
-      (nextGasOnPrimary ? primary : alternate).push(i);
-      nextGasOnPrimary = !nextGasOnPrimary;
-    } else alternate.push(i);
-  }
-  counts.primaryAttempted += primary.length;
-  counts.alternateAttempted += alternate.length;
-  const retry = async (reader: QuoteReader | undefined, indices: number[], counter: 'primaryRecovered' | 'alternateRecovered') => {
-    if (!reader || !indices.length) return;
-    const result = await reader.multicall({ ...pin, batchSize: 1400, contracts: indices.map(i => contracts[i]) }).catch(() => []);
-    for (const [j, row] of result.entries()) {
-      rows[indices[j]] = row;
-      if (row.status === 'success') {
-        counts[counter]++;
-        counts.recovered++;
-        counts.remaining--;
-      } else if (!aggregateFailure(row.error)) {
-        counts.individualFailures++;
-        counts.resolvedIndividual++;
-        counts.remaining--;
-      }
+  if (alternate) counts.alternateAttempted += selected.length;
+  const retry = await (alternate ?? client).multicall({ ...pin, batchSize: 1400, contracts: selected.map(i => contracts[i]) })
+    .catch(() => []);
+  for (const [j, row] of retry.entries()) {
+    rows[selected[j]] = row;
+    if (row.status === 'success') {
+      counts.recovered++;
+      counts.remaining--;
+      if (alternate) counts.alternateRecovered++;
+    } else if (!aggregateFailure(row.error)) {
+      counts.individualFailures++;
+      counts.resolvedIndividual++;
+      counts.remaining--;
     }
-  };
-  await Promise.all([
-    retry(readers?.primary ?? client, primary, 'primaryRecovered'),
-    retry(readers?.alternate, alternate, 'alternateRecovered'),
-  ]);
+  }
   return rows;
 }
 
@@ -343,13 +326,13 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
   const active = (config & (1n << 56n)) !== 0n && (config & (1n << 60n)) === 0n && (config & (1n << 63n)) !== 0n;
   if (!active) throw new Error('Aave WETH flash loans are disabled');
   const quoteRecovery = emptyArbitrumQuoteRecovery();
-  let verified: Promise<QuoteRecoveryReaders | undefined> | undefined;
-  const readersForBlock = async () => {
+  let verified: Promise<QuoteReader | undefined> | undefined;
+  const alternateForBlock = async () => {
     if (!recovery || !('blockHash' in pin)) return undefined;
     // Use independent transports. A fallback client could otherwise confirm its own hash twice.
     return verified ??= Promise.all([recovery.primary, recovery.alternate].map(reader => reader.getBlock({ blockNumber })))
       .then(headers => headers.every(header => header.number === blockNumber && header.hash === recovery.blockHash)
-        ? recovery : undefined).catch(() => undefined);
+        ? recovery.alternate : undefined).catch(() => undefined);
   };
   const usdLimit = loanLimitWei(maxLoanUsd, ethUsd) ?? 0n;
   const ladder = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
@@ -369,7 +352,7 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     return sellPools.length ? [{ market, pool, size, sellPools, auditSize }] : [];
   })));
   const bought = await quoteArbitrumPools(client, blockNumber,
-    buys.map(({ market, pool, size }) => quote(market.token, pool, true, size)), pin, quoteRecovery, readersForBlock);
+    buys.map(({ market, pool, size }) => quote(market.token, pool, true, size)), pin, quoteRecovery, alternateForBlock);
   let prunedAfterBuy = 0;
   const sells = buys.flatMap(({ market, pool, size, sellPools, auditSize }, i) => {
     const amount = bought[i].result?.[0] ?? 0n;
@@ -385,7 +368,7 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     });
   });
   const sold = await quoteArbitrumPools(client, blockNumber,
-    sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)), pin, quoteRecovery, readersForBlock);
+    sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)), pin, quoteRecovery, alternateForBlock);
   const opportunities: ArbQuote[] = [];
   let bestQuote: SampledQuote | null = null;
   let largestQuote: SampledQuote | null = null;
