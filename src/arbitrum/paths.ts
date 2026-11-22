@@ -23,7 +23,7 @@ const aeroQuoteAbi = parseAbi(['function quoteExactInputSingleV3(address pool,ad
 const assets = [weth, usdc, arb, usdg] as const;
 const symbols = new Map<Address, string>([[weth, 'WETH'], [usdc, 'USDC'], [arb, 'ARB'], [usdg, 'USDG']]);
 type Pool = { kind: 2 | 6; pool: Address; token0: Address; token1: Address; tier: number };
-type Edge = { pool: Pool; input: Address; output: Address; rate: number };
+type Edge = { pool: Pool; input: Address; output: Address; rate: number; inputDepth: number };
 const marketCache = new WeakMap<ArbitrumClient, { block: bigint; pools: Pool[] }>();
 export type ArbPathLeg = { kind: 2 | 6; pool: Address; tokenOut: Address; tickSpacing: number };
 export interface ArbPathQuote {
@@ -56,26 +56,41 @@ async function discoverPathPools(client: ArbitrumClient, block: bigint) {
   return pools;
 }
 
-// Spot ranks distinct cycles. Only amount-dependent quotes and a full execution simulation can authorize execution.
-function pathCandidates(base: Address, edges: Edge[], block: bigint) {
-  const cycles: { path: Edge[]; margin: number }[] = [];
+function pathCandidates(base: Address, edges: Edge[]) {
+  const cycles: Edge[][] = [];
   const walk = (current: Address, path: Edge[], seen: Set<Address>, rate: number) => {
     for (const edge of edges) {
       if (edge.input !== current || path.some((step) => step.pool.pool === edge.pool.pool)) continue;
       const next = [...path, edge];
       const margin = rate * edge.rate;
       if (edge.output === base) {
-        if (next.length >= 3 && margin >= 1 - 1e-10) cycles.push({ path: next, margin });
+        if (next.length >= 3 && margin >= 1 - 1e-10) cycles.push(next);
       } else if (next.length < 4 && !seen.has(edge.output)) {
         walk(edge.output, next, new Set([...seen, edge.output]), margin);
       }
     }
   };
   walk(base, [], new Set([base]), 1);
-  cycles.sort((a, b) => b.margin - a.margin);
-  const first = cycles.slice(0, 3);
-  if (cycles.length > 3) first.push(cycles[3 + Number(block % BigInt(cycles.length - 3))]);
-  return first;
+  return cycles;
+}
+
+// Estimate price impact from the virtual input reserve in the active tick. Crossing
+// initialized ticks changes liquidity, so the pinned DEX quote still decides each payout.
+function shortlist(cycles: Edge[][], amount: bigint, block: bigint) {
+  const ranked = cycles.map((path) => {
+    const out = path.reduce((input, edge) => input * edge.rate / (1 + input / edge.inputDepth), Number(amount));
+    return { path, out, tokens: path.map((edge) => edge.output).join('/') };
+  }).sort((a, b) => b.out - a.out);
+  if (ranked.length <= 4) return ranked;
+
+  const selected = ranked.slice(0, 2);
+  // Reserve one slot for a different token sequence when it quotes within 50 bps
+  // of the best model. Rotate the last slot among similarly priced alternatives.
+  const plausible = ranked.slice(2).filter((r) => r.out >= ranked[0].out * 0.995);
+  selected.push(plausible.find((r) => selected.every((s) => s.tokens !== r.tokens)) ?? ranked[2]);
+  const others = plausible.filter((r) => !selected.includes(r));
+  selected.push(others.length ? others[Number(block % BigInt(others.length))] : ranked.find((r) => !selected.includes(r))!);
+  return selected;
 }
 
 function quoteLeg(edge: Edge, amount: bigint) {
@@ -107,10 +122,12 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
     const sqrt = prices[i]?.result;
     if (sqrt === undefined || liquidity[i]?.result === undefined) { result.unavailableLegs++; continue; }
     if (!sqrt || !liquidity[i].result) continue;
-    const spot = (Number(sqrt) / 2 ** 96) ** 2;
+    const sqrtRatio = Number(sqrt) / 2 ** 96;
+    const spot = sqrtRatio ** 2;
+    const activeLiquidity = Number(liquidity[i].result);
     const keep = pool.kind === 2 ? 1 - pool.tier / 1e6 : 1;
-    edges.push({ pool, input: pool.token0, output: pool.token1, rate: spot * keep },
-      { pool, input: pool.token1, output: pool.token0, rate: keep / spot });
+    edges.push({ pool, input: pool.token0, output: pool.token1, rate: spot * keep, inputDepth: activeLiquidity / sqrtRatio / keep },
+      { pool, input: pool.token1, output: pool.token0, rate: keep / spot, inputDepth: activeLiquidity * sqrtRatio / keep });
   }
   const feed = funding[2].result;
   const now = funding[3].result;
@@ -123,16 +140,18 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
     if (!available || !usd) continue;
     const decimals = i === 0 ? 18 : 6;
     const symbol = i === 0 ? 'WETH' : 'USDC';
-    const cycles = pathCandidates(asset, edges, block);
-    result.paths += cycles.length;
+    const cycles = pathCandidates(asset, edges);
     const sizes = [50, 250, 1000, 2500, [10_000, 50_000, 250_000, 1_000_000][Number(block % 4n)]];
     const amounts = [...new Set(sizes.map((size) => {
       const loan = (loanLimitWei(Math.min(size, maxLoanUsd), usd) ?? 0n) / 10n ** BigInt(18 - decimals);
       return loan < available ? loan : available;
     }))].filter((amount) => amount > 0n);
-    for (const { path } of cycles) for (const amountIn of amounts) {
+    const selectedPaths = new Set<Edge[]>();
+    for (const amountIn of amounts) for (const { path } of shortlist(cycles, amountIn, block)) {
+      selectedPaths.add(path);
       trials.push({ path, asset, symbol, usd, decimals, amountIn, out: amountIn });
     }
+    result.paths += selectedPaths.size;
   }
   for (let hop = 0; trials.length && hop < 4; hop++) {
     const keys = trials.map((t) => t.path[hop].pool.pool + '/' + t.path[hop].input + '/' + t.out);

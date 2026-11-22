@@ -54,7 +54,7 @@ function cpOut(edge: PathEdge, amount: bigint) {
   const input = amount * (million - edge.fee);
   return edge.reserveOut * input / (million * edge.reserveIn + input);
 }
-function upperOut(edge: PathEdge, amount: bigint) {
+function marginalOut(edge: PathEdge, amount: bigint) {
   const numerator = amount * edge.rateN * (million - edge.fee);
   const denominator = edge.rateD * million;
   return (numerator + denominator - 1n) / denominator;
@@ -75,8 +75,8 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
   const trials: Trial[] = [];
   let cycles = 0;
   const audit = scan.blockNumber % 8n === 0n;
-  const auditSize = min(available, parseEther('0.05'));
-  const auditBest = new Map<number, Trial>();
+  const referenceSize = min(available, parseEther('0.05'));
+  const references = new Map<number, Trial>();
   const visit = (tokens: Address[], legs: PathEdge[][]) => {
     const last = tokens[tokens.length - 1];
     for (const [nextToken, choices] of graph.get(last) ?? []) {
@@ -93,26 +93,28 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
       for (const venues of path) {
         let maximum = 0n;
         for (const edge of venues) {
-          const value = upperOut(edge, upper);
+          const value = marginalOut(edge, upper);
           if (value > maximum) maximum = value;
         }
         upper = maximum;
       }
       const viable = upper >= maxAmount + floor;
-      if (!viable && !audit) continue;
-      for (const amountIn of viable ? loans : [auditSize]) {
+      // A finite V2 reserve can wipe out the marginal edge at large sizes. Keep smaller loans eligible.
+      for (const amountIn of viable ? loans : [referenceSize]) {
         let variants: Trial[] = [{ edges: [], amountIn, amountOut: amountIn, upper: amountIn }];
         for (const venues of path) {
           const next = variants.flatMap(part => venues.map(edge => ({
             edges: [...part.edges, edge], amountIn,
-            amountOut: cpOut(edge, part.amountOut), upper: upperOut(edge, part.upper),
+            amountOut: cpOut(edge, part.amountOut),
+            // V2 reserves determine the exact monotone output. Concentrated pools may cross ticks.
+            upper: edge.hop.kind === 2 || edge.hop.kind === 5 ? marginalOut(edge, part.upper) : cpOut(edge, part.upper),
           })));
           next.sort((a, b) => compare(a.amountOut, b.amountOut) || compare(a.upper, b.upper));
           variants = next.slice(0, 2);
         }
         const first = variants[0];
-        if (audit && amountIn === auditSize && first && first.amountOut > (auditBest.get(path.length)?.amountOut ?? 0n)) {
-          auditBest.set(path.length, first);
+        if (amountIn === referenceSize && first && first.amountOut > (references.get(path.length)?.amountOut ?? 0n)) {
+          references.set(path.length, first);
         }
         if (viable) trials.push(...variants.filter(v => v.upper >= amountIn + floor));
       }
@@ -130,13 +132,15 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
     chosen.push(trial);
     if (chosen.length >= maxTrials / 2) break;
   }
+  // Preserve a real market reference even when many size variants of the same thin exit rank ahead
+  // on marginal price. Also audit the four-hop reference every eighth block or when no trial qualifies.
+  const reference = references.get(3) ?? references.get(4);
+  if (reference && !chosen.includes(reference)) chosen.push(reference);
+  const four = references.get(4);
+  if (four && (audit || !trials.length) && !chosen.includes(four)) chosen.push(four);
   for (const trial of trials) {
-    if (!chosen.includes(trial)) chosen.push(trial);
     if (chosen.length >= maxTrials) break;
-  }
-  // Periodically compare the strongest screened three- and four-hop models with actual quoter returns.
-  for (const trial of auditBest.values()) {
-    if (chosen.length < maxTrials && !chosen.includes(trial)) chosen.push(trial);
+    if (!chosen.includes(trial)) chosen.push(trial);
   }
   return { cycles, trials: chosen };
 }

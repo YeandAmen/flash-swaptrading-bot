@@ -19,9 +19,17 @@ const usdcLiquidity = 69_987_654n;
 const wethLiquidity = parseEther('0.03');
 interface Request { address: Address; functionName: string; args?: readonly unknown[] }
 
-function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | 'partial') {
+type Market = { pool: string; from: Address; to: Address; kind: number; tier: number; n: bigint; d: bigint; shallow?: boolean };
+function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | 'partial' | 'shallow', pinned = block) {
+  const inventory: Market[] = [...markets];
+  if (mode === 'shallow') {
+    for (const [i, [kind, tier]] of [[2, 100], [2, 500], [2, 3000], [6, 1], [6, 10], [6, 50]].entries()) {
+      inventory.push({ pool: '0x' + (i + 1).toString().padStart(40, '0'), from: weth, to: arb, kind, tier,
+        n: BigInt(6000 + i * 100), d: 1n, shallow: true });
+    }
+  }
   return { multicall: async ({ blockNumber, contracts }: { blockNumber: bigint; contracts: Request[] }) => {
-    assert.equal(blockNumber, block);
+    assert.equal(blockNumber, pinned);
     return contracts.map(({ functionName, args = [], address }) => {
       const success = (result: unknown) => ({ status: 'success', result });
       if (functionName === 'balanceOf') {
@@ -37,25 +45,27 @@ function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | '
       if (functionName === 'getPool') {
         const [a, b, tier] = args;
         const kind = address === '0x1f98431c8ad98523631ae4a59f267346ea31f984' ? 2 : 6;
-        return success(markets.find(m => m.kind === kind && m.tier === tier &&
+        return success(inventory.find(m => m.kind === kind && m.tier === tier &&
           ((m.from === a && m.to === b) || (m.from === b && m.to === a)))?.pool ?? zeroAddress);
       }
       if (functionName === 'slot0' || functionName === 'liquidity') {
-        const market = markets.find(m => m.pool === address);
+        const market = inventory.find(m => m.pool === address);
         assert.ok(market, 'only discovered markets can be read');
         const rate = Number(market.n) / Number(market.d);
         return success(functionName === 'slot0'
-          ? BigInt(Math.floor(2 ** 96 * Math.sqrt(market.from < market.to ? rate : 1 / rate))) : 1_000_000n);
+          ? BigInt(Math.floor(2 ** 96 * Math.sqrt(market.from < market.to ? rate : 1 / rate))) : market.shallow ? 1_000_000n : 10n ** 30n);
       }
       const uni = functionName === 'quoteExactInputSingle';
       assert.ok(uni || functionName === 'quoteExactInputSingleV3');
-      const first = args[0] as { tokenIn: Address; amountIn: bigint; fee: number };
-      const market = uni ? markets[0] : markets.find(m => m.pool === args[0]);
+      const first = args[0] as { tokenIn: Address; tokenOut: Address; amountIn: bigint; fee: number };
+      const market = uni ? inventory.find(m => m.kind === 2 && m.tier === first.fee &&
+        ((m.from === first.tokenIn && m.to === first.tokenOut) || (m.from === first.tokenOut && m.to === first.tokenIn)))
+        : inventory.find(m => m.pool === args[0]);
       assert.ok(market);
       if (market.pool === markets[1].pool && mode === 'unavailable') return { status: 'failure' };
       const amount = uni ? first.amountIn : args[2] as bigint;
       const forward = (uni ? first.tokenIn : args[1]) === market.from;
-      const out = forward ? amount * market.n / market.d : amount * market.d / market.n;
+      const out = market.shallow ? 1n : forward ? amount * market.n / market.d : amount * market.d / market.n;
       return success([out, market.pool === markets[1].pool && mode === 'partial' ? 4295128740n : 1n << 96n, 0n, 0n]);
     });
   } } as unknown as ArbitrumClient;
@@ -103,4 +113,17 @@ test('unavailable or partially filled quote legs cannot complete a path', async 
     assert.deepEqual(result.opportunities, []);
     if (mode === 'unavailable') assert.ok(result.unavailableLegs > 0);
   }
+});
+
+
+test('tiny high-spot pools cannot crowd both funded assets out of the executable four-hop shortlist', async () => {
+  const pinned = 526452778n;
+  const result = await scanArbitrumPaths(fixture('shallow', pinned), pinned, 2000, 50);
+  assert.equal(result.pools, 10);
+  assert.ok(result.paths <= 8 && result.quotedRoutes <= 8, 'at most four paths per funded asset and size');
+  assert.ok(result.opportunities.some(r => r.symbol === 'WETH'));
+  const route = result.opportunities.find(r => r.symbol === 'USDC');
+  assert.ok(route);
+  assert.deepEqual(route.legs.map(l => l.pool), markets.map(m => m.pool));
+  assert.equal(result.best?.payoutUsd, result.opportunities[0].payoutUsd);
 });

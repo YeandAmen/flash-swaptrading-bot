@@ -130,3 +130,54 @@ test('a hash-pinned blocked RPC cannot occupy the worker beyond the scan deadlin
   assert.ok(Date.now() - started < 1000);
   assert.deepEqual(out.candidates, []);
 });
+
+test('finite V2 exits prune impossible amounts while a near-even reference gets an exact quote', async () => {
+  const thin = edge(a, b, 0, 1000n);
+  thin.reserveIn = 10n ** 10n;
+  thin.reserveOut = thin.reserveIn * 1000n;
+  const edges = [edge(WETH, a, 2), thin, edge(WETH, c, 2), edge(c, b, 0), edge(b, WETH, 0)];
+  const quotedOutputs = new Set<Address>();
+  const reader = client((calls, block) => calls.map((call, i) => {
+    if (!i) return block;
+    const args = call.args![0] as { amountIn: bigint; tokenOut: Address };
+    quotedOutputs.add(args.tokenOut);
+    return [args.amountIn, 1n << 96n];
+  }));
+  const out = await quoteEthereumPaths(settings(), reader, edges, parseEther('1'), labels);
+  assert.deepEqual([...quotedOutputs], [c]);
+  assert.equal(out.exactQuotes, 1);
+  assert.equal(out.bestQuote?.label, 'WETH → C → B → WETH');
+  assert.deepEqual(out.candidates, []);
+
+  // This V2 pair can repay at small sizes even though the maximum tested loan would lose money.
+  thin.reserveIn = parseEther('0.05');
+  thin.reserveOut = parseEther('0.07');
+  thin.rateN = 7n;
+  thin.rateD = 5n;
+  const small = await quoteEthereumPaths(settings(), reader, edges, parseEther('1'), labels);
+  assert.ok(small.candidates.length > 0);
+  assert.ok(small.candidates.every(quote => quote.amountIn < parseEther('0.05') && quote.grossProfit > 0n));
+});
+
+test('a full set of high-ranked three-hop trials leaves room for the four-hop audit', async () => {
+  const scan = { ...settings(), blockNumber: 104n, maxLoanWei: parseEther('512') };
+  const alternative = edge(a, b, 0, 2n);
+  alternative.pool = { ...alternative.pool, pool: c };
+  alternative.hop = { ...alternative.hop, pool: c };
+  const edges = [edge(WETH, a, 0), edge(a, b, 0), alternative, edge(b, WETH, 0, 3n), edge(b, c, 0), edge(c, WETH, 2)];
+  // An adverse C/WETH marginal quote rules the four-hop cycle out for trading.
+  edges[5].reserveOut /= 4n;
+  edges[5].rateD = 4n;
+  let audited = false;
+  const reader = client((calls, block) => calls.map((call, i) => {
+    if (!i) return block;
+    const args = call.args![0] as { amountIn: bigint; tokenIn: Address };
+    assert.equal(args.tokenIn, c);
+    audited = true;
+    return [args.amountIn / 4n, 1n << 96n];
+  }));
+  const out = await quoteEthereumPaths(scan, reader, edges, parseEther('512'), labels);
+  assert.ok(audited);
+  assert.equal(out.exactQuotes, 12);
+  assert.ok(out.candidates.every(q => q.hops.length === 3));
+});

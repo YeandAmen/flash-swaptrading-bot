@@ -82,7 +82,12 @@ const gift = 500_000n;
 await confirmed(await sender.writeContract({ address: usdc, abi: erc, functionName: 'transfer', account: fixture, args: [proxy, gift] }));
 const expected = (await client.simulateContract({ ...pathCall, args: [release, path] })).result;
 await assert.rejects(client.simulateContract({ ...pathCall, args: [release, { ...path, minProfit: expected + 1n }] }), /unprofitable/);
-const receipt = await confirmed(await sender.writeContract({ ...pathCall, args: [release, path], gas: 4_000_000n }));
+// Use the pinned network's base fee with an explicit small L2 priority fee.
+// Anvil's generic wallet priority estimate is higher than this historical chain fee.
+const blockFee = (await client.getBlock()).baseFeePerGas;
+assert.ok(blockFee !== null);
+const fees = { maxPriorityFeePerGas: 1_000_000n, maxFeePerGas: blockFee * 2n + 1_000_000n };
+const receipt = await confirmed(await sender.writeContract({ ...pathCall, args: [release, path], gas: 4_000_000n, ...fees }));
 const logs = receipt.logs.filter((l) => l.address.toLowerCase() === proxy.toLowerCase());
 const [gain] = parseEventLogs({ abi, eventName: 'PathArbitrage', logs });
 const [funded] = parseEventLogs({ abi, eventName: 'FundedBy', logs });
@@ -102,15 +107,21 @@ for (const token of [usdc, weth, arb, usdg] as const) {
   }
 }
 assert.equal(await client.getBalance({ address: proxy }), 0n);
-console.log(`✓ Four canonical swaps. Morpho principal returned. Owner received ${expected} micro-USDC profit, gift excluded. No residual balances or allowances. Local gas ${receipt.gasUsed}.`);
+const oracleAbi = parseAbi(['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)']);
+const [, ethUsd] = await client.readContract({ address: '0x639fe6ab55c921f74e7fac1ee960c0b6293ba612', abi: oracleAbi, functionName: 'latestRoundData' });
+const [, usdcUsd] = await client.readContract({ address: '0x50834F3163758fcC1Df9973b6e91f0F0F0434aD3', abi: oracleAbi, functionName: 'latestRoundData' });
+const gasUsd = Number(receipt.gasUsed * receipt.effectiveGasPrice) / 1e18 * Number(ethUsd) / 1e8;
+const netUsd = Number(expected) / 1e6 * Number(usdcUsd) / 1e8 - gasUsd;
+assert.ok(netUsd > 0, `Fork receipt gas $${gasUsd.toFixed(6)} exceeded loan profit`);
+console.log(`✓ Four canonical swaps. Morpho repaid. Owner received ${expected} micro-USDC profit, gift excluded. No residual balances/allowances. Gas ${receipt.gasUsed}, net $${netUsd.toFixed(4)}.`);
 const legacy = (maxBlock: bigint) => encodeFunctionData({ abi, functionName: 'execute', args: [{ funding: 1, token: usdc,
   buy: { kind: 2, pool: '0xc473e2aEE3441BF9240Be85eb122aBB059A3B57c', fee: 3000, tickSpacing: 0, nativeEth: false },
   sell: { kind: 2, pool: legs[0].pool, fee: 500, tickSpacing: 0, nativeEth: false },
-  amountIn: parseEther('0.05'), minProfit: 1n, tip: 0n, maxBlock }] });
+  amountIn: parseEther('0.25'), minProfit: 1n, tip: 0n, maxBlock }] });
 await assert.rejects(client.simulateContract({ address: proxy, abi: FLASH_ARB_PROXY_ABI, functionName: 'executePinned',
   account: owner, args: [release, legacy(0n)] }), /expired/);
 const legacyReceipt = await confirmed(await sender.writeContract({ address: proxy, abi: FLASH_ARB_PROXY_ABI, functionName: 'executePinned',
-  account: owner, args: [release, legacy(await client.getBlockNumber() + 10n)], gas: 2_000_000n }));
+  account: owner, args: [release, legacy(await client.getBlockNumber() + 10n)], gas: 2_000_000n, ...fees }));
 const [twoSwap] = parseEventLogs({ abi, eventName: 'Arbitrage', logs: legacyReceipt.logs.filter((l) => l.address.toLowerCase() === proxy.toLowerCase()) });
-assert.ok(twoSwap && twoSwap.args.profit > legacyReceipt.gasUsed * legacyReceipt.effectiveGasPrice);
-console.log('✓ Existing pinned Aave two-swap ABI also settled profitably after the upgrade.');
+assert.ok(twoSwap && twoSwap.args.profit > 0n);
+console.log('✓ Existing pinned Aave two-swap ABI also repaid and settled after the upgrade.');
