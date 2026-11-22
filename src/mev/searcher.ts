@@ -32,6 +32,7 @@ const IDLE_BID_AFTER_MS = 30 * 60_000;
 const NORMAL_GAS_PADDING_PCT = 0.25;
 const SLOT_MS = 12_000;
 const FALLBACK_LEAD_MS = 5_000;
+const DIRECT_QUOTE_GRACE_MS = 75;
 const CADENCE_RECHECK_MS = 60_000;
 const GAS_ONLY_TEST_MS = 6 * 60_000;
 const GAS_ONLY_TEST_ROUTES = 4;
@@ -743,22 +744,60 @@ export class MevSearcher {
     const canTryFallback = () => canTryLive() && !this.host.tradePending()
       && (CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS);
     const allowFallback = canTryFallback();
-    const shortlisted = await Promise.all(selected.map((candidate) =>
-      this.evaluate(candidate, r, nextMaxBase, policy, allowFallback, observedNet, broadenSizes)));
+    const pipeline = MEV.submission === 'direct' && canTryLive();
+    const ready = new Map<number, PreparedOffer>();
+    const estimated = new Set<number>();
+    let notifyReady!: () => void;
+    const firstReady = new Promise<void>((resolve) => { notifyReady = resolve; });
+    const preparePrimary = async (offer: Offer, index: number) => {
+      if (estimated.has(index)) return;
+      estimated.add(index);
+      const prepared = await this.prepareLive(offer, r, policy);
+      if (prepared) {
+        ready.set(index, prepared);
+        notifyReady();
+      }
+    };
+    let signed = false;
+    const sendReady = async () => {
+      const ranked = [...ready].sort(([i, a], [j, b]) => {
+        const difference = (a.net - b.net) || (a.tip - b.tip) || (a.offer.score - b.offer.score);
+        return difference > 0n ? -1 : difference < 0n ? 1 : i - j;
+      });
+      for (const [index, offer] of ranked) {
+        if (signed || !canTryLive()) break;
+        ready.delete(index);
+        await this.sendLive(offer, r, generation);
+        signed = Boolean(offer.offer.opp.hash);
+      }
+    };
+    const finished = Promise.all(selected.map(async (candidate, index) => {
+      try {
+        const route = await this.evaluate(candidate, r, nextMaxBase, policy, allowFallback, observedNet, broadenSizes);
+        if (route?.primary && pipeline && canTryLive()) await preparePrimary(route.primary, index);
+        return route;
+      } catch (error) {
+        this.host.log(`[mev] Route evaluation for ${candidate.t.token.symbol}: ${errMsg(error)}`, 'warn');
+        return null;
+      }
+    }));
+    if (pipeline) {
+      await Promise.race([finished, firstReady]);
+      if (ready.size) {
+        // Compare near-simultaneous quotes without waiting a full RPC timeout for unrelated routes.
+        const grace = Math.min(DIRECT_QUOTE_GRACE_MS, r.timestamp * 1000 + SLOT_MS - Date.now() - DIRECT_SEND_LEAD_MS);
+        if (grace > 0) await Promise.race([finished, sleep(grace)]);
+        await sendReady();
+      }
+    }
+    const shortlisted = await finished;
     const offers = shortlisted.flatMap((route) => route?.primary ? [route.primary] : [])
       .sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
     let fallback: Offer | undefined;
-    if (canTryLive()) {
-      const prepared = await Promise.all(offers.map((offer) => this.prepareLive(offer, r, policy)));
-      const ranked = prepared.filter((offer) => offer !== null).sort((a, b) => {
-        const byNet = a.net - b.net;
-        const difference = byNet === 0n ? a.tip - b.tip : byNet;
-        return difference > 0n ? -1 : difference < 0n ? 1 : 0;
-      });
-      for (const offer of ranked) {
-        if (!canTryLive()) break;
-        await this.sendLive(offer, r, generation);
-      }
+    if (!signed && canTryLive()) {
+      // A wallet reconciliation may also have finished while evaluations were in flight.
+      await Promise.all(shortlisted.map((route, index) => route?.primary && preparePrimary(route.primary, index)));
+      await sendReady();
       // Keep the original submission path fast. Spend one more gas quote only when no primary was signed.
       if (canTryFallback() && !offers.some((offer) => offer.opp.hash)) {
         const [bestFallback] = shortlisted.flatMap((route) => route?.fallback ? [{ route, offer: route.fallback }] : [])
@@ -776,7 +815,7 @@ export class MevSearcher {
           }
         }
       }
-    } else {
+    } else if (!signed) {
       for (const offer of offers.reverse()) this.record(offer.opp);
     }
     return Boolean(fallback?.opp.hash || offers.some((offer) => offer.opp.hash));

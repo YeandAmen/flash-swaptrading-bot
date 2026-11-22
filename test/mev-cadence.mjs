@@ -120,7 +120,7 @@ try {
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
-    protectedDirect = false }) {
+    protectedDirect = false, beforeSimulate, atSign, pendingForToken }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -131,6 +131,7 @@ try {
     const searcher = newSearcher(async (tx) => {
       signed.push(tx);
       seenAtSign.push(...simulated);
+      atSign?.(tx);
       return '0xc0';
     });
     searcher.file.stats.directScanStartedAt = now - age;
@@ -149,6 +150,7 @@ try {
     searcher.simulate = async (token, _buy, _sell, amount, _maxBlock, blockNumber) => {
       assert.equal(blockNumber, 100n);
       assert.ok(amount <= 500n * oneEth, 'every simulated amount stays under the $1m WETH cap');
+      await beforeSimulate?.(token.token.symbol);
       simulated.add(token.token.symbol);
       return { ok: true, profit: typeof profit === 'function' ? profit(token.token.symbol) : profit };
     };
@@ -166,7 +168,8 @@ try {
         assert.equal(blockNumber, undefined);
         finalStates.set('pending', call);
         if (pendingError) throw new Error('Pending state unavailable');
-        return { data: hash(pendingProfit) };
+        const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data }).args[0];
+        return { data: hash(pendingForToken ? pendingForToken(order.token) : pendingProfit) };
       }
       assert.equal(blockNumber, 100n);
       finalStates.set('pinned', call);
@@ -225,6 +228,33 @@ try {
     to: fresh.signed[0].to, data: fresh.signed[0].data, gas: fresh.signed[0].gas,
   }, 'both final checks use the exact transaction sent to the signer');
   assert.ok(fresh.seenAtSign.length <= baseLimit, 'an executable first-wave route should not wait on scan expansion');
+
+  // A slow third route cannot block two exact ready offers. The first fails its pending-state
+  // check, so the second must sign once before the unrelated simulation is released.
+  const slow = Promise.withResolvers();
+  const checked = [];
+  const watchdog = setTimeout(slow.resolve, 1_000);
+  try {
+    const pipelined = await scan({
+      age: 24 * minute, protectedDirect: true,
+      profit: (symbol) => coversGas * BigInt(symbol === 'TEST1' ? 2 : 1),
+      beforeSimulate: (symbol) => symbol === 'TEST2' ? slow.promise : undefined,
+      pendingForToken: (token) => {
+        checked.push(token.toLowerCase());
+        return token.toLowerCase() === address(101) ? underGas : coversGas;
+      },
+      atSign: () => slow.resolve(),
+    });
+    assert.deepEqual(checked, [address(101), address(100)], 'choose the best ready exact offer and retry serially after its pending-state rejection');
+    assert.ok(!pipelined.seenAtSign.includes('TEST2'), 'an unrelated unfinished quote must not hold the viable order until the RPC deadline');
+    assert.equal(pipelined.signed.length, 1);
+    assert.equal(pipelined.submitted.length, 1);
+    assert.equal(pipelined.journaled.length, 1);
+    assert.ok(pipelined.simulated.has('TEST2'), 'finish observing late evaluations without signing twice');
+  } finally {
+    clearTimeout(watchdog);
+    slow.resolve();
+  }
 
   // The round trip pays 170e12 wei. The former 170k-gas model at 1.1 gwei, even with a
   // 20% discount, requires 174.6e12 wei including the floor. Exact padded gas makes it executable.
