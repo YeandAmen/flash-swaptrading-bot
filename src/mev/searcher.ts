@@ -129,6 +129,7 @@ interface BundleSubmission {
   gasLimit?: string;
   maxFeePerGasWei?: string;
   relayAfterAck?: PrivateRelayStatus & { checkedAt: number };
+  relayAtTargetHead?: { block: number; blockHash: Hex; requestedAt: number; result?: PrivateRelayStatus & { checkedAt: number } };
   relayAfterExpiry?: PrivateRelayStatus & { checkedAt: number };
   gasEth: number;
   tipEth: number;
@@ -658,6 +659,7 @@ export class MevSearcher {
   private async head() {
     const head = await mevReadClient.getBlock({ blockTag: 'latest' });
     this.file.stats.rpcCalls++;
+    if (this.pending) this.samplePrivateStatusAtHead(this.pending, head);
     return head;
   }
 
@@ -1797,6 +1799,27 @@ export class MevSearcher {
     setTimeout(() => {
       if (eligible()) void this.recordPrivateStatus(pending.hash, submission, 'relayAfterAck', eligible);
     }, delay).unref();
+  }
+
+  private samplePrivateStatusAtHead(pending: PendingBundle, head: { number: bigint; hash: Hex }) {
+    const submission = pending.opp.submission;
+    if (CONFIG.forkMode || this.stopping || !pending.privateSubmission || submission?.kind !== 'direct'
+      || !submission.privateSubmission || submission.rpcAckMs === undefined || submission.relayAtTargetHead
+      || head.number <= BigInt(pending.opp.block) || head.number > BigInt(pending.target)) return;
+    const early = submission.relayAfterAck;
+    if (early && ((early.status !== 'PENDING' && early.status !== 'UNKNOWN') || (early.simError && early.simError !== 'Other'))) return;
+    // Checkpoint the request on the pending journal. Startup can sample an acknowledged
+    // order in its remaining blocks without duplicating a read already in flight.
+    const sample: NonNullable<BundleSubmission['relayAtTargetHead']> = {
+      block: Number(head.number), blockHash: head.hash, requestedAt: Date.now(),
+    };
+    submission.relayAtTargetHead = sample;
+    this.save();
+    void requestPrivateRelayStatus(pending.hash).then(status => {
+      if (!status || this.stopping || !this.file.recent.some(row => row.submission === submission)) return;
+      sample.result = { ...status, checkedAt: Date.now() };
+      this.save();
+    });
   }
 
   private async recordPrivateStatus(hash: Hex, submission: BundleSubmission, field: 'relayAfterAck' | 'relayAfterExpiry',

@@ -733,6 +733,115 @@ try {
   const restarted = newSearcher(async () => assert.fail('journal recovery must not sign'));
   assert.equal(restarted.file.stats.lastDirectLandedAt, journal.file.stats.lastDirectLandedAt);
 
+  // Recover an acknowledged signature and feed the same latest-head reads used by
+  // the production scanner and startup reconciliation, without advancing wall time.
+  {
+    const oldFetch = globalThis.fetch;
+    const oldHead = mevReadClient.getBlock;
+    const oldCount = mevReadClient.getTransactionCount;
+    const forkMode = CONFIG.forkMode;
+    const restore = () => newSearcher(async () => assert.fail('a relay diagnostic must never sign'));
+    const freshPending = () => {
+      const p = structuredClone(multi.submitted[0]);
+      p.opp.status = 'sent';
+      p.opp.submission.rpcAckMs = 52;
+      p.opp.submission.relayAfterAck = { status: 'PENDING', checkedAt: now };
+      delete p.opp.submission.relayAfterExpiry;
+      return p;
+    };
+    const writePending = p => {
+      journal.file.pending = p;
+      journal.file.recent = [p.opp];
+      journal.save();
+    };
+    let height = 100n;
+    const requests = [];
+    const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+    try {
+      CONFIG.forkMode = false;
+      mevReadClient.getBlock = async ({ blockTag }) => {
+        assert.equal(blockTag, 'latest');
+        return { number: height, hash: hash(height) };
+      };
+      mevReadClient.getTransactionCount = async () => 7;
+      globalThis.fetch = async (url, { method }) => {
+        assert.equal(method, 'GET');
+        assert.equal(url, 'https://protect.flashbots.net/tx/' + multi.submitted[0].hash);
+        const body = await new Promise(resolve => requests.push(resolve));
+        return new Response(JSON.stringify({ ...body, hash: multi.submitted[0].hash, maxBlockNumber: 103 }));
+      };
+      writePending(freshPending());
+      const recovered = restore();
+      recovered.receipt = async () => null;
+      await recovered.head();
+      assert.equal(requests.length, 0, 'submission block is too early');
+      height = 101n;
+      await recovered.head();
+      assert.equal(requests.length, 1);
+      await recovered.head();
+      height = 102n;
+      await restore().head();
+      assert.equal(requests.length, 1, 'repeat polls and restart while the query is outstanding are bounded');
+      requests[0]({ status: 'PENDING', simError: 'ExecutionReverted', revertReason: 'loan repayment' });
+      await nextTurn();
+      const checked = restore().file.pending.opp.submission;
+      assert.deepEqual(checked.relayAfterAck, { status: 'PENDING', checkedAt: now });
+      assert.equal(checked.relayAtTargetHead.block, 101);
+      assert.equal(checked.relayAtTargetHead.blockHash, hash(101));
+      assert.equal(checked.relayAtTargetHead.result.status, 'PENDING');
+      assert.equal(checked.relayAtTargetHead.result.revertReason, 'loan repayment');
+      assert.ok(checked.relayAtTargetHead.result.checkedAt >= checked.relayAtTargetHead.requestedAt);
+      assert.equal(checked.relayAfterExpiry, undefined);
+      assert.equal(recovered.file.pending.opp.status, 'sent');
+      await restore().head();
+      assert.equal(requests.length, 1);
+
+      height = 105n;
+      await recovered.reconcileWallet();
+      assert.equal(recovered.file.pending, null);
+      assert.equal(recovered.file.recent[0].status, 'not included');
+      assert.equal(requests.length, 2);
+      requests[1]({ status: 'FAILED', simError: 'ExecutionReverted', revertReason: 'expired' });
+      await nextTurn();
+      const settled = restore().file.recent[0].submission;
+      assert.deepEqual(settled.relayAfterAck, checked.relayAfterAck);
+      assert.deepEqual(settled.relayAtTargetHead, checked.relayAtTargetHead);
+      assert.equal(settled.relayAfterExpiry.revertReason, 'expired');
+
+      for (const [observed, update] of [
+        [104n, () => {}],
+        [101n, p => { delete p.opp.submission.rpcAckMs; }],
+        [101n, p => { delete p.privateSubmission; delete p.opp.submission.privateSubmission; }],
+        [101n, p => { p.opp.submission.relayAfterAck.simError = 'MaxFeePerGasTooLow'; }],
+        [101n, p => { p.opp.submission.relayAfterAck.status = 'INCLUDED'; }],
+      ]) {
+        const p = freshPending();
+        update(p);
+        height = observed;
+        writePending(p);
+        await restore().head();
+        assert.equal(requests.length, 2);
+      }
+      // An ACK may survive a restart before its first status callback finishes.
+      const p = freshPending();
+      delete p.opp.submission.relayAfterAck;
+      writePending(p);
+      height = 102n;
+      const resumed = restore();
+      await resumed.head();
+      assert.equal(requests.length, 3);
+      requests[2]({ status: 'INCLUDED' });
+      await nextTurn();
+      assert.equal(resumed.file.pending.opp.status, 'sent', 'relay status cannot settle a wallet nonce');
+      assert.equal(resumed.file.pending.opp.submission.relayAtTargetHead.block, 102);
+    } finally {
+      CONFIG.forkMode = forkMode;
+      globalThis.fetch = oldFetch;
+      mevReadClient.getBlock = oldHead;
+      mevReadClient.getTransactionCount = oldCount;
+    }
+  }
+
   console.log('PASS: direct cadence, protected and public deadlines, pending-state checks, gas limits, nonce reservation, and confirmed-fill persistence');
 } finally {
   rmSync(temporary, { recursive: true, force: true });
