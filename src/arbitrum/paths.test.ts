@@ -20,8 +20,8 @@ const wethLiquidity = parseEther('0.03');
 interface Request { address: Address; functionName: string; args?: readonly unknown[] }
 
 type Market = { pool: string; from: Address; to: Address; kind: number; tier: number; n: bigint; d: bigint; shallow?: boolean };
-function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | 'partial' | 'shallow', pinned = block) {
-  const inventory: Market[] = [...markets];
+function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | 'partial' | 'shallow', pinned = block, extra: Market[] = []) {
+  const inventory: Market[] = [...markets, ...extra];
   if (mode === 'shallow') {
     for (const [i, [kind, tier]] of [[2, 100], [2, 500], [2, 3000], [6, 1], [6, 10], [6, 50]].entries()) {
       inventory.push({ pool: '0x' + (i + 1).toString().padStart(40, '0'), from: weth, to: arb, kind, tier,
@@ -160,6 +160,47 @@ test('tiny high-spot pools cannot crowd both funded assets out of the executable
   assert.ok(route);
   assert.deepEqual(route.legs.map(l => l.pool), markets.map(m => m.pool));
   assert.equal(result.best?.payoutUsd, result.opportunities[0].payoutUsd);
+});
+
+test('a competitive 1% Uniswap pool fits within the existing four-route shortlist', async () => {
+  const active = { ...markets[0], pool: '0x42fc852a750ba93d5bf772ecdc857e87a86403a9', tier: 10_000,
+    n: markets[0].n * 103n, d: markets[0].d * 100n };
+  const dry = { ...markets[1], pool: '0x92fd143a8fa0c84e016c2765648b9733b0aa519e', kind: 2, tier: 10_000 };
+  const source = fixture('shallow', block, [active, dry]);
+  let feeProbes = 0, stateReads = 0, exactReads = 0;
+  const client = { multicall: async (request: { blockNumber: bigint; contracts: Request[] }) => {
+    const rows = await source.multicall(request as Parameters<typeof source.multicall>[0]);
+    return request.contracts.map(({ functionName, address, args = [] }, i) => {
+      if (functionName === 'getPool' && args[2] === 10_000) {
+        feeProbes++;
+        // A later duplicate address must not create another market or state read.
+        if (args.includes(weth) && args.includes(usdg)) return { status: 'success', result: active.pool };
+      }
+      if ((functionName === 'slot0' || functionName === 'liquidity') && address === active.pool) stateReads++;
+      if (functionName === 'liquidity' && address === dry.pool) return { status: 'success', result: 0n };
+      if (functionName === 'quoteExactInputSingle') {
+        const leg = args[0] as { fee: number; tokenIn: Address; tokenOut: Address };
+        if (leg.fee === 10_000) {
+          assert.deepEqual([leg.tokenIn, leg.tokenOut].sort(), [weth, usdc].sort(), 'the dry pool never reaches the quoter');
+          exactReads++;
+          const [out, ...rest] = (rows[i] as { result: readonly bigint[] }).result;
+          return { status: 'success', result: [out * 99n / 100n, ...rest] };
+        }
+      }
+      return rows[i];
+    });
+  } } as unknown as ArbitrumClient;
+  const result = await scanArbitrumPaths(client, block, 2000, 50);
+  assert.equal(feeProbes, 6);
+  assert.equal(stateReads, 2);
+  assert.ok(exactReads > 0);
+  assert.ok(result.paths <= 8 && result.quotedRoutes <= 8, 'four quotes per asset at the single capped amount');
+  const route = result.opportunities.find(r => r.asset === usdc && r.legs[0].pool === active.pool);
+  assert.ok(route);
+  assert.deepEqual(route.legs.map(leg => leg.pool), [active.pool, ...markets.slice(1).map(m => m.pool)]);
+  const first = route.amountIn * active.n / active.d * 99n / 100n;
+  const received = markets.slice(1).reduce((amount, market) => amount * market.n / market.d, first);
+  assert.equal(route.payout, received - route.amountIn);
 });
 
 function sizingFixture(spreadPpm: bigint, reserve: bigint, failRefinement = false) {

@@ -633,6 +633,8 @@ try {
     const settled = worker.file.recent.find(row => row.hash === pending.hash);
     assert.equal(settled.status, 'not included');
     assert.equal(settled.gasEth, 0);
+    assert.equal(settled.netUsd, 0);
+    assert.ok(settled.submission.directSimulation.pendingNetUsd > 0, 'a missed order retains its simulated payout separately');
     assert.equal(worker.traceMissedBundle(settled), false, 'at most one expiry query per transaction');
     assert.equal(statusRequests.length, 2);
     assert.equal(submission.relayAfterExpiry, undefined, 'wallet release does not wait for the relay response');
@@ -660,6 +662,42 @@ try {
   });
   assert.equal(late.signed.length, 1, 'a qualifying route in the additional wave is submitted once');
   assert.equal(late.submitted.length, 1);
+
+  // Both final states cover the signed floor. Report their lower executable net
+  // and preserve the original estimate and each state for comparison.
+  for (const [blockProfit, pendingProfit] of [[coversGas / 2n, coversGas / 4n], [coversGas / 4n, coversGas / 2n]]) {
+    const checked = await scan({ age: 24 * minute, profit: coversGas, finalProfit: blockProfit, pendingProfit, protectedDirect: true });
+    assert.equal(checked.signed.length, 1);
+    const signed = checked.signed[0];
+    const gasBudget = signed.gas * signed.maxFeePerGas;
+    const usd = wei => Number(wei) / 1e18 * 2_000;
+    const { opp } = checked.journaled[0];
+    assert.equal(opp.tipEth, 0);
+    assert.deepEqual(opp.submission.directSimulation, {
+      preparedNetUsd: usd(coversGas - gasBudget),
+      blockNetUsd: usd(blockProfit - gasBudget),
+      pendingNetUsd: usd(pendingProfit - gasBudget),
+    });
+    const reportedGross = blockProfit < pendingProfit ? blockProfit : pendingProfit;
+    assert.equal(opp.grossEth, Number(reportedGross) / 1e18);
+    assert.equal(opp.netEth, Number(reportedGross - gasBudget) / 1e18);
+    assert.equal(opp.netUsd, usd(reportedGross - gasBudget));
+    assert.equal(opp.submission.netUsd, opp.netUsd);
+    if (pendingProfit < blockProfit) {
+      const chargedGas = 60_000n;
+      const actualFee = 1_100_000_000n;
+      checked.searcher.host.exec.noteNonceUsed = () => {};
+      checked.searcher.receipt = async () => ({
+        from: checked.searcher.host.account.address, to: checked.journaled[0].contract, blockNumber: 101n,
+        gasUsed: chargedGas, effectiveGasPrice: actualFee, status: 'reverted', logs: [],
+      });
+      await checked.searcher.checkPending(101n);
+      const actual = checked.searcher.file.recent[0];
+      assert.equal(actual.status, 'failed');
+      assert.equal(actual.netUsd, usd(-chargedGas * actualFee));
+      assert.equal(actual.submission.directSimulation.pendingNetUsd, usd(pendingProfit - gasBudget));
+    }
+  }
 
   const changedProfit = await scan({ age: 31 * minute, profit: coversGas, finalProfit: underGas });
   assert.equal(changedProfit.signed.length, 0, 'the final simulation must still cover gas and minimum profit');
@@ -709,6 +747,7 @@ try {
   assert.equal(bundle.submitted.length, 1);
   assert.equal(bundle.submitted[0].kind, undefined);
   assert.equal(bundle.submitted[0].target, '101');
+  assert.equal(bundle.submitted[0].opp.submission.directSimulation, undefined);
   assert.deepEqual([...bundle.finalStates.keys()], ['pinned'], 'bundle submission does not depend on public pending state');
 
   const paper = await scan({ age: 31 * minute, profit: coversGas, paper: true });
@@ -724,6 +763,7 @@ try {
   const allowedTest = await scan({ age: 24 * minute, profit: underGas, finalProfit: underGas, maximumTestGasUsd: 2 });
   assert.equal(allowedTest.signed.length, 1, 'the explicit one-shot path can sign a gross-positive route below its gas cost');
   assert.equal(allowedTest.submitted[0].opp.gasOnlyTestId, testId);
+  assert.ok(allowedTest.submitted[0].opp.submission.directSimulation.pendingNetUsd < 0);
   assert.equal(allowedTest.test.status, 'submitted');
   assert.equal(decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: allowedTest.signed[0].data }).args[0].minProfit, 1n);
 

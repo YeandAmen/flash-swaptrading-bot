@@ -628,8 +628,13 @@ function submissionDetails(submission, openSubmissions) {
       }).join('');
     const signedGas = submission.gasLimit && submission.maxFeePerGasWei
       ? `<div>Gas limit ${esc(submission.gasLimit)} · fee cap ${esc(submission.maxFeePerGasWei)} wei/gas</div>` : '';
+    const sims = submission.directSimulation;
+    const quotesDiffer = sims && [sims.preparedNetUsd, sims.blockNetUsd, sims.pendingNetUsd].every(Number.isFinite)
+      && (sims.preparedNetUsd !== sims.blockNetUsd || sims.blockNetUsd !== sims.pendingNetUsd);
+    const comparison = quotesDiffer
+      ? `<div>Net estimates after padded gas · initial ${usd(sims.preparedNetUsd, 4)} · block ${usd(sims.blockNetUsd, 4)} · pending ${usd(sims.pendingNetUsd, 4)}</div>` : '';
     return `<details class="sub" data-target="${esc(key)}"${open}><summary>Direct transaction · route deadline block ${esc(target)}</summary>
-      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd)}</div>${signedGas}${relay}</details>`;
+      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd, 4)}</div>${comparison}${signedGas}${relay}</details>`;
   }
   const timing = `${(Math.abs(leadMs) / 1000).toFixed(2)}s ${leadMs >= 0 ? 'before' : 'after'} expected slot`;
   return `<details class="sub" data-target="${esc(key)}"${open}><summary>Bundle for block ${esc(target)}</summary>

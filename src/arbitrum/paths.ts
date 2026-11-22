@@ -39,7 +39,7 @@ async function discoverPathPools(client: ArbitrumClient, block: bigint) {
   const keys: Omit<Pool, 'pool'>[] = [];
   for (const [i, a] of assets.entries()) for (const b of assets.slice(i + 1)) {
     const [token0, token1] = a < b ? [a, b] : [b, a];
-    for (const tier of [100, 500, 3000]) keys.push({ kind: 2, token0, token1, tier });
+    for (const tier of [100, 500, 3000, 10_000]) keys.push({ kind: 2, token0, token1, tier });
     for (const tier of [1, 10, 50, 100]) keys.push({ kind: 6, token0, token1, tier });
   }
   const rows = await client.multicall({ blockNumber: block, contracts: keys.map(({ token0, token1, kind, tier }) => ({

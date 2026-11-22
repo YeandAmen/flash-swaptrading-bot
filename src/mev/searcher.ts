@@ -133,6 +133,7 @@ interface BundleSubmission {
   relayAtTargetHead?: { block: number; blockHash: Hex; requestedAt: number; result?: PrivateRelayStatus & { checkedAt: number } };
   relayAfterExpiry?: PrivateRelayStatus & { checkedAt: number };
   pathQuote?: { routeId: Hex; grossProfitWei: string };
+  directSimulation?: { preparedNetUsd: number; blockNetUsd: number; pendingNetUsd: number };
   gasEth: number;
   tipEth: number;
   netUsd: number;
@@ -1501,7 +1502,8 @@ export class MevSearcher {
         direct ? mevReadClient.call({ account, to: contract, data, gas, ...fees, value: 0n, blockTag: 'pending' })
           .catch((error) => ({ data: undefined, failure: reasonOf(error) })) : undefined,
       ]);
-      if (!result.data || decodeArbitrage(result.data) < minimumProfit) {
+      const blockProfit = result.data ? decodeArbitrage(result.data) : null;
+      if (blockProfit === null || blockProfit < minimumProfit) {
         return skip('final simulation returned insufficient profit');
       }
       if (direct && !this.withinDirectGasBudget(eth(gasBudget) * ethUsd, Date.now(), premium, test)) return skip('direct gas limit reached');
@@ -1520,7 +1522,8 @@ export class MevSearcher {
         }
         return skip('wallet ETH does not cover the padded gas budget');
       }
-      if (direct && (!pendingCheck?.data || decodeArbitrage(pendingCheck.data) < minimumProfit)) {
+      const pendingProfit = pendingCheck?.data ? decodeArbitrage(pendingCheck.data) : null;
+      if (direct && (pendingProfit === null || pendingProfit < minimumProfit)) {
         const failure = pendingCheck && 'failure' in pendingCheck ? pendingCheck.failure : 'insufficient profit';
         return skip('pending-state simulation: ' + failure);
       }
@@ -1551,6 +1554,22 @@ export class MevSearcher {
       const hash = keccak256(signed);
       const startedAt = Date.now();
       const kind = direct ? 'direct' as const : undefined;
+      let reportedGrossEth = opp.grossEth;
+      let reportedNet = net;
+      let directSimulation: BundleSubmission['directSimulation'];
+      if (pendingProfit !== null) {
+        // Both contracts return gross WETH after loan repayment. The signed gas
+        // budget already includes priority fees; only an explicit builder tip is separate.
+        const costs = gasBudget + tip;
+        const gross = pendingProfit < blockProfit ? pendingProfit : blockProfit;
+        reportedGrossEth = eth(gross);
+        reportedNet = gross - costs;
+        directSimulation = {
+          preparedNetUsd: eth(net) * ethUsd,
+          blockNetUsd: eth(blockProfit - costs) * ethUsd,
+          pendingNetUsd: eth(pendingProfit - costs) * ethUsd,
+        };
+      }
       const submission: BundleSubmission = {
         kind, privateSubmission,
         target: Number(target), startedAt, leadMs: r.timestamp * 1000 + SLOT_MS - startedAt,
@@ -1559,7 +1578,7 @@ export class MevSearcher {
         maxFeePerGasWei: direct ? fees.maxFeePerGas.toString() : undefined,
         pathQuote: privateSubmission && offer.path && !test
           ? { routeId: pathRouteId(offer.path, offer.release), grossProfitWei: offer.path.grossProfit.toString() } : undefined,
-        gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(net) * ethUsd, builders: [],
+        gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(reportedNet) * ethUsd, directSimulation, builders: [],
       };
       const queued = direct ? this.activeGasOnlyTest() : null;
       const matched = queued && signingGasUsd <= queued.maximumGasUsd
@@ -1571,8 +1590,8 @@ export class MevSearcher {
           BigInt(Math.ceil(queued.minimumNetUsd / (currentEthUsd ?? ethUsd) * 1e18))) ? queued : null;
       Object.assign(opp, {
         gasOnlyTestId: matched?.id,
-        hash, status: 'sent', gasEth: submission.gasEth, tipEth: submission.tipEth,
-        netEth: eth(net), netUsd: submission.netUsd, note: direct ? 'awaiting direct RPC submission' : 'awaiting builder replies', submission,
+        hash, status: 'sent', grossEth: reportedGrossEth, gasEth: submission.gasEth, tipEth: submission.tipEth,
+        netEth: eth(reportedNet), netUsd: submission.netUsd, note: direct ? 'awaiting direct RPC submission' : 'awaiting builder replies', submission,
       });
       const pending = { kind, privateSubmission, hash, nonce, target: target.toString(), contract, ethUsd, opp };
       const recent = this.file.recent.slice();
