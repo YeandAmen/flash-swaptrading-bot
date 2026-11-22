@@ -197,7 +197,7 @@ try {
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
-    protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease }) {
+    protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -231,11 +231,15 @@ try {
           kind: 2, pool: address(40 + i), fee: 500, tickSpacing: 0, nativeEth: false, tokenOut,
         }));
         return { status: 'scanned', blockNumber: block.blockNumber, pools: 3, cycles: 1, exactQuotes: 1,
-          candidates: [{ hops, amountIn: oneEth, amountOut: oneEth + coversGas, grossProfit: coversGas,
+          candidates: [{ hops, amountIn: pathAmount, amountOut: pathAmount + coversGas, grossProfit: coversGas,
             estimatedNet: coversGas, label: 'WETH → A → B → WETH' }] };
       };
     }
-    searcher.submitSignedDirect = async (pending) => { submitted.push(pending); };
+    const submitDirect = searcher.submitSignedDirect.bind(searcher);
+    searcher.submitSignedDirect = async (pending, bytes, canSend) => {
+      submitted.push(pending);
+      if (privateTransport) await submitDirect(pending, bytes, canSend, privateTransport);
+    };
     searcher.submitSignedBundle = async (pending) => { submitted.push(pending); };
     searcher.simulate = async (token, _buy, _sell, amount, _maxBlock, blockNumber) => {
       assert.equal(blockNumber, 100n);
@@ -252,12 +256,13 @@ try {
       assert.equal(blockNumber, 100n);
       return estimatedGas;
     };
-    mevReadClient.call = async ({ blockNumber, blockTag, to, data, gas }) => {
+    mevReadClient.call = async ({ blockNumber, blockTag, to, data, gas, maxFeePerGas }) => {
       const call = { to, data, gas };
       if (blockTag === 'pending') {
         assert.equal(blockNumber, undefined);
         finalStates.set('pending', call);
         if (pendingError) throw new Error('Pending state unavailable');
+        if (pendingBaseFee !== undefined && pendingBaseFee > maxFeePerGas) throw new Error('Base fee exceeds signed fee cap');
         if (pathRelease) {
           const decoded = decodeFunctionData({ abi: FLASH_ARB_LOGIC_V3_ABI, data });
           assert.equal(decoded.functionName, 'executePath');
@@ -293,7 +298,7 @@ try {
         searcher.queueGasOnlyTest(testId, maximumTestGasUsd);
       }
       await searcher.onBlock(block, historical);
-      return { simulated, signed, submitted, journaled, seenAtSign, finalStates, test: searcher.view().gasOnlyTest };
+      return { searcher, simulated, signed, submitted, journaled, seenAtSign, finalStates, test: searcher.view().gasOnlyTest };
     } finally {
       Object.assign(MEV, original);
       Object.assign(CONFIG, originalConfig);
@@ -378,7 +383,7 @@ try {
   });
   assert.equal(moved.signed.length, 0, 'an admitted alternate must pass the same exact pending-state profit check');
 
-  // At this payout only the next block can cover padded max-fee gas while reserving 10% and retaining $0.05.
+  // The fee cap only covers the next block at worst-case base-fee growth.
   const oneBlockOnly = 250_000_000_000_000n;
   const protectedInput = { age: 24 * minute, profit: oneBlockOnly, finalProfit: oneBlockOnly, protectedDirect: true };
   const protectedTrade = await scan(protectedInput);
@@ -387,10 +392,12 @@ try {
   assert.equal(protectedTrade.journaled.length, 1);
   assert.equal(protectedTrade.submitted[0], protectedTrade.journaled[0]);
   assert.equal(protectedTrade.journaled[0].privateSubmission, true);
-  assert.equal(protectedTrade.journaled[0].target, '101');
+  assert.equal(protectedTrade.journaled[0].target, '103');
   const protectedTx = protectedTrade.signed[0];
   const protectedOrder = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: protectedTx.data }).args[0];
-  assert.equal(protectedOrder.maxBlock, 101n);
+  assert.equal(protectedOrder.maxBlock, 103n);
+  assert.equal(protectedTx.maxFeePerGas, 1_066_666_666n);
+  assert.equal(protectedTx.maxPriorityFeePerGas, 66_666_666n);
   assert.equal(protectedOrder.minProfit, protectedTx.gas * protectedTx.maxFeePerGas + 25_000_000_000_000n);
   assert.deepEqual([...protectedTrade.finalStates.keys()].sort(), ['pending', 'pinned']);
   assert.deepEqual(protectedTrade.finalStates.get('pending'), protectedTrade.finalStates.get('pinned'));
@@ -400,19 +407,83 @@ try {
   assert.equal(lostProtectedSpread.journaled.length, 0);
   assert.equal(lostProtectedSpread.submitted.length, 0);
 
-  // With 187,500 padded gas, 310e12 wei can pay the full 0.25 gwei tip only for one block.
-  // A higher payout first allows the same tip for two blocks and then for all three.
-  for (const [proceeds, target] of [[310_000_000_000_000n, 101n], [330_000_000_000_000n, 102n], [coversGas, 103n]]) {
+  // Same selected fee pairs as the one-, two- and three-slot projections before the change.
+  for (const [proceeds, feeCap] of [[310_000_000_000_000n, 1_250_000_000n], [330_000_000_000_000n, 1_375_000_000n], [coversGas, 1_515_625_000n]]) {
     const ranked = await scan({ ...protectedInput, profit: proceeds, finalProfit: proceeds });
     assert.equal(ranked.signed.length, 1);
     assert.equal(ranked.submitted.length, 1);
     assert.equal(ranked.submitted[0].privateSubmission, true);
-    assert.equal(ranked.submitted[0].target, target.toString(), 'keep the longest window that affords the selected tip');
+    assert.equal(ranked.submitted[0].target, '103');
     const transaction = ranked.signed[0];
     const signedOrder = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: transaction.data }).args[0];
     assert.equal(transaction.maxPriorityFeePerGas, 250_000_000n);
-    assert.equal(signedOrder.maxBlock, target);
+    assert.equal(transaction.maxFeePerGas, feeCap);
+    assert.equal(signedOrder.maxBlock, 103n);
     assert.equal(signedOrder.minProfit, transaction.gas * transaction.maxFeePerGas + 25_000_000_000_000n);
+  }
+
+  const relay = [];
+  const multi = await scan({ ...pathOptions, pathAmount: oneEth / 5n, protectedDirect: true, finalProfit: oneBlockOnly, pendingProfit: oneBlockOnly,
+    privateTransport: async (bytes, maxBlock, canSend) => {
+      assert.equal(bytes, '0xc0');
+      assert.ok(canSend());
+      relay.push(maxBlock);
+      return hash(99);
+    } });
+  assert.equal(multi.signed.length, 1);
+  const tx = multi.signed[0];
+  const decodedPath = decodeFunctionData({ abi: FLASH_ARB_LOGIC_V3_ABI, data: tx.data });
+  assert.equal(decodedPath.functionName, 'executePath');
+  const [, hops, loan, payoutFloor, maxBlock] = decodedPath.args;
+  assert.equal(loan, oneEth / 5n);
+  assert.equal(maxBlock, 103n);
+  assert.deepEqual(relay, [maxBlock]);
+  assert.equal(BigInt(multi.submitted[0].target), maxBlock);
+  assert.equal(tx.maxFeePerGas, protectedTx.maxFeePerGas);
+  assert.equal(payoutFloor, tx.gas * tx.maxFeePerGas + 25_000_000_000_000n);
+
+  // Starting at 1 gwei, a full block followed by an empty block can move the
+  // base fee above this signature's cap and then back below it.
+  const expensive = 1_125_000_000n, cheaper = expensive - expensive / 8n;
+  assert.ok(expensive > tx.maxFeePerGas && cheaper + tx.maxPriorityFeePerGas <= tx.maxFeePerGas);
+  const unaffordable = await scan({ ...protectedInput, pendingBaseFee: expensive });
+  assert.deepEqual(unaffordable.signed, []);
+  assert.deepEqual(unaffordable.submitted, []);
+  const manual = await scan({ ...protectedInput, maximumTestGasUsd: 2 });
+  assert.equal(manual.submitted[0].opp.gasOnlyTestId, testId);
+  assert.equal(manual.submitted[0].target, '101', 'normal offers filling a queued manual test retain their previous deadline');
+
+  const worker = multi.searcher;
+  const oldNonceRead = mevReadClient.getTransactionCount;
+  const fork = CONFIG.forkMode;
+  try {
+    CONFIG.forkMode = false; // Exercise the normal two-confirmation reservation without any external call.
+    worker.receipt = async () => null;
+    const checkedAt = [];
+    worker.liveArmed = () => true;
+    const simulated = worker.file.stats.simulated;
+    let released = 0;
+    worker.host.exec.releaseBundle = () => { released++; };
+    mevReadClient.getTransactionCount = async ({ blockNumber }) => { checkedAt.push(blockNumber); return 7; };
+    for (const height of [101n, 102n, 103n, 104n]) {
+      await worker.checkPending(height);
+      assert.ok(worker.walletPending());
+      assert.equal(worker.file.pending.hash, multi.submitted[0].hash);
+      assert.equal(released, 0);
+      await worker.tryPaths([{ hops, amountIn: loan, label: 'repeat' }], { ...snapshot(Date.now()), blockNumber: height },
+        { minNetUsd: 0.05 }, worker.armGeneration);
+      assert.equal(worker.file.stats.simulated, simulated, 'an eligible repeated quote cannot start a second send while the nonce is reserved');
+    }
+    assert.deepEqual(checkedAt, []);
+    await worker.checkPending(105n);
+    assert.deepEqual(checkedAt, [maxBlock]);
+    assert.equal(worker.file.pending, null);
+    assert.equal(released, 1);
+    assert.equal(multi.signed.length, 1);
+    assert.equal(relay.length, 1);
+  } finally {
+    CONFIG.forkMode = fork;
+    mevReadClient.getTransactionCount = oldNonceRead;
   }
 
   const late = await scan({
@@ -541,7 +612,7 @@ try {
   const restarted = newSearcher(async () => assert.fail('journal recovery must not sign'));
   assert.equal(restarted.file.stats.lastDirectLandedAt, journal.file.stats.lastDirectLandedAt);
 
-  console.log('PASS: direct cadence, next-block expiry, pending-state and pre-broadcast checks, gas limits, and confirmed-fill persistence');
+  console.log('PASS: direct cadence, protected and public deadlines, pending-state checks, gas limits, nonce reservation, and confirmed-fill persistence');
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }
