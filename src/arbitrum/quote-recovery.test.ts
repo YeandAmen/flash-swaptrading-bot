@@ -43,6 +43,7 @@ function mixedPrimary(leg: Leg): Row {
 async function scan(primaryQuote: (leg: Leg) => Row, alternateQuote: (leg: Leg) => Row,
   alternateHeader: Header | null = { number: blockNumber, hash: blockHash }, poolCount = 4, supportsHash = true) {
   const alternateCalls: QuoteCall[] = [];
+  const alternateEvents: { tokenIn: Address; event: 'start' | 'finish' }[] = [];
   const primaryCalls: QuoteCall[] = [];
   const market: Parameters<typeof scanArbitrum>[2] = [{
     token, symbol: 'TEST',
@@ -76,6 +77,10 @@ async function scan(primaryQuote: (leg: Leg) => Row, alternateQuote: (leg: Leg) 
     },
     multicall: async (call: QuoteCall) => {
       alternateCalls.push(call);
+      const { tokenIn } = call.contracts[0].args[0];
+      alternateEvents.push({ tokenIn, event: 'start' });
+      await Promise.resolve();
+      alternateEvents.push({ tokenIn, event: 'finish' });
       return call.contracts.map(({ args: [leg] }) => alternateQuote(leg));
     },
   } as unknown as ArbitrumClient;
@@ -91,9 +96,8 @@ async function scan(primaryQuote: (leg: Leg) => Row, alternateQuote: (leg: Leg) 
     assert.equal(call.requireCanonical, true);
     assert.equal(call.blockNumber, undefined);
   }
-  assert.ok(alternateCalls.every(({ batchSize }) => batchSize === 1400));
   assert.equal(result.unavailableLegs, result.quoteRecovery.remaining);
-  return { result, alternateCalls, primaryCalls };
+  return { result, alternateCalls, alternateEvents, primaryCalls };
 }
 
 const mixedFailures = {
@@ -107,13 +111,29 @@ test('Arbitrum creates public recovery readers only for the default RPC', () => 
   assert.ok(arbitrumQuoteRecoveryReaders(defaultArbitrumRpc + '/'));
 });
 
-test('Arbitrum recovers only aggregate failures at the specified hash across both quote legs', async () => {
-  const { result, alternateCalls, primaryCalls } = await scan(mixedPrimary, successfulQuote);
-  assert.deepEqual(alternateCalls.map((call) => call.contracts.map(({ args: [leg] }) => [leg.tokenIn, leg.fee])), [
-    [[weth, 100], [weth, 101]], [[token, 100]],
-  ]);
-  assert.deepEqual(result.quoteRecovery, { ...mixedFailures, recovered: 3, remaining: 0, alternateAttempted: 3, alternateRecovered: 3 });
+test('Arbitrum runs separate hash-pinned gas and quota retries concurrently for both quote legs', async () => {
+  // The 103 -> 101 return also runs out of gas. Give the two recovered sells distinct payouts.
+  const primary = (leg: Leg) => leg.tokenIn === token && leg.amountIn === size + 103n && leg.fee === 101
+    ? gas : mixedPrimary(leg);
+  const alternate = (leg: Leg) => leg.tokenIn === weth ? successfulQuote(leg) : ok(size + size / 2000n + BigInt(leg.fee));
+  const { result, alternateCalls, alternateEvents, primaryCalls } = await scan(primary, alternate);
+  for (const input of [weth, token]) {
+    const calls = alternateCalls.filter(({ contracts }) => contracts[0].args[0].tokenIn === input);
+    assert.equal(calls.length, 2);
+    const expected = input === weth ? [[700, 100], [1400, 101]] : [[700, 101], [1400, 100]];
+    for (const [batchSize, fee] of expected) {
+      const call = calls.find((call) => call.batchSize === batchSize);
+      assert.deepEqual(call?.contracts.map(({ args: [leg] }) => [leg.tokenIn, leg.fee, leg.amountIn]),
+        [[input, fee, input === weth ? size : size + 103n]]);
+    }
+    assert.deepEqual(alternateEvents.filter(({ tokenIn }) => tokenIn === input).map(({ event }) => event),
+      ['start', 'start', 'finish', 'finish']);
+  }
+  assert.deepEqual(result.quoteRecovery, { ...mixedFailures, before: 4, outOfGas: 2, recovered: 4, remaining: 0,
+    alternateAttempted: 4, alternateRecovered: 4 });
   assert.equal(result.quotedRoutes, 9);
+  assert.deepEqual(result.opportunities.map(({ order, payout }) => [order.buy.fee, order.sell.fee, payout]),
+    [[103, 101, 101n], [103, 100, 100n]]);
   const sellLegs = primaryCalls.filter((call) => call.batchSize === 6000).flatMap((call) =>
     call.contracts.map(({ args: [leg] }) => leg).filter((leg) => leg.tokenIn === token));
   for (const buy of [100, 101, 103]) {
@@ -151,12 +171,23 @@ test('Arbitrum retains primary quotes when the primary rejects hash-pinned calls
   assert.deepEqual(result.quoteRecovery, mixedFailures);
 });
 
-test('Arbitrum bounds the alternate retry even when every quote in a market is unavailable', async () => {
-  const { result, alternateCalls } = await scan(() => quota, () => quota, { hash: blockHash, number: blockNumber }, 105);
-  const retries = alternateCalls.flatMap((call) => call.contracts.map(({ args: [leg] }) => leg.fee));
-  assert.equal(retries.length, 96);
-  assert.equal(new Set(retries).size, 96);
-  assert.deepEqual(result.quoteRecovery, { before: 105, recovered: 0, remaining: 105, individualFailures: 0,
-    resolvedIndividual: 0, outOfGas: 0, rateLimited: 105, alternateAttempted: 96, alternateRecovered: 0 });
-  assert.equal(result.quotedRoutes, 0);
+test('Arbitrum shares 96 unique retries between gas and quota failures in either quote stage', async () => {
+  for (const [failedInput, poolCount, failures, outOfGas] of [[weth, 105, 105, 53], [token, 11, 110, 60]] as const) {
+    const primary = (leg: Leg) => {
+      if (leg.tokenIn !== failedInput) return successfulQuote(leg);
+      return leg.fee % 2 === 0 ? gas : quota;
+    };
+    const { result, alternateCalls } = await scan(primary, () => quota, { hash: blockHash, number: blockNumber }, poolCount);
+    assert.equal(alternateCalls.length, 2);
+    const retries = alternateCalls.flatMap((call) => call.contracts.map(({ args: [leg] }) => {
+      assert.equal(leg.tokenIn, failedInput);
+      assert.equal(call.batchSize, leg.fee % 2 === 0 ? 700 : 1400);
+      return `${leg.fee}/${leg.amountIn}`;
+    }));
+    assert.equal(retries.length, 96);
+    assert.equal(new Set(retries).size, 96);
+    assert.deepEqual(result.quoteRecovery, { before: failures, recovered: 0, remaining: failures, individualFailures: 0,
+      resolvedIndividual: 0, outOfGas, rateLimited: failures - outOfGas, alternateAttempted: 96, alternateRecovered: 0 });
+    assert.equal(result.quotedRoutes, 0);
+  }
 });

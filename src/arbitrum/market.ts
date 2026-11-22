@@ -278,10 +278,19 @@ async function quoteArbitrumPools(client: ArbitrumClient, blockNumber: bigint, c
   const selected = Array.from({ length: Math.min(eligible.length, maxRetryQuoteLegs) },
     (_, i) => eligible[(start + i) % eligible.length]);
   if (alternate) counts.alternateAttempted += selected.length;
-  const retry = await (alternate ?? client).multicall({ ...pin, batchSize: 1400, contracts: selected.map(i => contracts[i]) })
-    .catch(() => []);
-  for (const [j, row] of retry.entries()) {
-    rows[selected[j]] = row;
+  // A smaller aggregate shares its gas allowance across fewer expensive quote calls.
+  const alternateGasLimited = new Set(alternate ? gasLimited : []);
+  const batches = [
+    { batchSize: 700, indices: selected.filter(i => alternateGasLimited.has(i)) },
+    { batchSize: 1400, indices: selected.filter(i => !alternateGasLimited.has(i)) },
+  ];
+  const retried = await Promise.all(batches.filter(batch => batch.indices.length).map(async ({ batchSize, indices }) => {
+    const result = await (alternate ?? client).multicall({ ...pin, batchSize, contracts: indices.map(i => contracts[i]) })
+      .catch(() => []);
+    return result.map((row, j) => ({ row, index: indices[j] }));
+  }));
+  for (const { row, index } of retried.flat()) {
+    rows[index] = row;
     if (row.status === 'success') {
       counts.recovered++;
       counts.remaining--;
