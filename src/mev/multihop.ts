@@ -60,6 +60,15 @@ function marginalOut(edge: PathEdge, amount: bigint) {
   return (numerator + denominator - 1n) / denominator;
 }
 
+function outputLimit(edge: PathEdge, first: PathEdge | undefined, loan: bigint) {
+  if (edge.outputBalance === undefined) return undefined;
+  // A simple cycle repeats only WETH. A first V4 leg can already have credited the manager
+  // with the loan in the same currency (native ETH and WETH are distinct balances).
+  const replenished = edge.hop.tokenOut === WETH && edge.hop.kind === 5 && first?.hop.kind === 5
+    && edge.hop.pool === first.hop.pool && edge.hop.nativeEth === first.hop.nativeEth;
+  return edge.outputBalance + (replenished ? loan : 0n);
+}
+
 /** Simple token cycles ensure no physical pool is quoted twice against its pre-swap state. */
 function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan) {
   const graph = new Map<Address, Map<Address, PathEdge[]>>();
@@ -103,12 +112,15 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
       for (const amountIn of viable ? loans : [referenceSize]) {
         let variants: Trial[] = [{ edges: [], amountIn, amountOut: amountIn, upper: amountIn }];
         for (const venues of path) {
-          const next = variants.flatMap(part => venues.map(edge => ({
-            edges: [...part.edges, edge], amountIn,
-            amountOut: cpOut(edge, part.amountOut),
+          const next = variants.flatMap(part => venues.map(edge => {
+            const modeled = cpOut(edge, part.amountOut);
             // V2 reserves determine the exact monotone output. Concentrated pools may cross ticks.
-            upper: isPathV3(edge.hop.kind) || edge.hop.kind === 5 ? marginalOut(edge, part.upper) : cpOut(edge, part.upper),
-          })));
+            const upper = isPathV3(edge.hop.kind) || edge.hop.kind === 5 ? marginalOut(edge, part.upper) : cpOut(edge, part.upper);
+            const limit = outputLimit(edge, part.edges[0], amountIn);
+            return { edges: [...part.edges, edge], amountIn,
+              amountOut: limit === undefined ? modeled : min(modeled, limit),
+              upper: limit === undefined ? upper : min(upper, limit) };
+          }));
           next.sort((a, b) => compare(a.amountOut, b.amountOut) || compare(a.upper, b.upper));
           variants = next.slice(0, 2);
         }
@@ -178,10 +190,14 @@ export async function quoteEthereumPaths(scan: EthereumPathScan, client: PathRea
     for (const [i, ref] of refs.entries()) {
       if (ref < 0) continue;
       const value = values[ref];
-      const v3 = isPathV3(trials[i].edges[leg].hop.kind);
+      const trial = trials[i];
+      const edge = trial.edges[leg];
+      const v3 = isPathV3(edge.hop.kind);
       const fullFill = Array.isArray(value) && (!v3 || typeof value[1] === 'bigint'
         && value[1] > 4295128740n && value[1] < 1461446703485210103287273052203988822378723970341n);
-      amounts[i] = fullFill && typeof value[0] === 'bigint' && value[0] > 0n ? value[0] : 0n;
+      const limit = outputLimit(edge, trial.edges[0], trial.amountIn);
+      amounts[i] = fullFill && typeof value[0] === 'bigint' && value[0] > 0n
+        && (limit === undefined || value[0] <= limit) ? value[0] : 0n;
       if (value === undefined) partial = true;
     }
   }

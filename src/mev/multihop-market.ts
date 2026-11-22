@@ -69,6 +69,8 @@ export interface PathEdge {
   // Marginal exchange rate, before fees. V3/V4 use the exact slot0 price.
   rateN: bigint;
   rateD: bigint;
+  // Physical output currency held at the pinned block, when available.
+  outputBalance?: bigint;
 }
 const key = (p: PathPool) => ({
   currency0: p.nativeEth ? zeroAddress : p.token0, currency1: p.token1,
@@ -175,6 +177,12 @@ export async function discoverPathPools(client: PathReader, block: bigint, token
   return { pools, complete: rows.length === probes.length && rows.every(r => r !== undefined) };
 }
 
+const standardPathAssets = new Set<Address>([WETH, ADDR.usdc, USDT, WBTC, DAI]);
+const maxInventoryReads = 48;
+function outputCurrency(pool: PathPool, token: Address) {
+  return pool.nativeEth && token === WETH ? zeroAddress : token;
+}
+
 export async function pathMarket(client: PathReader, block: bigint, pools: PathPool[], deadlineMs: number, blockHash?: Hex) {
   const calls: Read[] = [{ address: WETH, abi: erc20Abi, functionName: 'balanceOf', args: [MORPHO] }];
   const indices = pools.map(pool => {
@@ -185,7 +193,36 @@ export async function pathMarket(client: PathReader, block: bigint, pools: PathP
     else calls.push(...['getSlot0','getLiquidity'].map(functionName => ({ address: UNISWAP_V4_STATE_VIEW, abi: stateAbi, functionName, args: [pool.id] })));
     return index;
   });
+  // V4's quoter calculates deltas without transferring the output. V3 virtual reserves can
+  // also overstate deliverable output for rotating assets. Share one balance per holder and
+  // currency, keeping optional reads independent of the primary pool-state requests.
+  const probes = new Map<string, Read>();
+  // The few shared manager balances go first even when discovery returns many distinct V3 holders.
+  const concentrated = [...pools.filter(p => p.kind === 5), ...pools.filter(p => isPathV3(p.kind))];
+  for (const pool of concentrated) for (const token of [pool.token0, pool.token1]) {
+    if (pool.kind !== 5 && standardPathAssets.has(token)) continue;
+    const currency = outputCurrency(pool, token);
+    const key = pool.pool + '/' + currency;
+    if (probes.has(key) || probes.size >= maxInventoryReads) continue;
+    probes.set(key, currency === zeroAddress
+      ? { address: ADDR.multicall3, abi: multicall3Abi, functionName: 'getEthBalance', args: [pool.pool] }
+      : { address: currency, abi: erc20Abi, functionName: 'balanceOf', args: [pool.pool] });
+  }
+  const inventory = new Map<string, bigint>();
+  const balances = pinnedReads(client, block, [...probes.values()], maxInventoryReads, deadlineMs, blockHash).then(values => {
+    for (const [i, key] of [...probes.keys()].entries()) {
+      const balance = values[i];
+      if (typeof balance === 'bigint') inventory.set(key, balance);
+    }
+  });
   const rows = await pinnedReads(client, block, calls, 96, deadlineMs, blockHash);
+  // A slow optional read gets at most 100 ms beyond the necessary state reads.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([balances, new Promise<void>(resolve => {
+      timer = setTimeout(resolve, Math.max(0, Math.min(100, deadlineMs - Date.now())));
+    })]);
+  } finally { clearTimeout(timer); }
   const edges: PathEdge[] = [];
   for (const [i, pool] of pools.entries()) {
     const index = indices[i];
@@ -209,7 +246,8 @@ export async function pathMarket(client: PathReader, block: bigint, pools: PathP
       const tokenIn = forward ? pool.token0 : pool.token1;
       const tokenOut = forward ? pool.token1 : pool.token0;
       const { kind, fee, tickSpacing, nativeEth } = pool;
-      edges.push({ hop: { kind, pool: pool.pool, fee, tickSpacing, nativeEth, tokenOut }, pool, tokenIn,
+      const outputBalance = inventory.get(pool.pool + '/' + outputCurrency(pool, tokenOut));
+      edges.push({ hop: { kind, pool: pool.pool, fee, tickSpacing, nativeEth, tokenOut }, pool, tokenIn, outputBalance,
         reserveIn: forward ? r0 : r1, reserveOut: forward ? r1 : r0, zeroForOne: forward,
         rateN: forward ? rateN : rateD, rateD: forward ? rateD : rateN,
         fee: BigInt(kind === 5 ? Math.round(v4FeeFraction(state[2], fee, forward) * 1e6) : fee) });

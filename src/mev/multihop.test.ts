@@ -182,6 +182,96 @@ test('a full set of high-ranked three-hop trials leaves room for the four-hop au
   assert.ok(out.candidates.every(q => q.hops.length === 3));
 });
 
+test('pinned physical balances free quote slots for other routes despite inflated virtual liquidity', async () => {
+  const suspect = edge(WETH, a, 2, 1000n);
+  const suspectV4 = edge(c, a, 5, 1000n);
+  suspect.outputBalance = 1n;
+  suspectV4.outputBalance = 16n;
+  const edges = [suspect, suspectV4, edge(a, b, 0), edge(WETH, c, 2), edge(c, b, 0), edge(b, WETH, 0, 2n)];
+  const asked = new Set<Address>();
+  const reader = client((calls, block) => calls.map((r, i) => {
+    if (!i) return block;
+    const p = r.args![0] as { tokenOut: Address; amountIn: bigint };
+    asked.add(p.tokenOut);
+    return [p.amountIn, 1n << 96n];
+  }));
+  const result = await quoteEthereumPaths(settings(), reader, edges, parseEther('1'), labels);
+  assert.deepEqual([...asked], [c]);
+  assert.ok(result.candidates.length);
+  assert.ok(result.candidates.every(t => t.label === 'WETH → C → B → WETH'));
+});
+
+test('quotes require the whole output and allow only earlier deposits of the same physical currency', async () => {
+  const reader = client((calls, block) => calls.map((call, i) => {
+    if (!i) return block;
+    const p = call.args![0] as { exactAmount: bigint; poolKey: { currency0: Address; currency1: Address } };
+    const paysWeth = p.poolKey.currency0 === b || p.poolKey.currency1 === b;
+    return [p.exactAmount * (paysWeth ? 2n : 1n)];
+  }));
+  for (const native of [true, false]) {
+    const first = edge(WETH, a, 5, 1n, native);
+    const middle = edge(a, b, 0);
+    const last = edge(b, WETH, 5, 2n, native);
+    first.hop.pool = last.hop.pool = c;
+    const scan = () => quoteEthereumPaths(settings(), reader, [first, middle, last], parseEther('1'), labels);
+    last.outputBalance = parseEther('0.006');
+    const capped = await scan();
+    assert.deepEqual(capped.candidates.map(t => t.amountIn), [parseEther('0.005')]);
+    assert.equal(capped.candidates[0].amountOut, 2n * constantOut(middle, parseEther('0.005')));
+    first.hop.nativeEth = !native;
+    const differentCurrency = await scan();
+    assert.equal(differentCurrency.exactQuotes, 0, 'the quoter output cannot be clipped to the remaining inventory');
+    last.outputBalance = undefined;
+    const unknown = await scan();
+    assert.ok(unknown.candidates.some(c => c.amountIn > parseEther('0.005')));
+    last.outputBalance = parseEther('1');
+    const refilled = await scan();
+    assert.deepEqual(refilled.candidates, unknown.candidates);
+  }
+});
+
+test('one canonical balance batch deduplicates shared V4 holdings, distinguishes native ETH and fails open', async () => {
+  const hash = ('0x' + 'aa'.repeat(32)) as Hex;
+  const native = edge(WETH, a, 5, 1n, true).pool;
+  const wrapped = edge(WETH, a, 5).pool;
+  const v3 = edge(WETH, a, 2).pool;
+  native.pool = wrapped.pool = c;
+  let inventoryCalls = 0;
+  let expectedBalanceReads = 4;
+  const reader = { multicall: async (request: { contracts: Read[]; blockHash: Hex; requireCanonical: boolean }) => {
+    assert.equal(request.blockHash, hash);
+    assert.equal(request.requireCanonical, true);
+    const { contracts } = request;
+    const inventory = contracts.slice(1).every(c => ['getEthBalance', 'balanceOf'].includes(c.functionName));
+    if (inventory) {
+      inventoryCalls++;
+      assert.equal(contracts.length, expectedBalanceReads + 1);
+    }
+    return contracts.map(({ address, functionName, args }) => {
+      if (functionName === 'getBlockNumber') return { status: 'success', result: currentBlock };
+      if (functionName === 'getEthBalance') return { status: 'success', result: 3n };
+      if (functionName === 'balanceOf' && address === a && args?.[0] === v3.pool) return { status: 'failure' };
+      if (functionName === 'balanceOf') return { status: 'success', result: address === WETH ? 5n : 0n };
+      const result = functionName === 'slot0' ? [1n << 96n, 0, 0, 0, 0, 0, true]
+        : functionName === 'getSlot0' ? [1n << 96n, 0, 0, 0] : 10n ** 24n;
+      return { status: 'success', result };
+    });
+  } } as unknown as PathReader;
+  const market = await pathMarket(reader, currentBlock, [native, wrapped, v3], settings().deadlineMs, hash);
+  assert.ok(market.complete);
+  assert.equal(inventoryCalls, 1);
+  assert.deepEqual(market.edges.filter(e => e.hop.kind === 5 && e.hop.tokenOut === WETH).map(e => e.outputBalance), [3n, 5n]);
+  assert.ok(market.edges.filter(e => e.hop.kind === 5 && e.hop.tokenOut === a).every(e => e.outputBalance === 0n));
+  assert.equal(market.edges.find(e => e.hop.kind === 2 && e.hop.tokenOut === a)?.outputBalance, undefined);
+  const manyV3 = Array.from({ length: 60 }, (_, i) => ({
+    ...v3, pool: getAddress('0x' + (i + 100).toString(16).padStart(40, '0')),
+  }));
+  expectedBalanceReads = 48;
+  const busy = await pathMarket(reader, currentBlock, [...manyV3, native, wrapped], settings().deadlineMs, hash);
+  assert.equal(inventoryCalls, 2);
+  assert.deepEqual(busy.edges.filter(e => e.hop.kind === 5 && e.hop.tokenOut === WETH).map(e => e.outputBalance), [3n, 5n]);
+});
+
 
 test('Sushi and Pancake factory discovery, fee tiers and slot layouts remain bounded across token rotations', async () => {
   const sushi = getAddress('0xbaceb8ec6b9355dfc0269c18bac9d6e2bdc29c4f');
