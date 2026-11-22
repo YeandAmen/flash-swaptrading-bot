@@ -11,6 +11,7 @@ import { writeJson } from '../persistence.js';
 import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
 import { FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
 import { bundleTraceRequests, requestBuilderTrace } from './builder-trace.js';
+import { PRIVATE_STATUS_RETENTION_MS, requestPrivateRelayStatus, type PrivateRelayStatus } from './private-status.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
 import { sendBundle, submitPrivateDirect, type BuilderResult } from './bundles.js';
 import { affordableDirectFees, directExecutionReserve, directFees, directPriorityFee, findNonceConsumer } from './direct.js';
@@ -50,6 +51,7 @@ const MAX_STARTUP_TRACE_BUNDLES = 6;
 const DIRECT_WINDOW = 1;
 const PRIVATE_DIRECT_WINDOW = 2;
 const PRIVATE_LIVE_WINDOW = 3;
+const PRIVATE_EXPIRY_NOTE = 'private deadline passed without using this nonce';
 const PRIVATE_FUNCTIONAL_TEST_WINDOW = 5;
 const PUBLIC_FUNCTIONAL_TEST_WINDOW = 8;
 const MAX_PUBLIC_FUNCTIONAL_TEST_USD = 5;
@@ -124,6 +126,10 @@ interface BundleSubmission {
   leadMs: number;
   priorityGwei?: number;
   rpcAckMs?: number;
+  gasLimit?: string;
+  maxFeePerGasWei?: string;
+  relayAfterAck?: PrivateRelayStatus & { checkedAt: number };
+  relayAfterExpiry?: PrivateRelayStatus & { checkedAt: number };
   gasEth: number;
   tipEth: number;
   netUsd: number;
@@ -327,6 +333,7 @@ function reasonOf(e: unknown): string {
  */
 export class MevSearcher {
   private readonly scheduledTraces = new WeakSet<BuilderResult>();
+  private readonly requestedExpiryStatuses = new WeakSet<BundleSubmission>();
   file: MevFile;
   tokens: ArbToken[] = [];
   status = 'starting';
@@ -1513,6 +1520,8 @@ export class MevSearcher {
         kind, privateSubmission,
         target: Number(target), startedAt, leadMs: r.timestamp * 1000 + SLOT_MS - startedAt,
         priorityGwei: direct ? Number(fees.maxPriorityFeePerGas) / 1e9 : undefined,
+        gasLimit: direct ? gas.toString() : undefined,
+        maxFeePerGasWei: direct ? fees.maxFeePerGas.toString() : undefined,
         gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(net) * ethUsd, builders: [],
       };
       const queued = direct ? this.activeGasOnlyTest() : null;
@@ -1576,7 +1585,10 @@ export class MevSearcher {
       const rpcAckMs = Math.round(performance.now() - startedAt);
       if (this.pending === pending) {
         pending.opp.note = pending.privateSubmission ? 'private relay accepted; awaiting receipt' : 'direct Ethereum RPC accepted; awaiting receipt';
-        if (pending.opp.submission) pending.opp.submission.rpcAckMs = rpcAckMs;
+        if (pending.opp.submission) {
+          pending.opp.submission.rpcAckMs = rpcAckMs;
+          if (pending.privateSubmission && !CONFIG.forkMode) this.schedulePrivateStatusAfterAck(pending);
+        }
       }
       this.host.log(`[mev] Direct transaction ${pending.hash} submitted. RPC acknowledged in ${rpcAckMs} ms. Route deadline is block ${pending.target}.`);
     } catch (e) {
@@ -1711,7 +1723,7 @@ export class MevSearcher {
           netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
         this.host.log(`[mev] Direct transaction ${p.hash} was replaced at nonce ${p.nonce}.`);
       } else if (p.privateSubmission && nonce.status === 'unused') {
-        this.finishBundle({ ...p.opp, status: 'not included', note: 'private deadline passed without using this nonce',
+        this.finishBundle({ ...p.opp, status: 'not included', note: PRIVATE_EXPIRY_NOTE,
           netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
         this.host.log(`[mev] Private transaction ${p.hash} missed blocks ${first} through ${target}. Wallet nonce was unused.`);
       } else if (current > target && this.pending === p) {
@@ -1774,11 +1786,41 @@ export class MevSearcher {
     if (outcome.status === 'not included') this.traceMissedBundle(outcome);
   }
 
-  /** Collect builder diagnostics after chain settlement without delaying scans or nonce release. */
+  private schedulePrivateStatusAfterAck(pending: PendingBundle) {
+    const submission = pending.opp.submission!;
+    const lastSlot = submission.startedAt + submission.leadMs + (submission.target - pending.opp.block - 1) * SLOT_MS;
+    const eligible = () => !this.stopping && this.pending === pending && Date.now() < lastSlot
+      && (this.lastBlock?.number ?? pending.opp.block) < submission.target;
+    if (!eligible()) return;
+    // Leave time for a reply before the final eligible slot, even with a one-block order.
+    const delay = Math.max(0, Math.min(2_000, lastSlot - Date.now() - 2_500));
+    setTimeout(() => {
+      if (eligible()) void this.recordPrivateStatus(pending.hash, submission, 'relayAfterAck', eligible);
+    }, delay).unref();
+  }
+
+  private async recordPrivateStatus(hash: Hex, submission: BundleSubmission, field: 'relayAfterAck' | 'relayAfterExpiry',
+    eligible?: () => boolean) {
+    const status = await requestPrivateRelayStatus(hash);
+    if (!status || this.stopping || (eligible && !eligible()) || !this.file.recent.some(row => row.submission === submission)) return;
+    submission[field] = { ...status, checkedAt: Date.now() };
+    this.save();
+  }
+
+  /** Chain settlement has already released the nonce when these diagnostics are requested. */
   private traceMissedBundle(outcome: MevOpp) {
     const submission = outcome.submission;
-    if (CONFIG.forkMode || this.stopping || MEV.submission === 'direct' || !submission
-      || submission.kind === 'direct' || !Array.isArray(submission.builders)) return false;
+    if (CONFIG.forkMode || this.stopping || !submission) return false;
+    if (submission.kind === 'direct') {
+      const age = Date.now() - submission.startedAt;
+      if (outcome.note !== PRIVATE_EXPIRY_NOTE || !submission.privateSubmission || !outcome.hash
+        || !Number.isFinite(age) || age < 0 || age >= PRIVATE_STATUS_RETENTION_MS
+        || submission.relayAfterExpiry || this.requestedExpiryStatuses.has(submission)) return false;
+      this.requestedExpiryStatuses.add(submission);
+      void this.recordPrivateStatus(outcome.hash, submission, 'relayAfterExpiry');
+      return true;
+    }
+    if (MEV.submission === 'direct' || !Array.isArray(submission.builders)) return false;
     let scheduled = false;
     for (const request of bundleTraceRequests(submission.builders, MEV.builders, submission.startedAt)) {
       if (this.scheduledTraces.has(request.builder)) continue;

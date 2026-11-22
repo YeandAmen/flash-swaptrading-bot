@@ -52,7 +52,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   let checkLossGuards = false;
   let jupiterRequests = 0;
   let groupedExit: string | undefined;
-  let groupedIssue: 'layout' | 'oversized' | 'accounts' | 'rate-limit' | undefined;
+  let groupedIssue: 'layout' | 'oversized' | 'accounts' | 'rate-limit' | 'instruction-slippage' | 'response-slippage' | undefined;
   const requestedExits: string[][] = [];
   let slowQuote: Promise<void> | undefined;
   const [{ ata: usdcAta }, { ata: solAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
@@ -83,13 +83,17 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       if (first && venue === 'Meteora DLMM') await slowQuote;
       assert.equal(params.get('wrapAndUnwrapSol'), 'false');
       assert.equal(first ? outputMint : inputMint, WRAPPED_SOL);
-      if (!first) assert.equal(params.get('amount'), live ? '3498250000' : '3499000000');
-      const outAmount = first ? '3500000000' : returnOut;
+      const slippageBps = Number(params.get('slippageBps'));
+      assert.ok(slippageBps === 1 || slippageBps === 5);
+      const firstOut = 3_500_000_001n;
+      const minimum = (out: bigint, roundUp: boolean) => (out * BigInt(10_000 - slippageBps) + (roundUp ? 9_999n : 0n)) / 10_000n;
+      if (!first) assert.equal(params.get('amount'), String(minimum(firstOut, !live)));
+      const outAmount = first ? String(firstOut) : returnOut;
       const bytes = Buffer.alloc(issue === 'oversized' ? 1_500 : 34);
       Buffer.from('bb64facc31c4af14', 'hex').copy(bytes);
       bytes.writeBigUInt64LE(BigInt(params.get('amount')!), 8);
       bytes.writeBigUInt64LE(BigInt(outAmount), 16);
-      bytes.writeUInt16LE(5, 24);
+      bytes.writeUInt16LE(issue === 'instruction-slippage' ? 5 : slippageBps, 24);
       if (issue === 'layout') bytes[0] = 0;
       const destination = params.get('destinationTokenAccount');
       const metas = [
@@ -103,8 +107,8 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       return Response.json({
         inputMint, outputMint, inAmount: params.get('amount'),
         outAmount,
-        otherAmountThreshold: first ? '3499000000' : '250120000',
-        swapMode: 'ExactIn', slippageBps: 5,
+        otherAmountThreshold: String(minimum(BigInt(outAmount), true)),
+        swapMode: 'ExactIn', slippageBps: issue === 'response-slippage' ? 5 : slippageBps,
         routePlan: [{ swapInfo: { ammKey: first ? USDC : WRAPPED_SOL, label: venue, inputMint, outputMint } }],
         swapInstruction: { programId: JUPITER, data: live ? bytes.toString('base64') : 'AA==', accounts: live ? routeMetas : metas },
         cleanupInstruction: null, tipInstruction: null, otherInstructions: [], addressesByLookupTableAddress: null,
@@ -179,6 +183,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   const config = { rpcUrl: fakeRpc, wallet };
   const scan = await scanSolanaCycle(config);
   assert.equal(scan.flashFeeUsdc, 0.0025);
+  assert.equal(scan.slippageBps, 1);
   assert.equal(simulationCount, 2);
   for (const route of scan.routes) {
     assert.equal(route.status, 'simulated', route.detail);
@@ -285,8 +290,43 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       submissions++;
       return { status: 'route-declined', canTryAlternate: () => true };
     }, 'manual-test');
+    assert.equal(manual.slippageBps, 5);
     assert.ok(manual.routes.every((route) => route.qualified));
     assert.equal(submissions, 1);
+  });
+  await t.test('uses the guaranteed return to gate tight ordinary quotes while reporting the expected return', async () => {
+    const settings = { ...config, venuePair: solanaDiscoveryPairs[2], compareReturnVenues: true };
+    groupedExit = 'PancakeSwap';
+    returnOut = '250090000';
+    let submissions = 0;
+    const ordinary = await scanSolanaCycle(settings, async () => { submissions++; });
+    assert.equal(ordinary.slippageBps, 1);
+    assert.equal(submissions, 1);
+    for (const route of ordinary.routes) {
+      assert.equal(route.qualified, true, route.detail);
+      assert.equal(route.expectedNetBeforeNetworkUsdc, 0.0875);
+      assert.equal(route.quotedNetBeforeNetworkUsdc, 0.062491);
+    }
+
+    const noSubmit = async () => assert.fail('Unprotected quote authorized a candidate');
+    const simulationsBefore = simulationCount;
+    const manual = await scanSolanaCycle(settings, noSubmit, { id: 'profit-test', minimumNetUsd: 0.05 });
+    assert.equal(manual.slippageBps, 5);
+    for (const route of manual.routes) {
+      assert.equal(route.status, 'below-profit-floor', route.detail);
+      assert.equal(route.quotedNetBeforeNetworkUsdc, -0.037545);
+    }
+    returnOut = '250065000';
+    const near = await scanSolanaCycle(settings, noSubmit);
+    for (const route of near.routes) {
+      assert.equal(route.status, 'below-profit-floor', route.detail);
+      assert.equal(route.expectedNetBeforeNetworkUsdc, 0.0625);
+      assert.equal(route.quotedNetBeforeNetworkUsdc, 0.037493);
+    }
+    assert.equal(simulationCount, simulationsBefore);
+    groupedExit = undefined;
+    returnOut = '250250000';
+    requestedExits.length = 0;
   });
   await t.test('compares other direct exits and records the actual venue with one quote per leg', async () => {
     groupedExit = 'PancakeSwap';
@@ -333,7 +373,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     assert.equal(jupiterRequests, 4, 'no identical paired retry');
     assert.ok(sameVenue.routes.every((route) => route.detail?.includes('size limit')));
     groupedExit = 'PancakeSwap';
-    for (const issue of ['accounts', 'rate-limit'] as const) {
+    for (const issue of ['accounts', 'rate-limit', 'instruction-slippage', 'response-slippage'] as const) {
       groupedIssue = issue;
       jupiterRequests = 0;
       const rejected = await scanSolanaCycle(settings, async () => assert.fail('Rejected route submitted'));

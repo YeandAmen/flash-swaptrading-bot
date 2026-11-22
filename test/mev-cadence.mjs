@@ -472,6 +472,9 @@ try {
   assert.equal(protectedTrade.journaled[0].privateSubmission, true);
   assert.equal(protectedTrade.journaled[0].target, '103');
   const protectedTx = protectedTrade.signed[0];
+  const journaledFees = protectedTrade.journaled[0].opp.submission;
+  assert.equal(journaledFees.gasLimit, protectedTx.gas.toString());
+  assert.equal(journaledFees.maxFeePerGasWei, protectedTx.maxFeePerGas.toString());
   const protectedOrder = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: protectedTx.data }).args[0];
   assert.equal(protectedOrder.maxBlock, 103n);
   assert.equal(protectedTx.maxFeePerGas, 1_066_666_666n);
@@ -533,9 +536,30 @@ try {
 
   const worker = multi.searcher;
   const oldNonceRead = mevReadClient.getTransactionCount;
+  const originalFetch = globalThis.fetch;
   const fork = CONFIG.forkMode;
   try {
     CONFIG.forkMode = false; // Exercise the normal two-confirmation reservation without any external call.
+    const pending = worker.file.pending;
+    const submission = pending.opp.submission;
+    const statusRequests = [];
+    let returnExpiryStatus;
+    globalThis.fetch = async (url, { method }) => {
+      assert.equal(url, 'https://protect.flashbots.net/tx/' + pending.hash);
+      assert.equal(method, 'GET');
+      statusRequests.push(url);
+      const body = statusRequests.length === 1
+        ? { status: 'PENDING', simError: 'MaxFeePerGasTooLow' }
+        : await new Promise(resolve => { returnExpiryStatus = resolve; });
+      return new Response(JSON.stringify({ ...body, hash: pending.hash, maxBlockNumber: Number(maxBlock) }));
+    };
+    // The mocked private ingress acknowledged this order above in local fork mode.
+    // Drive the live acknowledgement timer now, keeping all diagnostic reads local.
+    worker.schedulePrivateStatusAfterAck(pending);
+    await new Promise(resolve => setTimeout(resolve, 2_100));
+    assert.equal(submission.relayAfterAck?.simError, 'MaxFeePerGasTooLow');
+    assert.equal(submission.relayAfterExpiry, undefined);
+    assert.equal(worker.file.pending, pending);
     worker.receipt = async () => null;
     const checkedAt = [];
     worker.liveArmed = () => true;
@@ -559,7 +583,26 @@ try {
     assert.equal(released, 1);
     assert.equal(multi.signed.length, 1);
     assert.equal(relay.length, 1);
+    const settled = worker.file.recent.find(row => row.hash === pending.hash);
+    assert.equal(settled.status, 'not included');
+    assert.equal(settled.gasEth, 0);
+    assert.equal(worker.traceMissedBundle(settled), false, 'at most one expiry query per transaction');
+    assert.equal(statusRequests.length, 2);
+    assert.equal(submission.relayAfterExpiry, undefined, 'wallet release does not wait for the relay response');
+    returnExpiryStatus({ status: 'FAILED', simError: 'ExecutionReverted', revertReason: 'deadline or floor' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(submission.relayAfterExpiry?.revertReason, 'deadline or floor');
+    assert.equal(submission.relayAfterAck?.simError, 'MaxFeePerGasTooLow');
+    assert.equal(worker.file.pending, null);
+    assert.equal(settled.status, 'not included');
+    for (const [patch, note] of [[{ privateSubmission: false }, settled.note],
+      [{ startedAt: now - 46 * minute }, settled.note], [{}, 'a different confirmed transaction used the nonce']]) {
+      const ignored = { ...settled, note, submission: { ...submission, ...patch, relayAfterExpiry: undefined } };
+      assert.equal(worker.traceMissedBundle(ignored), false);
+    }
+    assert.equal(statusRequests.length, 2);
   } finally {
+    globalThis.fetch = originalFetch;
     CONFIG.forkMode = fork;
     mevReadClient.getTransactionCount = oldNonceRead;
   }

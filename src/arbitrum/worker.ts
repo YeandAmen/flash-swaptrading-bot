@@ -16,7 +16,7 @@ import { reconcileArbitrumIntent, type ArbitrumIntent } from './settlement.js';
 import { arbitrumTestLeads } from './test-leads.js';
 import {
   arbitrumChainId, arbitrumClient, arbitrumEthUsd, arbitrumProbeSize, defaultArbitrumRpc,
-  discoverArbitrumPools, scanArbitrum, type ArbQuote, type RecentArbitrumSizingLead,
+  refreshArbitrumPools, scanArbitrum, type ArbQuote, type RecentArbitrumSizingLead,
 } from './market.js';
 
 const journalFile = path.join(DATA_DIR, 'arbitrum-trades.json');
@@ -71,7 +71,8 @@ export class ArbitrumWorker {
   private readonly alternateWriter = this.rpcUrl.replace(/\/$/, '') === defaultArbitrumRpc
     ? arbitrumClient('https://arbitrum-one-rpc.publicnode.com') : null;
   private readonly executionEnabled = process.env.ARBITRUM_LIVE === 'on' && CONFIG.allowLiveTrading;
-  private markets: Awaited<ReturnType<typeof discoverArbitrumPools>> = [];
+  private markets: Awaited<ReturnType<typeof refreshArbitrumPools>>['markets'] = [];
+  private knownPools?: Awaited<ReturnType<typeof refreshArbitrumPools>>['knownPools'];
   private refreshAfter = 0;
   private regularScans = 0;
   private readingPaths = false;
@@ -245,10 +246,11 @@ export class ArbitrumWorker {
     const quoteAt = Date.now();
     const block = await this.client.getBlockNumber({ cacheTime: 0 });
     if (Date.now() >= this.refreshAfter) {
-      const markets = await discoverArbitrumPools(this.client, block);
-      if (markets.length === 0) throw new Error('No liquid Arbitrum markets returned by RPC');
-      this.markets = markets;
-      this.refreshAfter = Date.now() + 5 * 60_000;
+      const discovery = await refreshArbitrumPools(this.client, block, this.knownPools);
+      this.knownPools = discovery.knownPools;
+      this.markets = discovery.markets;
+      this.refreshAfter = Date.now() + (discovery.complete && this.markets.length ? 5 * 60_000 : 30_000);
+      if (!discovery.complete) this.activity.record('warn', 'Pool discovery was incomplete. Retrying in 30 seconds.');
     }
     const selectedTest = this.journal?.test;
     const test = this.summary.mode === 'live' && !this.journal?.pending && activeFlashTest(selectedTest) ? selectedTest : null;

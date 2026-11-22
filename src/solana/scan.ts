@@ -16,7 +16,8 @@ import {
 
 const COMMITMENT = 'confirmed';
 const REQUEST_TIMEOUT_MS = 8_000;
-const SLIPPAGE_BPS = 5;
+const ORDINARY_SLIPPAGE_BPS = 1;
+const TEST_SLIPPAGE_BPS = 5;
 const COMPUTE_UNITS = 1_400_000;
 const PRIORITY_MICROLAMPORTS = 1_000n;
 const USDC_UNITS = 1_000_000n;
@@ -127,7 +128,9 @@ interface SolanaRoute {
   buy: Venue;
   sell: string;
   status: 'no-route' | 'quote-error' | 'below-profit-floor' | 'simulation-failed' | 'simulated';
-  quotedNetBeforeNetworkUsdc?: number;
+  // Both figures use the amount of WSOL guaranteed by the first leg.
+  expectedNetBeforeNetworkUsdc?: number;
+  quotedNetBeforeNetworkUsdc?: number; // Guaranteed by the return instruction if the swap succeeds.
   simulatedNetUsdc?: number;
   simulatedCostLamports?: number;
   unitsConsumed?: number;
@@ -144,6 +147,7 @@ export interface SolanaScanResult {
   wallet: Address;
   walletSol: number;
   loanUsdc: number;
+  slippageBps: number;
   flashFeeUsdc: number | null;
   availableUsdc: number;
   routes: SolanaRoute[];
@@ -203,14 +207,14 @@ function deadline() {
 
 export async function buildSwap(
   wallet: Address, input: Address, output: Address, destination: Address,
-  amount: bigint, venues: Venue | readonly Venue[], apiKey?: string,
+  amount: bigint, venues: Venue | readonly Venue[], apiKey?: string, slippageBps = TEST_SLIPPAGE_BPS,
 ): Promise<JupiterBuild | null> {
   const allowedVenues: readonly string[] = typeof venues === 'string' ? [venues] : venues;
   const url = new URL(JUPITER_BUILD);
   url.search = new URLSearchParams({
     inputMint: input, outputMint: output, taker: wallet, amount: amount.toString(),
     destinationTokenAccount: destination, wrapAndUnwrapSol: 'false',
-    slippageBps: String(SLIPPAGE_BPS), dexes: allowedVenues.join(','), maxAccounts: '22', transactionVersion: '0',
+    slippageBps: String(slippageBps), dexes: allowedVenues.join(','), maxAccounts: '22', transactionVersion: '0',
   }).toString();
   const result = await fetch(url, {
     headers: apiKey ? { 'x-api-key': apiKey } : {},
@@ -227,7 +231,7 @@ export async function buildSwap(
   }
   const swap = await result.json() as JupiterBuild;
   if (swap.inputMint !== input || swap.outputMint !== output || rawAmount(swap.inAmount) !== amount
-    || swap.swapMode !== 'ExactIn' || swap.slippageBps !== SLIPPAGE_BPS
+    || swap.swapMode !== 'ExactIn' || swap.slippageBps !== slippageBps
     || rawAmount(swap.otherAmountThreshold) === 0n || rawAmount(swap.otherAmountThreshold) > rawAmount(swap.outAmount)) {
     throw new Error('Jupiter returned incompatible swap terms');
   }
@@ -272,7 +276,8 @@ export async function lookupTables(rpc: Rpc, swaps: JupiterBuild[]): Promise<Add
 
 class RouteCompositionError extends Error {}
 
-export function routeMinimum(swap: JupiterBuild, wallet: Address, source: Address, destination: Address): bigint {
+export function routeMinimum(swap: JupiterBuild, wallet: Address, source: Address, destination: Address,
+  slippageBps = TEST_SLIPPAGE_BPS): bigint {
   const bytes = Buffer.from(swap.swapInstruction.data, 'base64');
   const accounts = swap.swapInstruction.accounts;
   if (bytes.length < 34 || !bytes.subarray(0, 8).equals(routeV2)) {
@@ -280,7 +285,7 @@ export function routeMinimum(swap: JupiterBuild, wallet: Address, source: Addres
   }
   if (bytes.readBigUInt64LE(8) !== rawAmount(swap.inAmount)
     || bytes.readBigUInt64LE(16) !== rawAmount(swap.outAmount)
-    || bytes.readUInt16LE(24) !== SLIPPAGE_BPS || bytes.readUInt16LE(26) !== 0 || bytes.readUInt16LE(28) !== 0
+    || bytes.readUInt16LE(24) !== slippageBps || bytes.readUInt16LE(26) !== 0 || bytes.readUInt16LE(28) !== 0
     || accounts[0]?.pubkey !== wallet || !accounts[0].isSigner
     || accounts[1]?.pubkey !== source || !accounts[1].isWritable
     || accounts[2]?.pubkey !== destination || !accounts[2].isWritable
@@ -290,7 +295,7 @@ export function routeMinimum(swap: JupiterBuild, wallet: Address, source: Addres
     throw new Error('Jupiter RouteV2 account or amount does not match the signed route');
   }
   // The integer lower bound also covers a JSON threshold that rounds up by one unit.
-  return bytes.readBigUInt64LE(16) * BigInt(10_000 - SLIPPAGE_BPS) / 10_000n;
+  return bytes.readBigUInt64LE(16) * BigInt(10_000 - slippageBps) / 10_000n;
 }
 
 async function liveWalletState(rpc: Rpc, wallet: Address, usdAta: Address, solAta: Address, minContextSlot: bigint) {
@@ -333,6 +338,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   if (!config.wallet) throw new Error('Set SOLANA_WALLET_ADDRESS to the public address of your Solana wallet');
   const wallet = address(config.wallet);
   const test = execute && requestedTest ? (typeof requestedTest === 'string' ? { id: requestedTest } : requestedTest) : null;
+  const slippageBps = test ? TEST_SLIPPAGE_BPS : ORDINARY_SLIPPAGE_BPS;
   const venues = config.venuePair ?? solanaVenuePairs[0];
   const limits = solanaTestMinimums(test);
   const configuredLoan = usdcAmount(config.loanUsdc ?? defaultLoanUsdc, 1, 100_000, 'Loan size');
@@ -365,7 +371,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   const result: SolanaScanResult = {
     chain: 'solana', mode: execute ? 'live' : 'paper', checkedAt: new Date().toISOString(),
     slot: Number(context.slot), wallet, walletSol: Number(balance) / Number(SOL_UNITS),
-    loanUsdc: usdcUnits(loan), flashFeeUsdc: repay === null ? null : usdcUnits(repay - loan),
+    loanUsdc: usdcUnits(loan), slippageBps, flashFeeUsdc: repay === null ? null : usdcUnits(repay - loan),
     availableUsdc: usdcUnits(reserve.available), routes: [], status: 'loan-unavailable',
   };
   if (repay === null || loan > reserve.available) return result;
@@ -379,15 +385,15 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
     let reusableFirst = firstQuote;
     let hasDifferentExit = false;
     let sell: string = compareReturns ? 'Jupiter direct return' : pairedVenue;
-    let quote: number | undefined;
+    let quote: Pick<SolanaRoute, 'expectedNetBeforeNetworkUsdc' | 'quotedNetBeforeNetworkUsdc'> | undefined;
     try {
-      const first = firstQuote ?? await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy, config.jupiterApiKey);
+      const first = firstQuote ?? await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy, config.jupiterApiKey, slippageBps);
       if (!first) return { buy, sell, status: 'no-route', detail: 'No direct first-leg route' };
       reusableFirst = first;
-      const firstMinimum = execute ? routeMinimum(first, wallet, usdcAta.ata, solAta.ata) : rawAmount(first.otherAmountThreshold);
+      const firstMinimum = execute ? routeMinimum(first, wallet, usdcAta.ata, solAta.ata, slippageBps) : rawAmount(first.otherAmountThreshold);
       if (firstMinimum <= 0n) throw new Error('Jupiter did not guarantee any first-leg output');
       const exits = compareReturns ? discoveryVenues.filter((venue) => venue !== buy) : pairedVenue;
-      const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, exits, config.jupiterApiKey);
+      const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, exits, config.jupiterApiKey, slippageBps);
       if (!second) {
         if (compareReturns && !submission) return scanRoute(buy, index, first);
         return { buy, sell, status: 'no-route', detail: 'No direct return route' };
@@ -399,10 +405,13 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       if (second.routePlan.some(({ swapInfo }) => usedPools.has(address(swapInfo.ammKey)))) {
         return { buy, sell, status: 'no-route', detail: 'Routes share a liquidity pool' };
       }
-      const returnMinimum = execute ? routeMinimum(second, wallet, solAta.ata, usdcAta.ata) : rawAmount(second.otherAmountThreshold);
+      const returnMinimum = execute ? routeMinimum(second, wallet, solAta.ata, usdcAta.ata, slippageBps) : rawAmount(second.otherAmountThreshold);
       const beforeNetwork = returnMinimum - repay;
-      quote = usdcUnits(beforeNetwork);
-      if (beforeNetwork < minimumNet) return { buy, sell, status: 'below-profit-floor', quotedNetBeforeNetworkUsdc: quote };
+      quote = {
+        expectedNetBeforeNetworkUsdc: usdcUnits(rawAmount(second.outAmount) - repay),
+        quotedNetBeforeNetworkUsdc: usdcUnits(beforeNetwork),
+      };
+      if (beforeNetwork < minimumNet) return { buy, sell, status: 'below-profit-floor', ...quote };
       if (balance < 5_000n) throw new Error('The public wallet has no SOL to cover a full transaction simulation');
 
       const [tables, blockhashResult, baseline] = await Promise.all([
@@ -448,7 +457,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         maxDebit = exactFee + baseline.rent;
         if (baseline.lamports <= maxDebit) throw new Error('Solana fee payer cannot cover the fee and required ATA rent');
         const requiredUsdc = minimumNet + nativeCostInUsdc(gasOnlyTest ? baseline.rent : maxDebit, loan, firstMinimum);
-        if (beforeNetwork < requiredUsdc) return { buy, sell, status: 'below-profit-floor', quotedNetBeforeNetworkUsdc: quote };
+        if (beforeNetwork < requiredUsdc) return { buy, sell, status: 'below-profit-floor', ...quote };
         transaction = await assemble([
           lighthouseLamports(wallet, 'equal', baseline.lamports - exactFee),
           ...createAccounts,
@@ -506,7 +515,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         }
       }
       return {
-        buy, sell, status: 'simulated', quotedNetBeforeNetworkUsdc: quote, simulatedNetUsdc: usdcUnits(net),
+        buy, sell, status: 'simulated', ...quote, simulatedNetUsdc: usdcUnits(net),
         simulatedCostLamports: Number(costLamports), unitsConsumed: Number(simulation.unitsConsumed ?? 0),
         slot: Number(execution.slot),
         qualified,
@@ -516,7 +525,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       if (error instanceof RouteCompositionError && compareReturns && hasDifferentExit && reusableFirst && !submission) {
         return scanRoute(buy, index, reusableFirst);
       }
-      return { buy, sell, status: quote === undefined ? 'quote-error' : 'simulation-failed', quotedNetBeforeNetworkUsdc: quote,
+      return { buy, sell, status: quote === undefined ? 'quote-error' : 'simulation-failed', ...quote,
         detail: summarizeFailure(error, config.jupiterApiKey) };
     }
   };

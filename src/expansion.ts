@@ -117,10 +117,16 @@ export function startExpansion() {
         `Solana transaction ${row.status}. Fee ${row.feeLamports} lamports.`, `https://explorer.solana.com/tx/${row.signature}`, row.at);
       loggedOutcome = row.signature;
     }
-    const routes = solanaResult.routes.map((route) =>
-      `${route.buy} → ${route.sell}: ${route.detail ?? route.status}${route.quotedNetBeforeNetworkUsdc === undefined ? '' : ` (${route.quotedNetBeforeNetworkUsdc.toFixed(6)} USDC before network fees)`}`);
+    const routes = solanaResult.routes.map((route) => {
+      const { expectedNetBeforeNetworkUsdc: expected, quotedNetBeforeNetworkUsdc: guaranteed } = route;
+      const quote = expected === undefined || guaranteed === undefined ? ''
+        : ` (${expected.toFixed(6)} / ${guaranteed.toFixed(6)})`;
+      return `${route.buy} → ${route.sell}: ${route.detail ?? route.status}${quote}`;
+    });
     const sizing = probe ? ' ' + probe.loanUsdc + ' USDC ' + probe.reason + ' probe.' : '';
-    const report = 'Slot ' + solanaResult.slot + '.' + sizing + ' ' + (routes.join(' | ') || solanaResult.status) + '.';
+    const terms = solanaResult.routes.some((route) => route.quotedNetBeforeNetworkUsdc !== undefined)
+      ? ' Expected / guaranteed net USDC before network fees.' : '';
+    const report = `Slot ${solanaResult.slot}.${sizing} ${solanaResult.slippageBps} bp/leg.${terms} ${routes.join(' | ') || solanaResult.status}.`;
     solanaActivity.record(quoteFailure || liveError ? 'warn' : 'info', report);
   }, solanaCanArm ? 12_000 : 30_000, (error) => {
     solanaStatus = error;

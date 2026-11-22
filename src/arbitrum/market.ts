@@ -181,28 +181,45 @@ async function readArbitrumSpotRates(client: ArbitrumClient, blockNumber: bigint
   return rates;
 }
 
-export async function discoverArbitrumPools(client: ArbitrumClient, blockNumber: bigint): Promise<Market[]> {
+export async function refreshArbitrumPools(client: ArbitrumClient, blockNumber: bigint, previous = new Map<string, Pool>()) {
   const v3Pairs = tokens.flatMap(([, token]) => v3Fees.map((fee) => ({ token, fee })));
   const addresses = await client.multicall({ blockNumber, contracts: v3Pairs.map(({ token, fee }) => ({
     address: factory, abi: factoryAbi, functionName: 'getPool' as const, args: [weth, token, fee] as const,
-  })) });
+  })) }).catch(() => []);
   const v3Pools = v3Pairs.flatMap(({ token, fee }, i) => {
-    const poolAddress = addresses[i].result;
+    const key = token + '/' + fee;
+    const poolAddress = addresses[i]?.result ?? previous.get(key)?.pool;
     if (!poolAddress || poolAddress === zeroAddress) return [];
     const pool: Pool = { kind: 2, pool: poolAddress, fee, tickSpacing: 0, nativeEth: false };
-    return [{ token, pool, read: { address: poolAddress, abi: v3PoolAbi, functionName: 'liquidity' as const } }];
+    return [{ token, pool, key, read: { address: poolAddress, abi: v3PoolAbi, functionName: 'liquidity' as const } }];
   });
   const v4Keys = tokens.flatMap(([, token]) => v4Tiers.map(([fee, tickSpacing]) => ({ token, fee, tickSpacing })));
   const v4Pools = v4Keys.flatMap(({ token, fee, tickSpacing }) => [true, false].map((nativeEth) => {
     const pool: Pool = { kind: 5, pool: poolManager, fee, tickSpacing, nativeEth };
-    return { token, pool, read: { address: stateView, abi: stateAbi, functionName: 'getLiquidity' as const,
-      args: [poolId(token, pool)] as const } };
+    const key = poolId(token, pool);
+    return { token, pool, key, read: { address: stateView, abi: stateAbi, functionName: 'getLiquidity' as const,
+      args: [key] as const } };
   }));
   const candidates = [...v3Pools, ...v4Pools];
-  const liquidity = await client.multicall({ blockNumber, contracts: candidates.map((candidate) => candidate.read) });
-  return tokens.map(([symbol, token]) => ({
-    symbol, token, pools: candidates.filter((candidate, i) => candidate.token === token && (liquidity[i].result ?? 0n) > 0n).map((candidate) => candidate.pool),
+  const liquidity = await client.multicall({ blockNumber, contracts: candidates.map((candidate) => candidate.read) }).catch(() => []);
+  const complete = addresses.length === v3Pairs.length && addresses.every(row => row.status === 'success')
+    && liquidity.length === candidates.length && liquidity.every(row => row.status === 'success');
+  const knownPools = new Map<string, Pool>();
+  for (const [i, { key, pool }] of candidates.entries()) {
+    const quantity = liquidity[i]?.result;
+    // Preserve only this exact pool on a failed read. A zero address or zero liquidity evicts it.
+    if (quantity === undefined ? previous.get(key)?.pool.toLowerCase() === pool.pool.toLowerCase() : quantity > 0n) {
+      knownPools.set(key, pool);
+    }
+  }
+  const markets = tokens.map(([symbol, token]) => ({
+    symbol, token, pools: candidates.filter(candidate => candidate.token === token && knownPools.has(candidate.key)).map(candidate => candidate.pool),
   })).filter((market) => market.pools.length > 1);
+  return { markets, knownPools, complete };
+}
+
+export async function discoverArbitrumPools(client: ArbitrumClient, blockNumber: bigint): Promise<Market[]> {
+  return (await refreshArbitrumPools(client, blockNumber)).markets;
 }
 
 function quote(token: Address, pool: Pool, buy: boolean, amount: bigint) {

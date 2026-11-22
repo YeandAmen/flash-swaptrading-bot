@@ -612,8 +612,17 @@ function submissionDetails(submission, openSubmissions) {
   const key = `${kind === 'direct' ? 'direct' : 'bundle'}-${target}`;
   const open = openSubmissions.has(key) ? ' open' : '';
   if (kind === 'direct') {
+    const relay = [['after acknowledgement', submission.relayAfterAck], ['after expiry', submission.relayAfterExpiry]]
+      .filter(([, result]) => result)
+      .map(([when, result]) => {
+        const fields = [result.status, result.simError, result.revertReason];
+        if (result.maxBlockNumber) fields.push('relay deadline block ' + result.maxBlockNumber);
+        return `<div>Flashbots ${when} · ${esc(fields.filter(Boolean).join(' · '))}</div>`;
+      }).join('');
+    const signedGas = submission.gasLimit && submission.maxFeePerGasWei
+      ? `<div>Gas limit ${esc(submission.gasLimit)} · fee cap ${esc(submission.maxFeePerGasWei)} wei/gas</div>` : '';
     return `<details class="sub" data-target="${esc(key)}"${open}><summary>Direct transaction · route deadline block ${esc(target)}</summary>
-      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd)}</div></details>`;
+      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd)}</div>${signedGas}${relay}</details>`;
   }
   const timing = `${(Math.abs(leadMs) / 1000).toFixed(2)}s ${leadMs >= 0 ? 'before' : 'after'} expected slot`;
   return `<details class="sub" data-target="${esc(key)}"${open}><summary>Bundle for block ${esc(target)}</summary>
