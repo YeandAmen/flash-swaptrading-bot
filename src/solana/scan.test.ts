@@ -102,6 +102,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       bytes.writeBigUInt64LE(BigInt(outAmount), 16);
       bytes.writeUInt16LE(issue === 'instruction-slippage' ? 5 : slippageBps, 24);
       // Distinguish the two fixture routes even when the quoted amounts match.
+      if (venue === 'Kipseli') bytes[32] = 9;
       bytes[33] = venue === 'Whirlpool' ? 1 : 2;
       if (issue === 'layout') bytes[0] = 0;
       const destination = params.get('destinationTokenAccount');
@@ -573,6 +574,97 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     assert.equal(finalWires.length, 2, 'a pending intent precludes another final simulation');
     assert.equal(signer.mock.callCount(), 1);
     assert.equal(sentMessages.length, 1);
+  });
+  await t.test('attributes early simulation failures and retries one verified grouped return with the original entry', async (t) => {
+    const settings = { ...config, loanUsdc: 2_500, venuePair: solanaDiscoveryPairs[2], compareReturnVenues: true };
+    const previous = { firstOut, returnOut, groupedExit };
+    t.after(() => {
+      firstOut = previous.firstOut; returnOut = previous.returnOut; groupedExit = previous.groupedExit;
+      reportedFee = fee; requestedExits.length = 0;
+    });
+    firstOut = 35_000_000_001n;
+    const guarantee = 2_500_000_000n + 25_000n + 72_517n; // lender repayment plus the observed pre-network margin
+    returnOut = ((guarantee * 10_000n + 9_998n) / 9_999n).toString();
+    groupedExit = 'Kipseli';
+    let step: 'entry' | 'return' | 'borrow' | 'repay' | 'guard' | 'unknown' = 'return';
+    let code = 6001, cpi = false, expired = false, allExits = false, missingEntry = false;
+    let clock = 1_000, attempts = 0;
+    t.mock.method(performance, 'now', () => clock);
+    const fetchFixture = globalThis.fetch;
+    t.mock.method(globalThis, 'fetch', (input: URL | RequestInfo, init?: RequestInit) => {
+      if (new URL(String(input)).origin !== fakeRpc) return fetchFixture(input, init);
+      const req = JSON.parse(String(init?.body));
+      if (req.method !== 'simulateTransaction') return fetchFixture(input, init);
+      attempts++;
+      const transaction = getTransactionDecoder().decode(Buffer.from(req.params[0], 'base64'));
+      const wire = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
+      if (wire.version !== 0) assert.fail('expected V0');
+      const programs = wire.instructions.map(ix => wire.staticAccounts[ix.programAddressIndex]);
+      const exit = programs.lastIndexOf(JUPITER);
+      if (wire.instructions[exit].data?.[32] !== 9 && !allExits) return fetchFixture(input, init);
+      const index = step === 'entry' ? programs.indexOf(JUPITER) : step === 'borrow' ? programs.indexOf(KAMINO)
+        : step === 'repay' ? programs.lastIndexOf(KAMINO) : step === 'guard' ? programs.lastIndexOf(LIGHTHOUSE) : exit;
+      const root = programs[index];
+      const logs = [...(step === 'return' && !missingEntry ? [`Program ${JUPITER} invoke [1]`, `Program ${JUPITER} success`] : []),
+        `Program ${root} invoke [1]`, 'Program log: Error: https://private.invalid/value?key=secret',
+        ...(cpi ? [`Program ${tokenProgram} invoke [2]`, `Program ${tokenProgram} failed: custom program error: 0x1771`] : []),
+        `Program ${root} failed: custom program error: 0x${code.toString(16)}`];
+      const err = step === 'unknown' ? { InstructionError: [250, { Custom: code }] } : { InstructionError: [index, { Custom: code }] };
+      if (expired) clock += 8_001;
+      return Promise.resolve(Response.json({ jsonrpc: '2.0', id: req.id, result: { context: { slot: 42 }, value: { err, logs } } }));
+    });
+    let handoffs = 0;
+    const run = async (manual?: string) => {
+      attempts = handoffs = 0;
+      const before = jupiterRequests;
+      const result = await scanSolanaCycle(settings, async candidate => {
+        handoffs++;
+        assert.equal(candidate.loan, 2_500_000_000n);
+        assert.equal(candidate.feeLamports, BigInt(fee));
+        assert.ok(candidate.net >= 50_000n);
+      }, manual);
+      assert.equal(result.flashFeeUsdc, 0.025);
+      assert.ok(result.routes.every(route => !/private|secret/.test(route.detail ?? '')));
+      return { result, requests: jupiterRequests - before };
+    };
+    const recovered = await run();
+    assert.equal(recovered.requests, 5, 'two entries, two grouped returns, one paired return');
+    assert.equal(attempts, 3);
+    assert.equal(handoffs, 1);
+    assert.ok(recovered.result.routes.every(r => r.quotedNetBeforeNetworkUsdc === 0.072517));
+    const winner = recovered.result.routes.find(route => route.qualified);
+    assert.ok(winner && winner.sell !== 'Kipseli');
+    assert.match(winner.detail!, /Previous Kipseli: Outer ix [0-9]+ Jupiter return: slippage 6001/);
+    reportedFee++;
+    const rejected = await run();
+    assert.equal(rejected.requests, 5);
+    assert.equal(handoffs, 0, 'paired return still needs exact network fee reconciliation');
+    reportedFee = fee;
+    for (const [failure, detail] of [
+      ['entry', 'Jupiter entry'], ['borrow', 'Kamino borrow'], ['repay', 'Kamino repay'],
+      ['guard', 'Lighthouse balance floor'], ['unknown', 'unclassified error'],
+    ] as const) {
+      step = failure;
+      const blocked = await run();
+      assert.equal(blocked.requests, 4, failure);
+      assert.equal(handoffs, 0, failure);
+      assert.ok(blocked.result.routes.every(r => r.status === 'simulation-failed' && r.detail?.includes(detail)));
+    }
+    step = 'return';
+    for (const reason of ['nested CPI', 'unverified entry', 'unknown code', 'expired', 'same exit', 'manual']) {
+      cpi = reason === 'nested CPI';
+      missingEntry = reason === 'unverified entry';
+      code = reason === 'unknown code' ? 6002 : 6001;
+      expired = reason === 'expired';
+      allExits = reason === 'same exit' || reason === 'manual';
+      groupedExit = reason === 'same exit' ? 'paired' : 'Kipseli';
+      // The manual five-bps return must still clear its pre-simulation floor.
+      if (reason === 'manual') returnOut = '2503000000';
+      const blocked = await run(reason === 'manual' ? 'manual-error' : undefined);
+      assert.equal(blocked.requests, 4, reason);
+      assert.equal(handoffs, 0, reason);
+      assert.ok(blocked.result.routes.every(r => r.status === 'simulation-failed'), reason);
+    }
   });
   await t.test('tries the alternate only after an explicit route decline', async () => {
     let submissions = 0;

@@ -6,6 +6,7 @@ import {
   setTransactionMessageFeePayer, setTransactionMessageLifetimeUsingBlockhash,
   type Address, type AddressesByLookupTableAddress, type TransactionMessageBytesBase64, type Instruction, type Transaction,
 } from '@solana/kit';
+import { describeSimulationFailure } from './simulation-error.js';
 import { redactDiagnostic } from '../diagnostics.js';
 import { validSolanaSwapLossUsdc, type FlashTest } from '../network-test.js';
 import { lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
@@ -409,7 +410,10 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
 
   let submission: Promise<void | SolanaRouteDecline> | undefined;
   let alternate: PreparedSolanaCycle | undefined;
-  let deferredReturn: { index: number; first: JupiterBuild } | undefined;
+  let deferredReturn: { index: number; first: JupiterBuild; previousFailure?: string } | undefined;
+  let retriedSimulationExit = false;
+  const afterRetry = (route: SolanaRoute, previousFailure?: string): SolanaRoute => previousFailure
+    ? { ...route, detail: `${route.detail ?? route.status}. Previous ${previousFailure}` } : route;
   const retryDeadline = performance.now() + REQUEST_TIMEOUT_MS;
   const scanRoute = async (buy: Venue, index: number, firstQuote?: JupiterBuild, signal?: AbortSignal): Promise<SolanaRoute> => {
     const pairedVenue = venues[1 - index];
@@ -417,10 +421,15 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
     let reusableFirst = firstQuote;
     let hasDifferentExit = false;
     let sell: string = compareReturns ? 'Jupiter direct return' : pairedVenue;
-    const tryPairedReturn = (first: JupiterBuild, unavailable: SolanaRoute) => {
-      if (!submission) return scanRoute(buy, index, first);
+    const tryPairedReturn = (first: JupiterBuild, unavailable: SolanaRoute, previousFailure?: string) => {
+      if (!submission) {
+        const remaining = Math.ceil(retryDeadline - performance.now());
+        if (previousFailure && remaining <= 0) return unavailable;
+        return scanRoute(buy, index, first, previousFailure ? AbortSignal.timeout(remaining) : undefined)
+          .then(route => afterRetry(route, previousFailure));
+      }
       // Only the opposite entry can reach this point once the first candidate has been handed off.
-      deferredReturn = { index, first };
+      deferredReturn = { index, first, previousFailure };
       return unavailable;
     };
     let quote: Pick<SolanaRoute, 'expectedNetBeforeNetworkUsdc' | 'quotedNetBeforeNetworkUsdc'> | undefined;
@@ -517,10 +526,17 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         minContextSlot: execute ? requiredSlot : context.slot, commitment: COMMITMENT,
       }).send(deadline(signal));
       if (simulation.err) {
-        const programError = simulation.logs?.find((line) => line.startsWith('Program log: Error: '));
-        const errorName = typeof simulation.err === 'string' ? simulation.err : Object.keys(simulation.err).join(', ');
-        const cause = programError?.slice('Program log: Error: '.length) ?? errorName;
-        throw new Error(`Atomic simulation failed: ${cause}`);
+        const compiled = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
+        const programs = compiled.version === 0
+          ? compiled.instructions.map(ix => compiled.staticAccounts[ix.programAddressIndex]) : [];
+        const failure = describeSimulationFailure(simulation.err, simulation.logs, programs);
+        const unavailable: SolanaRoute = { buy, sell, status: 'simulation-failed', ...quote, detail: failure.detail };
+        if (execute && failure.returnSlippage && compareReturns && hasDifferentExit && !retriedSimulationExit
+          && performance.now() < retryDeadline) {
+          retriedSimulationExit = true;
+          return tryPairedReturn(first, unavailable, `${sell}: ${failure.detail}`);
+        }
+        return unavailable;
       }
       const usdBalance = (balances: typeof simulation.postTokenBalances) => balances?.reduce((sum, token) =>
         token.mint === USDC && token.owner === wallet ? sum + rawAmount(token.uiTokenAmount.amount) : sum, 0n);
@@ -545,6 +561,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       const qualified = fee <= maxFeeLamports && postUsdc - preUsdc >= protectedCost + minimumNet
         && beforeNetwork >= protectedCost + minimumNet && lossBalancesMatch
         && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
+      if (signal && (signal.aborted || performance.now() >= retryDeadline)) throw new Error('Paired Solana return quote expired');
       if (qualified && execute && baseline && exactFee !== null) {
         const candidate = { ...(test ? { testId: test.id } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight,
           simulationSlot: execution.slot, maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports,
@@ -579,8 +596,8 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
     if (!alternate && deferredReturn) {
       const remaining = Math.ceil(retryDeadline - performance.now());
       if (remaining <= 0 || !initial.canTryAlternate()) return result;
-      const { first, index } = deferredReturn;
-      result.routes[index] = await scanRoute(venues[index], index, first, AbortSignal.timeout(remaining));
+      const { first, index, previousFailure } = deferredReturn;
+      result.routes[index] = afterRetry(await scanRoute(venues[index], index, first, AbortSignal.timeout(remaining)), previousFailure);
       if (performance.now() >= retryDeadline) return result;
     }
     if (alternate && initial.canTryAlternate()) await execute?.(alternate);
