@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { MAX_SAFE_SOLANA_LOAN_USDC, SolanaMarketPlanner } from './market.js';
+import { MAX_SOLANA_LOAN_UNITS, SolanaMarketPlanner } from './market.js';
 
 test('Solana discovers all venue and depth combinations even with a persistent positive lead', () => {
   const planner = new SolanaMarketPlanner(3);
@@ -56,7 +56,8 @@ test('ordinary Solana discovery visits each bounded size once per venue through 
       for (const size of expected) {
         for (let venue = 0; venue < 3; venue++) {
           const probe = planner.plan(cap, 0);
-          assert.deepEqual(probe, { venue, loanUsdc: size, maxLoanUsdc: cap, reason: 'discovery' });
+          assert.deepEqual(probe, { venue, loanUsdc: size, loanUsdcUnits: String(Math.round(size * 1e6)),
+            maxLoanUsdc: cap, maxLoanUsdcUnits: String(cap * 1e6), reason: 'discovery' });
         }
       }
     }
@@ -73,13 +74,40 @@ test('unlimited planning uses a finite startup probe, then sweeps to the lender 
   const reserve = 8_345_678.123456;
   for (const expected of [25, 250, 2_500, 25_000, 250_000, 2_500_000, reserve]) {
     for (let venue = 0; venue < 2; venue++) {
-      const probe = planner.plan(Infinity, 0, reserve);
-      assert.deepEqual(probe, { venue, loanUsdc: expected, maxLoanUsdc: reserve, reason: 'discovery',
+      const probe = planner.plan(Infinity, 0, 8_345_678_123_456n);
+      assert.deepEqual(probe, { venue, loanUsdc: expected, loanUsdcUnits: String(Math.round(expected * 1e6)),
+        maxLoanUsdc: reserve, maxLoanUsdcUnits: '8345678123456', reason: 'discovery',
         ...(expected === reserve ? { fullReserve: true } : {}) });
     }
   }
-  assert.equal(planner.plan(Infinity, 0, 0).loanUsdc, 1);
-  assert.equal(planner.plan(Infinity, 0, 1e14).maxLoanUsdc, MAX_SAFE_SOLANA_LOAN_USDC);
+  assert.equal(planner.plan(Infinity, 0, 0n).loanUsdc, 1);
+  assert.equal(planner.plan(Infinity, 0, MAX_SOLANA_LOAN_UNITS).maxLoanUsdcUnits, MAX_SOLANA_LOAN_UNITS.toString());
+  assert.throws(() => planner.plan(Infinity, 0, MAX_SOLANA_LOAN_UNITS + 1n), /reserve amount/);
+});
+
+test('unlimited discovery and refinement retain individual micro-USDC units above the JS safe integer range', () => {
+  const reserve = 250_000_000_000_000_001n;
+  const planner = new SolanaMarketPlanner(1);
+  const sizes = new Set<bigint>();
+  let now = 0;
+  for (let dollars = 25n; dollars * 1_000_000n < reserve; dollars *= 10n) {
+    const probe = planner.plan(Infinity, now++, reserve);
+    assert.equal(probe.loanUsdcUnits, (dollars * 1_000_000n).toString());
+    assert.equal(probe.fullReserve, undefined);
+    sizes.add(BigInt(probe.loanUsdcUnits));
+  }
+  assert.ok(sizes.has(25_000_000_000_000_000n));
+  assert.ok(sizes.has(reserve - 1n));
+  const full = planner.plan(Infinity, now++, reserve);
+  assert.equal(full.fullReserve, true);
+  assert.equal(full.loanUsdcUnits, reserve.toString());
+  assert.equal(full.maxLoanUsdcUnits, reserve.toString());
+  assert.equal(full.loanUsdc, Number(reserve - 1n) / 1e6, 'numeric display cannot distinguish these adjacent raw amounts');
+  planner.record(full, -1, now);
+  const refinement = Array.from({ length: 4 }, () => planner.plan(Infinity, now++, reserve)).find(p => p.reason === 'refinement');
+  assert.equal(refinement?.loanUsdcUnits, (reserve * 5n / 8n).toString());
+  assert.equal(refinement.lead?.loanUsdcUnits, reserve.toString());
+  assert.deepEqual(JSON.parse(JSON.stringify(refinement)), refinement, 'public probe including its lead is JSON-safe');
 });
 
 test('multimillion discovery keeps a shallow positive refinement in its existing fourth poll', () => {

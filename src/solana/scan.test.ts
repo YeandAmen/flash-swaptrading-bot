@@ -50,6 +50,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   let live = false;
   let reportedFee = fee;
   let returnOut = '250250000';
+  let firstOut = 3_500_000_001n;
   let usdcBalance = 1_000_000;
   let wsolBalance = 20_000;
   let wsolDrop = 0;
@@ -92,7 +93,6 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       assert.equal(first ? outputMint : inputMint, WRAPPED_SOL);
       const slippageBps = Number(params.get('slippageBps'));
       assert.ok(slippageBps === 1 || slippageBps === 5);
-      const firstOut = 3_500_000_001n;
       const minimum = (out: bigint, roundUp: boolean) => (out * BigInt(10_000 - slippageBps) + (roundUp ? 9_999n : 0n)) / 10_000n;
       if (!first) assert.equal(params.get('amount'), String(minimum(firstOut, !live)));
       const outAmount = first ? String(firstOut) : returnOut;
@@ -294,6 +294,101 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       assert.deepEqual(result.routes, []);
     }
     assert.equal(jupiterRequests, startingRequests);
+  });
+  await t.test('unlimited raw sizing preserves the exact quote, fee and encoded principal above 2^53', async (t) => {
+    const configured = { ...config, loanUsdc: Infinity };
+    const original = { available: availableUsdcUnits, firstOut, returnOut };
+    t.after(() => { availableUsdcUnits = original.available; firstOut = original.firstOut; returnOut = original.returnOut; });
+    const requestedUnits: bigint[] = [];
+    const fixtureFetch = globalThis.fetch;
+    t.mock.method(globalThis, 'fetch', (input: URL | RequestInfo, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.origin === 'https://api.jup.ag' && url.searchParams.get('inputMint') === USDC) {
+        requestedUnits.push(BigInt(url.searchParams.get('amount')!));
+      }
+      return fixtureFetch(input, init);
+    });
+    const planned = 9_007_199_254_740_993n;
+    for (const [available, fullReserve, expected, oneUnitShort] of [
+      [planned + 1_006n, false, planned, false],
+      [planned + 1_006n, true, planned + 1_006n, false],
+      [planned - 2n, false, planned - 2n, false],
+      [planned + 1_006n, false, planned, true],
+    ] as const) {
+      availableUsdcUnits = available;
+      requestedUnits.length = 0;
+      firstOut = expected * 14n + 1n;
+      // The fixture fee rounds up to 90,071,992,548 micro-USDC, and 6,400 lamports costs 458 micro-USDC.
+      const guarantee = expected + 90_071_992_548n + 458n + 50_000n - (oneUnitShort ? 1n : 0n);
+      returnOut = ((guarantee * 10_000n + 9_998n) / 9_999n).toString();
+      let handoffs = 0;
+      const before = simulationCount;
+      const result = await scanSolanaCycle({ ...configured, plannedLoanUnits: planned, useFullReserve: fullReserve }, async candidate => {
+        handoffs++;
+        assert.equal(candidate.loan, expected);
+        const compiled = getCompiledTransactionMessageDecoder().decode(candidate.transaction.messageBytes);
+        if (compiled.version !== 0) assert.fail('Expected a v0 transaction');
+        const kamino = compiled.instructions.filter(ix => compiled.staticAccounts[ix.programAddressIndex] === KAMINO);
+        assert.deepEqual(kamino.map(ix => Buffer.from(ix.data!).readBigUInt64LE(8)), [expected, expected]);
+      });
+      assert.equal(result.loanUsdcUnits, expected.toString());
+      assert.equal(result.availableUsdcUnits, available.toString());
+      assert.equal(result.flashFeeUsdcUnits, '90071992548');
+      assert.equal(result.flashFeeUsdc, 90_071.992548);
+      assert.deepEqual(requestedUnits, [expected, expected]);
+      assert.ok(result.routes.every(route => route.quotedNetBeforeNetworkUsdc === (oneUnitShort ? 0.050457 : 0.050458)));
+      assert.ok(result.routes.every(route => oneUnitShort ? route.status === 'below-profit-floor' : route.qualified), JSON.stringify(result.routes));
+      assert.equal(handoffs, oneUnitShort ? 0 : 1);
+      assert.equal(simulationCount - before, oneUnitShort ? 0 : 2);
+      assert.doesNotThrow(() => JSON.stringify(result));
+    }
+  });
+  await t.test('planner overrides require unlimited ordinary mode and a repayable u64 amount', async (t) => {
+    const original = availableUsdcUnits;
+    t.after(() => { availableUsdcUnits = original; });
+    const noSubmit = async () => assert.fail('An unprofitable or out-of-range candidate was handed off');
+    const unlimited = { ...config, loanUsdc: Infinity };
+    const maxU64 = (1n << 64n) - 1n;
+    const before = jupiterRequests;
+    for (const plannedLoanUnits of [-1n, 999_999n, maxU64 + 1n]) {
+      await assert.rejects(scanSolanaCycle({ ...unlimited, plannedLoanUnits }, noSubmit), /Planned loan size/);
+    }
+    for (const override of [{ plannedLoanUnits: 250_000_000n }, { useFullReserve: true }]) {
+      await assert.rejects(scanSolanaCycle({ ...config, ...override }, noSubmit), /unlimited ordinary/);
+      await assert.rejects(scanSolanaCycle({ ...unlimited, ...override }, noSubmit, 'manual'), /unlimited ordinary/);
+    }
+    const largestRepayable = 18_446_559_608_113_470_487n;
+    for (const unrepayable of [largestRepayable + 1n, maxU64]) {
+      availableUsdcUnits = unrepayable;
+      const result = await scanSolanaCycle({ ...unlimited, useFullReserve: true }, noSubmit);
+      assert.equal(result.status, 'loan-unavailable');
+      assert.equal(result.loanUsdcUnits, unrepayable.toString());
+      assert.deepEqual(result.routes, []);
+    }
+    assert.equal(jupiterRequests, before);
+    availableUsdcUnits = maxU64;
+    const atBoundary = await scanSolanaCycle({ ...unlimited, plannedLoanUnits: largestRepayable }, noSubmit);
+    assert.equal(atBoundary.status, 'scanned');
+    assert.equal(BigInt(atBoundary.loanUsdcUnits) + BigInt(atBoundary.flashFeeUsdcUnits!), maxU64);
+    assert.ok(atBoundary.routes.every(route => route.status === 'below-profit-floor'));
+    assert.equal(jupiterRequests, before + 4);
+  });
+  await t.test('rejects a Jupiter output larger than u64 before requesting the next swap', async (t) => {
+    const fixtureFetch = globalThis.fetch;
+    t.mock.method(globalThis, 'fetch', async (input: URL | RequestInfo, init?: RequestInit) => {
+      const response = await fixtureFetch(input, init);
+      const url = new URL(String(input));
+      if (url.origin !== 'https://api.jup.ag') return response;
+      assert.equal(url.searchParams.get('inputMint'), USDC);
+      const swap = await response.json();
+      swap.outAmount = (1n << 64n).toString();
+      return Response.json(swap);
+    });
+    const before = jupiterRequests, beforeSim = simulationCount;
+    const result = await scanSolanaCycle(config, async () => assert.fail('A route with a non-u64 output was handed off'));
+    assert.ok(result.routes.every(route => route.status === 'quote-error' && route.detail?.includes('u64')));
+    assert.equal(jupiterRequests - before, 2);
+    assert.equal(simulationCount, beforeSim);
   });
   await t.test('prices a missing ATA in parallel with the message fee and waits for both before simulation', async (t) => {
     const fetchFixture = globalThis.fetch;

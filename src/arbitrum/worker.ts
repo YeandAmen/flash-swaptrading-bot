@@ -130,6 +130,7 @@ export class ArbitrumWorker {
 
   summary = {
     mode: (this.enabled ? 'paper' : 'off') as 'off' | 'paper' | 'live',
+    loanLimitMode: Number.isFinite(MEV.maxLoanUsd) ? 'usd-cap' : 'lender-liquidity',
     canArm: this.enabled && this.executionEnabled,
     status: this.enabled ? 'Starting' : 'Disabled',
     block: 0, pools: 0, routes: 0, simulated: 0, updatedAt: 0, netEstimateUsd: null as number | null,

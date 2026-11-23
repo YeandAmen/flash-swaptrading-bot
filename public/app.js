@@ -110,6 +110,13 @@ function networkGas(value, unit) {
   return `${Number(value).toLocaleString('en-US', { maximumFractionDigits: 9 })} ${unit}`;
 }
 
+function networkUsdc(rawUnits, fallback) {
+  if (typeof rawUnits !== 'string' || !/^\d{1,20}$/.test(rawUnits)) return networkGas(fallback, 'USDC');
+  const units = BigInt(rawUnits);
+  const fraction = (units % 1_000_000n).toString().padStart(6, '0').replace(/0+$/, '');
+  return `${(units / 1_000_000n).toLocaleString('en-US')}${fraction ? '.' + fraction : ''} USDC`;
+}
+
 function setNetworkMarkup(id, html) {
   const element = $(id);
   if (element.innerHTML !== html) element.innerHTML = html;
@@ -244,7 +251,8 @@ function renderArbitrum(arb) {
     ? ` · Quoted loans up to ${usd(largestLoan, 0)}` : '';
   const screened = Number.isSafeInteger(arb?.prunedRoutes) && arb.prunedRoutes > 0
     ? ` · ${networkNumber(arb.prunedRoutes)} quotes screened out` : '';
-  $('arbitrumStatus').textContent = status + quoteDetail + depth + screened + arbitrumRecoveryDetail(arb?.quoteRecovery)
+  const loanSizing = arb?.loanLimitMode === 'lender-liquidity' && scanned ? ' · Loan size follows lender liquidity' : '';
+  $('arbitrumStatus').textContent = status + quoteDetail + depth + loanSizing + screened + arbitrumRecoveryDetail(arb?.quoteRecovery)
     + (scanned ? networkAge(arb.updatedAt) : '');
   const pathStatus = $('arbitrumPathStatus');
   pathStatus.hidden = !arb?.pathStatus || arb.mode === 'off';
@@ -298,10 +306,11 @@ function renderSolana(solana) {
   const qualified = routes?.filter((route) => route.qualified).length;
   const status = completed && qualified !== undefined
     ? `${qualified} qualifying ${qualified === 1 ? 'route' : 'routes'}` : solana?.status;
-  const principal = Number.isFinite(result?.loanUsdc) ? ` · ${networkGas(result.loanUsdc, 'USDC')} loan` : '';
+  const principal = Number.isFinite(result?.loanUsdc) ? ` · ${networkUsdc(result.loanUsdcUnits, result.loanUsdc)} loan` : '';
   const probe = solana?.marketProbe;
   const sizeDetail = completed && probe && Number.isFinite(probe.maxLoanUsdc)
-    ? ` · ${probe.reason === 'refinement' ? 'Size refinement' : 'Depth scan'} · ${probe.limitMode === 'lender-liquidity' ? 'available to borrow' : 'cap'} ${networkGas(probe.maxLoanUsdc, 'USDC')}` : '';
+    ? ` · ${probe.reason === 'refinement' ? 'Size refinement' : 'Depth scan'} · ${probe.limitMode === 'lender-liquidity'
+      ? 'available to borrow ' + networkUsdc(result?.availableUsdcUnits, probe.maxLoanUsdc) : 'cap ' + networkGas(probe.maxLoanUsdc, 'USDC')}` : '';
   $('solanaStatus').textContent = (status || 'Solana state unavailable.') + principal + sizeDetail + networkAge(checkedAt);
   $('solanaSlot').textContent = result?.slot > 0 ? networkNumber(result.slot) : '–';
   $('solanaRoutes').textContent = routes ? networkNumber(routes.length) : '–';

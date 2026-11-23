@@ -9,7 +9,7 @@ import {
 import { redactDiagnostic } from '../diagnostics.js';
 import { validSolanaSwapLossUsdc, type FlashTest } from '../network-test.js';
 import { lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
-import { DEFAULT_SOLANA_LOAN_USDC, isValidSolanaLoanLimit, MAX_SAFE_SOLANA_LOAN_USDC } from './market.js';
+import { DEFAULT_SOLANA_LOAN_USDC, isValidSolanaLoanLimit, MAX_SAFE_SOLANA_LOAN_USDC, MAX_SOLANA_LOAN_UNITS } from './market.js';
 import {
   createKaminoFlashInstructions, createWalletAta, decodeKaminoUsdcReserve, decodeLookupTable, kaminoRepayment,
   JUPITER, KAMINO_MARKET_LOOKUP, KAMINO_USDC_RESERVE, MAINNET_GENESIS, SOLANA_PUBLIC_RPC, USDC, WRAPPED_SOL,
@@ -69,6 +69,9 @@ export interface SolanaScanConfig {
   jupiterApiKey?: string;
   loanUsdc?: number;
   clampLoanToReserve?: boolean;
+  // Unlimited ordinary planning keeps token amounts in atomic units through transaction assembly.
+  plannedLoanUnits?: bigint;
+  useFullReserve?: boolean;
   minNetUsdc?: number;
   maxFeeLamports?: number;
   venuePair?: VenuePair;
@@ -149,9 +152,12 @@ export interface SolanaScanResult {
   wallet: Address;
   walletSol: number;
   loanUsdc: number;
+  loanUsdcUnits: string;
   slippageBps: number;
   flashFeeUsdc: number | null;
+  flashFeeUsdcUnits: string | null;
   availableUsdc: number;
+  availableUsdcUnits: string;
   routes: SolanaRoute[];
   status: 'scanned' | 'loan-unavailable';
 }
@@ -202,7 +208,9 @@ export function solanaTestMinimums(test?: Omit<SolanaFlashTest, 'id'> | null) {
 
 function rawAmount(value: string): bigint {
   if (typeof value !== 'string' || !/^\d{1,20}$/.test(value)) throw new Error('Jupiter returned an invalid token amount');
-  return BigInt(value);
+  const amount = BigInt(value);
+  if (amount > MAX_SOLANA_LOAN_UNITS) throw new Error('Token amount exceeds u64');
+  return amount;
 }
 
 function usdcUnits(raw: bigint): number {
@@ -217,6 +225,7 @@ export async function buildSwap(
   wallet: Address, input: Address, output: Address, destination: Address,
   amount: bigint, venues: ReturnVenue | readonly ReturnVenue[], apiKey?: string, slippageBps = TEST_SLIPPAGE_BPS, signal?: AbortSignal,
 ): Promise<JupiterBuild | null> {
+  if (amount <= 0n || amount > MAX_SOLANA_LOAN_UNITS) throw new Error('Jupiter input amount is outside the token u64 range');
   const allowedVenues: readonly string[] = typeof venues === 'string' ? [venues] : venues;
   const url = new URL(JUPITER_BUILD);
   url.search = new URLSearchParams({
@@ -348,9 +357,17 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   const venues = config.venuePair ?? solanaVenuePairs[0];
   const limits = solanaTestMinimums(test);
   const unlimited = config.loanUsdc === Infinity;
+  const { plannedLoanUnits, useFullReserve } = config;
+  if ((plannedLoanUnits !== undefined || useFullReserve) && (!unlimited || requestedTest)) {
+    throw new Error('Raw reserve sizing requires an unlimited ordinary scan');
+  }
+  if (plannedLoanUnits !== undefined && (typeof plannedLoanUnits !== 'bigint'
+    || plannedLoanUnits < USDC_UNITS || plannedLoanUnits > MAX_SOLANA_LOAN_UNITS)) {
+    throw new Error('Planned loan size must be at least 1 USDC and fit in u64 token units');
+  }
   if (unlimited && test) throw new Error('Loan size for a manual Solana test must be between 1 and 100000 USDC');
   const requested = unlimited ? DEFAULT_SOLANA_LOAN_USDC : config.loanUsdc ?? DEFAULT_SOLANA_LOAN_USDC;
-  const configuredLoan = usdcAmount(requested, 1, test ? 100_000 : MAX_SAFE_SOLANA_LOAN_USDC,
+  const configuredLoan = plannedLoanUnits ?? usdcAmount(requested, 1, test ? 100_000 : MAX_SAFE_SOLANA_LOAN_USDC,
     'Loan size', requested <= 100_000 ? Math.round : Math.floor);
   const desiredLoan = limits.minimumLoan !== undefined && limits.minimumLoan > configuredLoan ? limits.minimumLoan : configuredLoan;
   const gasOnlyTest = !!test && limits.minimumNet === undefined;
@@ -378,15 +395,16 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   if (!account || account.executable) throw new Error('Could not load the Kamino USDC reserve');
   const reserve = decodeKaminoUsdcReserve(account.owner, Buffer.from(account.data[0], 'base64'));
   const clamp = !test && (unlimited || config.clampLoanToReserve === true);
-  const loan = clamp && desiredLoan > reserve.available ? reserve.available : desiredLoan;
+  const loan = useFullReserve || (clamp && desiredLoan > reserve.available) ? reserve.available : desiredLoan;
   const repay = reserve.active && loan >= USDC_UNITS ? kaminoRepayment(loan, reserve) : null;
   const result: SolanaScanResult = {
     chain: 'solana', mode: execute ? 'live' : 'paper', checkedAt: new Date().toISOString(),
     slot: Number(context.slot), wallet, walletSol: Number(balance) / Number(SOL_UNITS),
-    loanUsdc: usdcUnits(loan), slippageBps, flashFeeUsdc: repay === null ? null : usdcUnits(repay - loan),
-    availableUsdc: usdcUnits(reserve.available), routes: [], status: 'loan-unavailable',
+    loanUsdc: usdcUnits(loan), loanUsdcUnits: loan.toString(), slippageBps,
+    flashFeeUsdc: repay === null ? null : usdcUnits(repay - loan), flashFeeUsdcUnits: repay === null ? null : (repay - loan).toString(),
+    availableUsdc: usdcUnits(reserve.available), availableUsdcUnits: reserve.available.toString(), routes: [], status: 'loan-unavailable',
   };
-  if (repay === null || loan > reserve.available) return result;
+  if (repay === null || repay > MAX_SOLANA_LOAN_UNITS || loan > reserve.available) return result;
   result.status = 'scanned';
 
   let submission: Promise<void | SolanaRouteDecline> | undefined;

@@ -197,18 +197,26 @@ test('Solana journals before raw send and restores one pending signature across 
       worker.stop();
     }
   });
-  await t.test('the unlimited signer accepts a finite multimillion loan and rejects an unsafe principal', async () => {
+  await t.test('the unlimited signer compares raw Kamino principals exactly through the native u64 limit', async () => {
     const worker = makeWorker(Infinity);
     await worker.initialize();
     worker.arm();
     try {
-      const loan = 12_500_000_000_000n;
-      const ordinary = { ...testCandidate(wallet, undefined, loanInstructions(loan, 2)), loan,
-        firstMinimum: candidate.firstMinimum * 50_000n, simulationSlot: 70n };
-      assert.equal((await worker.submit(ordinary))?.status, 'route-declined');
-      assert.match(worker.summary.status, /stale before final simulation/);
-      await worker.submit({ ...ordinary, loan: BigInt(Number.MAX_SAFE_INTEGER) + 1n });
-      assert.match(worker.summary.status, /loan size limit/);
+      const maxU64 = (1n << 64n) - 1n;
+      for (const loan of [(1n << 53n) + 1n, maxU64]) {
+        const ordinary = { ...testCandidate(wallet, undefined, loanInstructions(loan, 2)), loan,
+          firstMinimum: loan, simulationSlot: 70n };
+        for (const field of ['borrow', 'repay'] as const) {
+          const mismatched = loanInstructions(loan, 2);
+          mismatched[field].writeBigUInt64LE(loan - 1n, 8);
+          await worker.submit({ ...ordinary, transaction: testCandidate(wallet, undefined, mismatched).transaction });
+          assert.match(worker.summary.status, /missing complete swap/);
+        }
+        assert.equal((await worker.submit(ordinary))?.status, 'route-declined');
+        assert.match(worker.summary.status, /stale before final simulation/);
+        await worker.submit({ ...ordinary, loan: maxU64 + 1n });
+        assert.match(worker.summary.status, /loan size limit/);
+      }
       assert.equal(simulationCount, 0);
       assert.equal(rawSendCount, 0);
     } finally {

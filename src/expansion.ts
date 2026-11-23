@@ -5,7 +5,7 @@ import { NetworkActivity } from './network-activity.js';
 import { LIGHTHOUSE } from './solana/guard.js';
 import { JUPITER, KAMINO } from './solana/protocol.js';
 import { ArbitrumWorker } from './arbitrum/worker.js';
-import { isValidSolanaLoanLimit, MAX_SAFE_SOLANA_LOAN_USDC, SolanaMarketPlanner, type SolanaMarketProbe } from './solana/market.js';
+import { isValidSolanaLoanLimit, SolanaMarketPlanner, type SolanaMarketProbe } from './solana/market.js';
 import type { SolanaScanResult } from './solana/scan.js';
 import type { SolanaLiveWorker } from './solana/worker.js';
 
@@ -85,13 +85,16 @@ export function startExpansion() {
       solanaMarket ??= new SolanaMarketPlanner(solanaDiscoveryPairs.length);
       const now = Date.now();
       const lastReserveAge = solanaResult ? now - Date.parse(solanaResult.checkedAt) : Infinity;
-      const recentReserve = lastReserveAge >= 0 && lastReserveAge <= 60_000 ? solanaResult?.availableUsdc : undefined;
+      const recentReserve = lastReserveAge >= 0 && lastReserveAge <= 60_000 && solanaResult?.availableUsdcUnits !== undefined
+        ? BigInt(solanaResult.availableUsdcUnits) : undefined;
       probe = solanaMarket.plan(config.loanUsdc, now, recentReserve);
       config.venuePair = solanaDiscoveryPairs[probe.venue];
       config.compareReturnVenues = true;
       config.clampLoanToReserve = true;
-      // On the full-reserve rung use this scan's exact Kamino balance, even if it grew since the last read.
-      config.loanUsdc = probe.fullReserve ? MAX_SAFE_SOLANA_LOAN_USDC : probe.loanUsdc;
+      if (lenderLimited) {
+        config.plannedLoanUnits = BigInt(probe.loanUsdcUnits);
+        config.useFullReserve = probe.fullReserve;
+      } else config.loanUsdc = probe.loanUsdc;
     }
     solanaResult = await scanSolanaCycle(config, execution?.scanHandoff(), test ?? undefined);
     if (test) execution?.recordTestScan(test.id, solanaResult.routes.length);
@@ -101,7 +104,11 @@ export function startExpansion() {
     solanaUpdatedAt = Date.now();
     if (probe) {
       probe.loanUsdc = solanaResult.loanUsdc;
-      if (lenderLimited) probe.maxLoanUsdc = Math.min(solanaResult.availableUsdc, MAX_SAFE_SOLANA_LOAN_USDC);
+      probe.loanUsdcUnits = solanaResult.loanUsdcUnits;
+      if (lenderLimited) {
+        probe.maxLoanUsdc = solanaResult.availableUsdc;
+        probe.maxLoanUsdcUnits = solanaResult.availableUsdcUnits;
+      }
       const { routes, checkedAt } = solanaResult;
       const quotes = routes.flatMap(({ status, quotedNetBeforeNetworkUsdc }) =>
         (status === 'below-profit-floor' || status === 'simulated') && quotedNetBeforeNetworkUsdc !== undefined

@@ -11,7 +11,7 @@ import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest, type Fl
 import { writeJson } from '../persistence.js';
 import { readPrivateFile, writePrivateFile } from '../private-file.js';
 import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount, verifyLighthouseDeployment } from './guard.js';
-import { DEFAULT_SOLANA_LOAN_USDC, isValidSolanaLoanLimit } from './market.js';
+import { DEFAULT_SOLANA_LOAN_USDC, isValidSolanaLoanLimit, MAX_SOLANA_LOAN_UNITS } from './market.js';
 import { createWalletAta, JUPITER, KAMINO, MAINNET_GENESIS, SOLANA_PUBLIC_RPC, USDC, WRAPPED_SOL } from './protocol.js';
 import {
   matchesSolanaSwapLossBalances, solanaTestMinimums, SOLANA_TEST_MAX_FEE_LAMPORTS,
@@ -355,7 +355,7 @@ export class SolanaLiveWorker {
     if (!isValidSolanaLoanLimit(loanLimit)) {
       throw new Error('Invalid Solana live loan cap');
     }
-    this.maximumLoan = loanLimit === Infinity ? BigInt(Number.MAX_SAFE_INTEGER) : BigInt(Math.floor(loanLimit * 1_000_000));
+    this.maximumLoan = loanLimit === Infinity ? MAX_SOLANA_LOAN_UNITS : BigInt(Math.floor(loanLimit * 1_000_000));
     const minimum = config.minNetUsdc ?? 0.05;
     const cap = config.maxFeeLamports ?? 50_000;
     const usdCapInMicroUsdc = Math.floor(maximumNetworkFeeUsd * 1_000_000);
