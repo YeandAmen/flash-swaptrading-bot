@@ -35,6 +35,7 @@ const NORMAL_GAS_PADDING_PCT = 0.25;
 const SLOT_MS = 12_000;
 const FALLBACK_LEAD_MS = 5_000;
 const DIRECT_QUOTE_GRACE_MS = 75;
+const PRIVATE_SETTLEMENT_GRACE_MS = 150;
 const CADENCE_RECHECK_MS = 60_000;
 const GAS_ONLY_TEST_MS = 6 * 60_000;
 const GAS_ONLY_TEST_ROUTES = 4;
@@ -409,6 +410,7 @@ export class MevSearcher {
   private refreshingPools: Promise<void> | null = null;
   private stateReadError: string | null = null;
   private recovery: Promise<void> | null = null;
+  private settlementWaitHead?: Hex;
   private bundleReserved = false;
   private contractReady = false;
   private armGeneration = 0;
@@ -1076,8 +1078,21 @@ export class MevSearcher {
     generation: number, observedNet: (usd: number) => void, broadenSizes: boolean, startup?: ReadonlyMap<Candidate, Offer>): Promise<boolean> {
     // If verification finishes during this batch, its earlier simulations still used paper overrides.
     const startedInPaper = this.startupCapture && !this.contractReady;
+    const verifiedContract = this.selectedContract;
+    const release = this.file.proxyRelease;
+    const protectedMode = MEV.directProtected;
+    let waitedForSettlement = false;
+    const ordinarySettlementScan = () => !CONFIG.forkMode && MEV.submission === 'direct' && MEV.directProtected === protectedMode && !startup && !startedInPaper
+      && this.liveArmed(generation) && this.contractReady && verifiedContract !== null && this.selectedContract === verifiedContract
+      && this.file.proxyRelease === release && !this.deploying && !this.file.deployTx && !this.activeGasOnlyTest()
+      && !this.host.tradePending();
+    const prior = this.pending?.privateSubmission && this.pending.kind === 'direct' && !this.pending.opp.gasOnlyTestId
+      && this.pending.opp.block < Number(r.blockNumber) && ordinarySettlementScan() && this.canMeetSendDeadline(r) ? this.pending : null;
+    const recovery = this.recovery;
+    const heldByPrior = () => prior !== null && prior === this.pending && ordinarySettlementScan();
     const canTryLive = () => !startedInPaper && this.liveArmed(generation) && this.contractReady && !this.deploying && !this.walletPending()
-      && (!startup || !this.activeGasOnlyTest()) && (MEV.directProtected || !this.activeGasOnlyTest()?.privateSubmission);
+      && (!startup || !this.activeGasOnlyTest()) && (MEV.directProtected || !this.activeGasOnlyTest()?.privateSubmission)
+      && (!waitedForSettlement || (ordinarySettlementScan() && this.canMeetSendDeadline(r)));
     const canTryFallback = () => canTryLive() && !this.host.tradePending()
       && (CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS);
     const allowFallback = canTryFallback();
@@ -1104,7 +1119,7 @@ export class MevSearcher {
       for (const [index, offer] of ranked) {
         if (signed || !canTryLive()) break;
         ready.delete(index);
-        await this.sendLive(offer, r, generation, Boolean(startup));
+        await this.sendLive(offer, r, generation, Boolean(startup), waitedForSettlement ? ordinarySettlementScan : undefined);
         signed = Boolean(offer.offer.opp.hash);
       }
     };
@@ -1132,6 +1147,17 @@ export class MevSearcher {
     const shortlisted = await finished;
     const offers = shortlisted.flatMap((route) => route?.primary ? [route.primary] : [])
       .sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0);
+    // Only the existing receipt/nonce check can release this reservation. Give it
+    // a fraction of this head's spare signing time once across both shortlist waves.
+    if (!signed && offers.length && prior && recovery && recovery === this.recovery && this.settlementWaitHead !== r.hash && heldByPrior()
+      && r.blockNumber >= BigInt(prior.target) + RECEIPT_CONFIRMATIONS) {
+      const spareMs = r.timestamp * 1000 + SLOT_MS - DIRECT_SEND_LEAD_MS - Date.now();
+      if (spareMs > 0) {
+        this.settlementWaitHead = r.hash;
+        waitedForSettlement = true;
+        await this.waitForPrivateSettlement(recovery, Math.min(spareMs, PRIVATE_SETTLEMENT_GRACE_MS));
+      }
+    }
     let fallback: Offer | undefined;
     if (!signed && canTryLive()) {
       // A wallet reconciliation may also have finished while evaluations were in flight.
@@ -1150,7 +1176,7 @@ export class MevSearcher {
               const { A, B } = extra.offer.candidate;
               this.cooldown.delete(`${poolIdentity(A)}|${poolIdentity(B)}`);
             }
-            await this.sendLive(extra, r, generation, Boolean(startup));
+            await this.sendLive(extra, r, generation, Boolean(startup), waitedForSettlement ? ordinarySettlementScan : undefined);
           }
         }
       }
@@ -1163,9 +1189,20 @@ export class MevSearcher {
         const best = [...previous, ...offers].sort((a, b) => a.score > b.score ? -1 : a.score < b.score ? 1 : 0).slice(0, 2);
         this.startupHint = { block: r, nextMaxBase, proxy: proxyContract, release: proxyRelease, offers: best };
       }
-      for (const offer of offers.reverse()) this.record(offer.opp);
+      const held = heldByPrior() && (waitedForSettlement || this.canMeetSendDeadline(r)) ? prior : null;
+      for (const offer of offers.reverse()) {
+        this.record(held ? { ...offer.opp, status: 'skipped',
+          note: `Block-pinned estimate held while the prior private order (target block ${held.target}) awaits receipt and nonce reconciliation.` } : offer.opp);
+      }
     }
     return Boolean(fallback?.opp.hash || offers.some((offer) => offer.opp.hash));
+  }
+
+  private async waitForPrivateSettlement(recovery: Promise<void>, waitMs: number) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>(resolve => { timer = setTimeout(resolve, waitMs); });
+    try { await Promise.race([recovery, timeout]); }
+    finally { clearTimeout(timer); }
   }
 
   private async scanGasOnlyTest(test: GasOnlyTest, candidates: Candidate[], r: BlockRead, nextMaxBase: bigint,
@@ -1616,7 +1653,7 @@ export class MevSearcher {
     }
   }
 
-  private async sendLive(prepared: PreparedOffer, r: BlockRead, generation: number, startup = false) {
+  private async sendLive(prepared: PreparedOffer, r: BlockRead, generation: number, startup = false, settlementEligible?: () => boolean) {
     const exec = this.host.exec;
     const account = this.host.account;
     const { offer, contract, ethUsd, data, gas, gasBudget, tip, fees, target, minimumProfit, net, test, premium, privateSubmission } = prepared;
@@ -1624,8 +1661,9 @@ export class MevSearcher {
     const { opp } = offer;
     const skip = (note: string) => { this.skipOpportunity(opp, note); };
     const stillLive = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
-      && !this.deploying && !this.host.tradePending() && this.canMeetSendDeadline(r);
-    const canSend = () => stillLive() && (!startup || !this.activeGasOnlyTest()) && (!offer.path || (this.pathRelease === offer.release && !this.activeGasOnlyTest())) && (!test || this.activeGasOnlyTest() === test);
+      && !this.deploying && !this.host.tradePending() && this.canMeetSendDeadline(r) && (!settlementEligible || settlementEligible());
+    const canSend = () => stillLive() && (!settlementEligible || !this.walletPending()) && (!startup || !this.activeGasOnlyTest())
+      && (!offer.path || (this.pathRelease === offer.release && !this.activeGasOnlyTest())) && (!test || this.activeGasOnlyTest() === test);
     if (!canSend()) return skip('target slot passed or MEV became unavailable before signing');
     if (this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
     try {

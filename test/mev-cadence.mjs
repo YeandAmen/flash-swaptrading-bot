@@ -416,7 +416,7 @@ try {
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
     protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport,
-    pathHistory, pathCandidates, pendingForPath, startup, snapshotTiming, atJournal }) {
+    pathHistory, pathCandidates, pendingForPath, startup, snapshotTiming, atJournal, beforeBlock }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -514,7 +514,7 @@ try {
           assert.equal(decoded.args[0], pathRelease);
           return { data: hash(pendingForPath ? pendingForPath(decoded.args[1]) : pendingProfit) };
         }
-        const inner = startup ? decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data }).args[1] : data;
+        const inner = searcher.file.proxyRelease ? decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data }).args[1] : data;
         const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: inner }).args[0];
         return { data: hash(pendingForToken ? pendingForToken(order.token) : pendingProfit) };
       }
@@ -544,6 +544,7 @@ try {
         searcher.queueGasOnlyTest(testId, maximumTestGasUsd);
       }
       if (startup === 'disarmed-before') searcher.disarm();
+      beforeBlock?.(searcher, block);
       await searcher.onBlock(block, historical);
       if (startup) {
         assert.ok(paperQuoteTokens.size > 0 && liveQuoteTokens.size === 0);
@@ -589,6 +590,150 @@ try {
       Object.assign(CONFIG, originalConfig);
       Date.now = originalNow;
     }
+  }
+
+  // Start a live-style scan with the previous private order still holding the wallet. Every RPC,
+  // nonce and signer is local to this fixture. Complete recovery only after the shortlist is ready.
+  async function scanWhileReserved({ target = 98, spareMs = 1000, outcome = 'release', change,
+    pendingProfit = coversGas, priorPrivate = true, priorKind = 'direct', priorManual = false, fork = false, repeatShortlist = false } = {}) {
+    const waits = [], estimates = new Map();
+    let reconciles = 0, oldOrder, completedQuotes = 0, workerUnderTest, ingress = 0;
+    const result = await scan({ age: minute, profit: coversGas, protectedDirect: true,
+      pendingForToken() {
+        if (change === 'release-at-final-read') workerUnderTest.file.proxyRelease = hash(70);
+        if (change === 'mode-at-final-read') MEV.submission = 'bundle';
+        return pendingProfit;
+      },
+      atSign() { if (change === 'release-at-sign') workerUnderTest.file.proxyRelease = hash(70); },
+      atJournal() { if (change === 'mode-at-journal') MEV.submission = 'bundle'; },
+      privateTransport: change === 'mode-at-journal' ? async () => { ingress++; throw Error('unexpected private ingress'); } : undefined,
+      beforeBlock(worker, block) {
+        workerUnderTest = worker;
+        worker.file.proxyRelease = proxyReleaseHash;
+        worker.file.proxyContract = address(2);
+        worker.scanPaths = () => undefined;
+        CONFIG.allowLiveTrading = true;
+        CONFIG.forkMode = fork;
+        let clock = block.timestamp * 1000 + 12_000 - 1_500 - spareMs;
+        Date.now = () => clock;
+        oldOrder = { kind: priorKind, privateSubmission: priorPrivate, hash: hash(90), nonce: 7, contract: address(2),
+          target: String(target), ethUsd: 2000, opp: { block: 95, t: clock - 45_000, status: 'sent',
+            ...(priorManual ? { gasOnlyTestId: 'prior-manual-test' } : {}) } };
+        worker.file.pending = oldOrder;
+        const evaluate = worker.evaluate.bind(worker);
+        worker.evaluate = async (...args) => {
+          const route = await evaluate(...args);
+          completedQuotes++;
+          if (route?.primary) estimates.set(route.primary.opp.symbol, { ...route.primary.opp });
+          return route;
+        };
+        if (repeatShortlist) {
+          const shortlist = worker.scanShortlist.bind(worker);
+          worker.scanShortlist = async (...args) => {
+            const first = await shortlist(...args);
+            assert.equal(first, false);
+            return shortlist(...args);
+          };
+        }
+        let settle;
+        const recovery = new Promise(resolve => { settle = resolve; });
+        let inFlight, recoverCalls = 0;
+        const reconcile = MevSearcher.prototype.reconcileWallet.bind(worker);
+        worker.recover = height => {
+          assert.equal(height, block.blockNumber);
+          assert.equal(++recoverCalls, 1);
+          return fork ? Promise.resolve() : recovery;
+        };
+        worker.reconcileWallet = height => {
+          reconciles++;
+          const result = reconcile(height);
+          inFlight = worker.recovery;
+          return result;
+        };
+        const wait = worker.waitForPrivateSettlement.bind(worker);
+        worker.waitForPrivateSettlement = (captured, ms) => {
+          assert.equal(captured, inFlight, 'reuse the original in-flight receipt/nonce check');
+          assert.equal(completedQuotes, baseLimit, 'wait only after the last first-wave simulation');
+          assert.equal(worker.file.pending, oldOrder);
+          waits.push(ms);
+          if (outcome === 'timeout') {
+            clock += ms;
+            return wait(captured, 0);
+          }
+          queueMicrotask(() => {
+            if (outcome === 'release') worker.file.pending = null;
+            if (change === 'disarm') worker.disarm();
+            if (change === 'manual') worker.queueGasOnlyTest('manual-during-wait', 2);
+            if (change === 'deploy') worker.deploying = true;
+            if (change === 'spot') worker.host.tradePending = () => true;
+            if (change === 'contract') worker.file.proxyContract = address(3);
+            if (change === 'replacement') worker.file.pending = { ...oldOrder, hash: hash(92) };
+            settle();
+          });
+          return wait(captured, ms);
+        };
+      } });
+    assert.equal(reconciles, 1, 'one ordinary onBlock reconciliation per scan');
+    return { ...result, waits, oldOrder, estimates, ingress };
+  }
+
+  const released = await scanWhileReserved();
+  assert.deepEqual(released.waits, [150]);
+  assert.equal(released.signed.length, 1);
+  assert.equal(released.submitted.length, 1);
+  assert.deepEqual([...released.finalStates.keys()].sort(), ['pending', 'pinned']);
+  assert.deepEqual(released.finalStates.get('pinned'), released.finalStates.get('pending'));
+  assert.deepEqual(released.finalStates.get('pinned'), {
+    to: released.signed[0].to, data: released.signed[0].data, gas: released.signed[0].gas,
+  }, 'releasing the old wallet requires both final reads of the exact new order');
+  const repriced = await scanWhileReserved({ pendingProfit: underGas });
+  assert.deepEqual(repriced.waits, [150]);
+  assert.ok(repriced.finalStates.has('pending'));
+  assert.equal(repriced.signed.length, 0);
+  assert.equal(repriced.submitted.length, 0);
+
+  for (const [options, expectedWaits] of [
+    [{ outcome: 'timeout', repeatShortlist: true }, [150]], [{ outcome: 'timeout', spareMs: 31 }, [31]], [{ outcome: 'retained' }, [150]],
+    [{ target: 99, outcome: 'timeout' }, []], [{ spareMs: 0, outcome: 'timeout' }, []],
+    [{ priorPrivate: false }, []], [{ priorKind: 'bundle' }, []], [{ priorManual: true }, []], [{ fork: true }, []],
+  ]) {
+    const held = await scanWhileReserved(options);
+    assert.deepEqual(held.waits, expectedWaits, JSON.stringify(options));
+    assert.equal(held.searcher.file.pending, held.oldOrder);
+    assert.equal(held.signed.length, 0);
+    assert.equal(held.finalStates.size, 0);
+    const rows = held.searcher.file.recent.filter(row => held.estimates.has(row.symbol));
+    assert.equal(rows.length, baseLimit);
+    if (options.priorPrivate === false || options.priorKind === 'bundle' || options.priorManual || options.fork || options.spareMs === 0) {
+      assert.ok(rows.every(row => !row.note.includes('receipt and nonce reconciliation')));
+      continue;
+    }
+    for (const row of rows) {
+      assert.equal(row.status, 'skipped', JSON.stringify(options));
+      assert.match(row.note, new RegExp(`^Block-pinned estimate held .*target block ${options.target ?? 98}.*receipt and nonce reconciliation`));
+      for (const field of ['sizeEth', 'grossEth', 'gasEth', 'tipEth', 'netEth', 'netUsd', 'funding']) {
+        assert.equal(row[field], held.estimates.get(row.symbol)[field], 'preserve the preflight ' + field);
+      }
+      assert.equal(row.submission, undefined);
+    }
+  }
+  for (const change of ['disarm', 'manual', 'deploy', 'spot', 'contract', 'replacement']) {
+    const changed = await scanWhileReserved({ change });
+    assert.deepEqual(changed.waits, [150], change);
+    assert.equal(changed.signed.length, 0, change);
+    assert.equal(changed.submitted.length, 0, change);
+    assert.equal(changed.finalStates.size, 0, change);
+    if (change === 'replacement') assert.equal(changed.searcher.file.pending.hash, hash(92));
+  }
+
+  for (const change of ['release-at-final-read', 'mode-at-final-read', 'release-at-sign', 'mode-at-journal']) {
+    const changed = await scanWhileReserved({ change });
+    assert.deepEqual(changed.waits, [150], change);
+    assert.ok(changed.finalStates.has('pinned') && changed.finalStates.has('pending'), change);
+    assert.equal(changed.signed.length, change.endsWith('final-read') ? 0 : 1, change);
+    assert.equal(changed.journaled.length, change === 'mode-at-journal' ? 1 : 0, change);
+    assert.equal(changed.ingress, 0, change);
+    assert.equal(changed.searcher.file.pending, null, change);
   }
 
   const warm = { age: minute, profit: coversGas, paper: true, protectedDirect: true };
