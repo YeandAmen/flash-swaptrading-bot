@@ -10,7 +10,15 @@ export type ArbitrumOrderRejection = 'daily-budget' | 'net-floor' | 'stale-quote
   | 'gas-estimate-changed' | 'simulation-unavailable' | 'execution-reverted' | 'head-rpc' | 'fee-rpc' | 'simulation-rpc'
   | 'unsupported-path';
 
-const reject = (reason: ArbitrumOrderRejection) => ({ ok: false as const, reason });
+export interface ArbitrumStaleHead {
+  at: number;
+  headBlock: number;
+  headTimestamp: number;
+  headAgeMs: number;
+  reason: 'head-behind-source' | 'quote-too-old' | 'head-clock-behind' | 'head-clock-ahead';
+}
+
+const reject = (reason: Exclude<ArbitrumOrderRejection, 'stale-quote'>) => ({ ok: false as const, reason });
 
 export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Address, owner: Address, candidate: ArbQuote | ArbPathQuote,
   ethUsd: number, minimumNetUsd: number, maximumFeeUsd: number, gasOnlyTest = false, release?: Hex) {
@@ -29,10 +37,17 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
     const minNet = gasOnlyTest ? 0n : minimumNetInAsset(minimumNetUsd, scale, assetPrice);
     if (candidate.payout <= minNet) return reject('net-floor');
     const head = await client.getBlock();
-    const stale = 'legs' in candidate ? head.number < candidate.block || head.number - candidate.block > 50n
-      : head.number > candidate.order.maxBlock + 50n;
-    if (stale || Math.abs(Date.now() - Number(head.timestamp) * 1000) > 5_000) {
-      return reject('stale-quote');
+    const at = Date.now();
+    const headTimestamp = Number(head.timestamp);
+    const headAgeMs = at - headTimestamp * 1000;
+    const lastFreshBlock = ('legs' in candidate ? candidate.block : candidate.order.maxBlock) + 50n;
+    let reason: ArbitrumStaleHead['reason'] | undefined;
+    if (path && head.number < path.block) reason = 'head-behind-source';
+    else if (head.number > lastFreshBlock) reason = 'quote-too-old';
+    else if (headAgeMs > 5_000) reason = 'head-clock-behind';
+    else if (headAgeMs < -5_000) reason = 'head-clock-ahead';
+    if (reason) {
+      return { ok: false as const, reason: 'stale-quote' as const, stale: { at, headBlock: Number(head.number), headTimestamp, headAgeMs, reason } };
     }
     // Broad snapshot quotes can take several L2 blocks. Refresh the deadline only for an exact live check.
     const deadline = head.number + 10n;

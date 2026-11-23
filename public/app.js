@@ -238,6 +238,27 @@ function arbitrumRecoveryDetail(recovery) {
   return reasons.length ? ' · ' + reasons.join(', ') : '';
 }
 
+function arbitrumStaleQuoteDetail(quote) {
+  if (!quote || !Number.isSafeInteger(quote.sourceBlock) || !Number.isSafeInteger(quote.headBlock)
+    || !Number.isFinite(quote.headAgeMs) || !(quote.at > 0)) return '';
+  const reasons = {
+    'head-behind-source': 'RPC head behind the quote block',
+    'quote-too-old': 'quote exceeded its block-age limit',
+    'head-clock-behind': 'RPC block timestamp behind the bot clock',
+    'head-clock-ahead': 'RPC block timestamp ahead of the bot clock',
+  };
+  const reason = Object.hasOwn(reasons, quote.reason) ? reasons[quote.reason] : '';
+  if (!reason || !quote.route || !quote.funding || !quote.symbol || ![6, 18].includes(quote.decimals)
+    || typeof quote.amountIn !== 'string' || !/^\d{1,39}$/.test(quote.amountIn)) return '';
+  const loan = networkTokenAmount(quote.amountIn, quote.decimals, quote.symbol);
+  const age = (Math.abs(quote.headAgeMs) / 1000).toFixed(1) + 's';
+  const timing = quote.reason === 'head-clock-behind' || quote.reason === 'head-clock-ahead' ? ' by ' + age : '';
+  const gross = Number.isFinite(quote.payoutUsd) ? ' · ' + usd(quote.payoutUsd, Math.abs(quote.payoutUsd) < 1 ? 4 : 2) + ' before gas' : '';
+  return 'Last stale quote · ' + time(quote.at) + ' · ' + quote.route + ' · ' + quote.funding + ' loan ' + loan + gross
+    + ' · quote block ' + networkNumber(quote.sourceBlock) + ', RPC head ' + networkNumber(quote.headBlock)
+    + ' · ' + reason + timing;
+}
+
 function renderArbitrum(arb) {
   const verified = arb?.deployment?.verified === true;
   const canArm = arb?.canArm && (arb.deployment ? verified : arb.executor && arb.block > 0);
@@ -266,6 +287,9 @@ function renderArbitrum(arb) {
     && sizing.bestPayoutUsd > sizing.baselineBestPayoutUsd
     ? ' · Best at fixed loan sizes was ' + networkUsd(sizing.baselineBestPayoutUsd) + ' before gas' : '';
   pathStatus.textContent = (arb?.pathStatus ?? '') + pathBlock + pathBest + fixedBest;
+  const stale = $('arbitrumStaleQuote');
+  stale.textContent = arbitrumStaleQuoteDetail(arb?.lastStaleQuote);
+  stale.hidden = !stale.textContent;
   $('arbitrumBlock').textContent = scanned ? networkNumber(arb.block) : '–';
   $('arbitrumRoutes').textContent = scanned ? networkNumber(arb.routes) : '–';
   $('arbitrumGas').textContent = networkGas(arb?.balanceEth, 'ETH');

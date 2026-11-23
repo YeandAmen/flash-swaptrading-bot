@@ -254,7 +254,9 @@ Arbitrum uses same-block quotes at several loan sizes. Every regular scan reques
 
 The current Arbitrum implementation also supports three- and four-swap cycles funded by Morpho Blue in native USDC or WETH. The scanner checks Uniswap v3 pools at the 0.01%, 0.05%, 0.3% and 1% fee tiers, plus Aero Slipstream pools, among WETH, USDC, ARB and USDG. The proxy repays the loan and sends the surplus in the borrowed token to the trading wallet. The dashboard shows completed quotes and the implementation status while older releases continue scanning.
 
-When the best fixed-size quote falls below the profit floor before gas, the scanner uses completed quotes on the same pools to estimate an intermediate loan size. It checks at most one extra size per borrowed asset against the same block. The dashboard compares the best quotes before gas. Live execution still requires at least $0.05 net after padded fees and the pending-state check.
+When no fixed-size quote covers the profit floor after the 10% payout reserve, the scanner uses quotes from the same pools and block to estimate an intermediate loan size. It checks at most one extra size per borrowed asset. The dashboard compares the best quotes before gas. Live execution requires 90% of the payout to cover both padded gas and the $0.05 minimum, followed by a pending-state simulation.
+
+If an automatic Arbitrum order fails its freshness check, the dashboard shows that order's route, loan size, quote block, and the RPC head used for the check. It distinguishes an old quote from a late or future-dated RPC header. The latest such rejection stays visible until the worker restarts.
 
 To test with fake funds, use an Arbitrum archive endpoint with state access at the selected L2 block.
 

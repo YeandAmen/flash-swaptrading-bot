@@ -18,11 +18,12 @@ const profitable: ArbQuote = {
   payout: parseEther('0.001'),
 };
 
-function clientFor({ head = 104n, preparationBlock = 100n, payout = profitable.payout, feeCap = 100_000_000n } = {}) {
+function clientFor({ head = 104n, preparationBlock = 100n, payout = profitable.payout, feeCap = 100_000_000n,
+  timestamp = BigInt(Math.floor(Date.now() / 1000)) } = {}) {
   let finalMinProfit = 0n;
   let finalDeadline = 0n;
   const client = {
-    getBlock: async () => ({ number: preparationBlock, timestamp: BigInt(Math.floor(Date.now() / 1000)) }),
+    getBlock: async () => ({ number: preparationBlock, timestamp }),
     getBlockNumber: async () => head,
     estimateGas: async () => 200_000n,
     estimateFeesPerGas: async () => ({ maxFeePerGas: feeCap, maxPriorityFeePerGas: 1_000_000n }),
@@ -72,7 +73,9 @@ test('an explicit Arbitrum test isolates the network fee exception', async () =>
     { ok: false, reason: 'net-floor' });
 });
 
-test('USDC multi-hop requires its reviewed release and protects dollar costs in six-decimal asset units', async () => {
+test('USDC multi-hop requires its reviewed release and protects dollar costs in six-decimal asset units', async t => {
+  const at = 1_800_000_000_075;
+  t.mock.method(Date, 'now', () => at);
   const path: ArbPathQuote = { asset: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', amountIn: 100_000_000n,
     decimals: 6, symbol: 'USDC', assetUsd: 0.95, loanUsd: 95, payout: 200_000n, payoutUsd: 0.19,
     block: 100n, label: 'USDC cycle', legs: [owner, contract, owner].map((pool) => ({ kind: 2, pool, tokenOut: contract, tickSpacing: 0 })) };
@@ -88,14 +91,34 @@ test('USDC multi-hop requires its reviewed release and protects dollar costs in 
   assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5), { ok: false, reason: 'unsupported-path' });
   assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5, true, arbitrumReleaseHash),
     { ok: false, reason: 'unsupported-path' });
-  for (const observedBlock of [49n, 101n]) {
+  for (const [observedBlock, reason] of [[49n, 'quote-too-old'], [101n, 'head-behind-source']] as const) {
     assert.deepEqual(await prepareArbitrumOrder(client, contract, owner, { ...path, block: observedBlock },
-      2_000, 0.05, 0.5, false, arbitrumReleaseHash), { ok: false, reason: 'stale-quote' });
+      2_000, 0.05, 0.5, false, arbitrumReleaseHash), { ok: false, reason: 'stale-quote',
+      stale: { at, headBlock: 100, headTimestamp: 1_800_000_000, headAgeMs: 75, reason } });
   }
+  assert.ok((await prepareArbitrumOrder(client, contract, owner, { ...path, block: 50n },
+    2_000, 0.05, 0.5, false, arbitrumReleaseHash)).ok);
   const prepared = await prepareArbitrumOrder(client, contract, owner, path, 2_000, 0.05, 0.5, false, arbitrumReleaseHash);
   assert.ok(prepared.ok);
   assert.equal(minimum, 105264n);
   assert.ok(Math.abs(prepared.netUsd - 0.14) < 1e-10);
+});
+
+test('two-swap freshness preserves the deadline boundary and reports signed header age at rejection', async t => {
+  const timestamp = 1_800_000_000n;
+  let now = Number(timestamp) * 1000;
+  t.mock.method(Date, 'now', () => now);
+  for (const [height, age, reason] of [
+    [160n, 5000, null], [160n, -5000, null], [99n, 0, null],
+    [100n, 5001, 'head-clock-behind'], [100n, -5001, 'head-clock-ahead'], [161n, -5001, 'quote-too-old'],
+  ] as const) {
+    now = Number(timestamp) * 1000 + age;
+    const { client } = clientFor({ head: height, preparationBlock: height, timestamp });
+    const prepared = await prepareArbitrumOrder(client, contract, owner, profitable, 2000, 0.05, 0.50);
+    if (!reason) assert.ok(prepared.ok);
+    else assert.deepEqual(prepared, { ok: false, reason: 'stale-quote',
+      stale: { at: now, headBlock: Number(height), headTimestamp: Number(timestamp), headAgeMs: age, reason } });
+  }
 });
 
 test('Arbitrum preparation reports the failing RPC stage without exposing provider errors', async () => {

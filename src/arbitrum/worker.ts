@@ -12,7 +12,7 @@ import { broadcastArbitrum, type ArbitrumBroadcast } from './broadcast.js';
 import { arbitrumSupportsPaths, reviewedArbitrumRelease, verifyArbitrumExecutor, type ArbitrumExecutor } from './proxy.js';
 import { ARBITRUM_FLASH_ARB_LOGIC_V2_ABI } from './artifact-logic-v2.js';
 import { scanArbitrumPaths, type ArbPathQuote } from './paths.js';
-import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
+import { prepareArbitrumOrder, type ArbitrumOrderRejection, type ArbitrumStaleHead } from './execution.js';
 import { reconcileArbitrumIntent, type ArbitrumIntent } from './settlement.js';
 import { arbitrumTestLeads } from './test-leads.js';
 import {
@@ -27,6 +27,7 @@ const dayMs = 86400_000;
 const txLimitUsd = Math.min(0.50, CONFIG.maxSwapNetworkFeeUsd);
 const dailyLimitUsd = 2;
 const minNetUsd = 0.05;
+const weth: Address = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
 const transferAbi = [parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)')] as const;
 const morpho = '0x6c247b1F6182318877311737BaC0844bAa518F5e';
 const preparationStatus: Record<ArbitrumOrderRejection, string> = {
@@ -48,6 +49,9 @@ type Pending = ArbitrumIntent & { ethUsd: number; budgetUsd: number; executor?: 
 type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'unverified' | 'replaced' | 'expired'; gasUsd: number; netUsd: number; at: number;
   loanUsd?: number; replacementHash?: Hash };
 type AutoProfit = { hash: Hash; owner: Address; at: number; netUsd: number; block: number };
+type StaleQuote = ArbitrumStaleHead & { sourceBlock: number; kind: 'two-swap' | 'multi-hop'; route: string;
+  asset: Address; symbol: 'WETH' | 'USDC'; decimals: number; amountIn: string; funding: 'Aave V3' | 'Morpho'; payoutUsd: number;
+  legs: (ArbPathQuote['legs'][number] | (ArbQuote['order']['buy'] & { tokenOut: Address }))[] };
 type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest; lastAutoProfit?: AutoProfit };
 
 function matchesOwner(signer: unknown, owner: Address) {
@@ -143,6 +147,7 @@ export class ArbitrumWorker {
     bestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['bestQuote'],
     largestQuote: null as Awaited<ReturnType<typeof scanArbitrum>>['largestQuote'],
     preparationRejections: {} as Partial<Record<ArbitrumOrderRejection, number>>,
+    lastStaleQuote: null as StaleQuote | null,
     executor: isAddress(this.contract) ? this.contract : null,
     balanceEth: null as string | null, pending: null as Hash | null, settled: null as Settlement | null,
     lastAutoProfit: null as AutoProfit | null,
@@ -265,7 +270,7 @@ export class ArbitrumWorker {
         + (result.unavailableLegs ? `, ${result.unavailableLegs} unavailable legs` : '');
       this.activity.recordScan(result.quotedRoutes, Date.now());
       if (executable && result.opportunities.length) {
-        await this.queueOrders(result.opportunities.slice(0, 3), usd, null, generation, release)
+        await this.queueOrders(result.opportunities.slice(0, 3), usd, null, generation, release, block)
           .catch(() => this.scanError('Arbitrum multi-hop order preparation failed'));
       }
     }).catch(() => {
@@ -315,7 +320,7 @@ export class ArbitrumWorker {
       if (leads.length) {
         test.checked += leads.length;
         const ethUsd = await arbitrumEthUsd(this.client, block);
-        if (await this.queueOrders(leads, ethUsd, test, generation, this.deployment.releaseHash)) return;
+        if (await this.queueOrders(leads, ethUsd, test, generation, this.deployment.releaseHash, block)) return;
       }
     }
     const regularScan = test ? undefined : this.regularScans++;
@@ -358,7 +363,7 @@ export class ArbitrumWorker {
     } else if (!this.summary.executor) this.summary.status = 'Flash payout quoted. Deploy executor to check full fees';
     else {
       this.summary.status = 'No fresh route passed padded gas and payout floor';
-      await this.queueOrders(candidates.slice(0, 3), result.ethUsd, test, generation, this.deployment.releaseHash);
+      await this.queueOrders(candidates.slice(0, 3), result.ethUsd, test, generation, this.deployment.releaseHash, block);
     }
     const status = this.summary.status;
     if (result.unavailableLegs) this.summary.status += `. Partial scan, RPC unavailable for ${result.unavailableLegs} quote legs`;
@@ -366,14 +371,16 @@ export class ArbitrumWorker {
     this.activity.record('info', `Block ${block}: ${result.quotedRoutes} two-swap quotes across ${this.summary.pools} pools, ${result.unavailableLegs} unavailable quote legs.${screened} ${this.summary.pathStatus}. ${status}.`, undefined, this.summary.updatedAt);
   }
 
-  private queueOrders(candidates: (ArbQuote | ArbPathQuote)[], ethUsd: number, test: FlashTest | null, generation: number, release: Hex | null) {
-    const run = () => this.tryOrders(candidates, ethUsd, test, generation, release);
+  private queueOrders(candidates: (ArbQuote | ArbPathQuote)[], ethUsd: number, test: FlashTest | null, generation: number, release: Hex | null,
+    sourceBlock: bigint) {
+    const run = () => this.tryOrders(candidates, ethUsd, test, generation, release, sourceBlock);
     const result = this.orderTail.then(run, run);
     this.orderTail = result;
     return result;
   }
 
-  private async tryOrders(candidates: (ArbQuote | ArbPathQuote)[], ethUsd: number, test: FlashTest | null, generation: number, release: Hex | null): Promise<boolean> {
+  private async tryOrders(candidates: (ArbQuote | ArbPathQuote)[], ethUsd: number, test: FlashTest | null, generation: number, release: Hex | null,
+    sourceBlock: bigint): Promise<boolean> {
     const canContinue = () => this.active && generation === this.sendGeneration && !this.journal?.pending
       && this.deployment.verified && this.deployment.releaseHash === release
       && (test ? this.journal?.test === test && activeFlashTest(test) : !activeFlashTest(this.journal?.test));
@@ -400,6 +407,17 @@ export class ArbitrumWorker {
         firstRejection ??= prepared.reason;
         const counts = this.summary.preparationRejections;
         counts[prepared.reason] = (counts[prepared.reason] ?? 0) + 1;
+        if (prepared.reason === 'stale-quote' && !test && canSign()
+          && (!this.summary.lastStaleQuote || prepared.stale.at >= this.summary.lastStaleQuote.at)) {
+          this.summary.lastStaleQuote = { ...prepared.stale, sourceBlock: Number(path ? candidate.block : sourceBlock),
+            kind: path ? 'multi-hop' : 'two-swap', route: path ? candidate.label : `WETH → ${candidate.symbol} → WETH`,
+            asset: path ? candidate.asset : weth, symbol: path ? candidate.symbol : 'WETH', decimals: path ? candidate.decimals : 18,
+            amountIn: principal.toString(), funding: path ? 'Morpho' : 'Aave V3',
+            payoutUsd: path ? candidate.payoutUsd : Number(formatEther(candidate.payout)) * ethUsd,
+            legs: path ? candidate.legs.map(leg => ({ ...leg })) : [
+              { ...candidate.order.buy, tokenOut: candidate.order.token }, { ...candidate.order.sell, tokenOut: weth },
+            ] };
+        }
         continue;
       }
       const loanUsd = 'legs' in candidate ? candidate.loanUsd : Number(formatEther(candidate.order.amountIn)) * ethUsd;
