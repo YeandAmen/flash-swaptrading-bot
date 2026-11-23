@@ -939,7 +939,8 @@ function mevGasLimits(gas) {
   const regular = `standard limits ${usd(gas.maxGasUsd)} per attempt and ${usd(gas.dailyGasUsd)} per 24 hours`;
   if (!(gas.premiumMaxGasUsd > 0)) return regular;
   const daily = gas.premiumDailyGasUsd ?? gas.premiumMaxGasUsd;
-  return `${regular} · high-profit limits ${usd(gas.premiumMaxGasUsd)} per attempt and ${usd(daily)} per 24 hours`;
+  const bid = gas.protected && gas.premiumTipBumpPct > 0 ? ` · high-profit private priority boost ${gas.premiumTipBumpPct}%` : '';
+  return `${regular} · high-profit limits ${usd(gas.premiumMaxGasUsd)} per attempt and ${usd(daily)} per 24 hours${bid}`;
 }
 let reviewedMevArm = null;
 function mevArmSettings() {

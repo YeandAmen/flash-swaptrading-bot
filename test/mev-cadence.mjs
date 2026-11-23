@@ -24,6 +24,7 @@ Object.assign(process.env, {
   MEV_DIRECT_MIN_NET_USD: '0.05',
   MEV_DIRECT_MAX_PRIORITY_GWEI: '0.25',
   MEV_DIRECT_PROTECTED_BLOCKS: '3',
+  MEV_DIRECT_PREMIUM_TIP_BUMP_PCT: '0',
   MEV_MAX_SIMS_PER_BLOCK: '3',
   MEV_DIRECT_CADENCE_MAX_ROUTES: '8',
   MEV_MAX_LOAN_USD: '1000000',
@@ -77,6 +78,16 @@ try {
       } else await assert.rejects(config, /MEV_DIRECT_PROTECTED_BLOCKS/);
     }
   } finally { process.env.MEV_DIRECT_PROTECTED_BLOCKS = '3'; }
+  try {
+    for (const raw of [undefined, '0', '10', '25', '-1', '26', '1.5', 'bad']) {
+      if (raw === undefined) delete process.env.MEV_DIRECT_PREMIUM_TIP_BUMP_PCT;
+      else process.env.MEV_DIRECT_PREMIUM_TIP_BUMP_PCT = raw;
+      const config = import('../dist/config.js?premium-tip-bump=' + raw);
+      if (raw === undefined || ['0', '10', '25'].includes(raw)) {
+        assert.equal((await config).MEV.directPremiumTipBumpPct, Number(raw ?? 0));
+      } else await assert.rejects(config, /MEV_DIRECT_PREMIUM_TIP_BUMP_PCT/);
+    }
+  } finally { process.env.MEV_DIRECT_PREMIUM_TIP_BUMP_PCT = '0'; }
   const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
   const { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_RUNTIME } = await import('../dist/mev/artifact-proxy.js');
   const { FLASH_ARB_LOGIC_V3_RUNTIME } = await import('../dist/mev/artifact-logic-v3.js');
@@ -574,7 +585,7 @@ try {
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
     protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport,
     pathHistory, pathCandidates, pendingForPath, startup, snapshotTiming, atJournal, beforeBlock,
-    protectedBlocks = MEV.directProtectedBlocks, onEstimate }) {
+    protectedBlocks = MEV.directProtectedBlocks, onEstimate, fastPriority = 300_000_000n }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -643,7 +654,7 @@ try {
     };
     mevReadClient.getFeeHistory = async ({ rewardPercentiles }) => {
       assert.deepEqual(rewardPercentiles, [50, 90]);
-      return { reward: [[100_000_000n, 300_000_000n]] };
+      return { reward: [[100_000_000n, fastPriority]] };
     };
     mevReadClient.estimateGas = async ({ blockNumber, data }) => {
       assert.equal(blockNumber, block.blockNumber);
@@ -1879,6 +1890,103 @@ try {
     } finally {
       publicClient.getBlock = originals.getBlock;
       CONFIG.forkMode = originals.fork;
+    }
+  }
+
+  {
+    // Order #212 source proceeds and gas, with ETH/USD inferred from its displayed net.
+    const proceeds = 9_384_436_800_537_263n, nextBase = 5_203_947_878n, paddedGas = 352_648n;
+    const fastTip = 2_000_000_000n, bumpedTip = 2_200_000_000n, ethUsd = 1_795.73;
+    const realNow = Date.now;
+    const originalMev = Object.fromEntries(['directPremiumTipBumpPct', 'directMaxPriorityGwei',
+      'directDailyGasUsd', 'directPremiumMaxGasUsd'].map(key => [key, MEV[key]]));
+    let clock = now + 86_400_000;
+    async function replay(bump, { price = ethUsd, spent = 0, base = nextBase, beforeBlock, ...overrides } = {}) {
+      clock += 30_000; // Each replay gets its own fee-history sample.
+      MEV.directPremiumTipBumpPct = bump;
+      return scan({ age: minute, profit: proceeds, finalProfit: proceeds, protectedDirect: true,
+        protectedBlocks: 1, estimatedGas: 282_118n, maximumDirectGasUsd: 1.5, fastPriority: fastTip,
+        snapshotTiming: { timestamp: Math.floor(clock / 1_000), nextBaseFee: base }, ...overrides,
+        beforeBlock(worker) {
+          worker.host.ethUsd = () => price;
+          worker.file.directGas = spent ? [{ hour: Math.floor(clock / 3_600_000), usd: spent }] : [];
+          assert.equal(worker.view().settings.direct.premiumTipBumpPct, bump);
+          beforeBlock?.(worker);
+        } });
+    }
+    try {
+      Date.now = () => clock;
+      Object.assign(MEV, { directMaxPriorityGwei: 1, directDailyGasUsd: 4, directPremiumMaxGasUsd: 20 });
+      for (const [bump, expected] of [[0, fastTip], [10, bumpedTip]]) {
+        const result = await replay(bump);
+        assert.equal(result.signed.length, 1);
+        const [tx] = result.signed;
+        assert.equal(tx.gas, paddedGas);
+        assert.equal(tx.maxPriorityFeePerGas, expected);
+        assert.equal(tx.maxFeePerGas, nextBase + expected);
+        const gasBudget = paddedGas * tx.maxFeePerGas;
+        const { minProfit } = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: tx.data }).args[0];
+        assert.ok(gasBudget <= loanLimitWei(5, ethUsd));
+        assert.ok(minProfit - gasBudget >= BigInt(Math.ceil(5 / ethUsd * 1e18)));
+        assert.ok(minProfit - gasBudget >= gasBudget);
+        assert.ok(minProfit <= proceeds - (proceeds + 9n) / 10n);
+      }
+      const [clipped] = (await replay(10, { spent: 15.375 })).signed;
+      assert.equal(clipped.maxFeePerGas, loanLimitWei(4.625, ethUsd) / paddedGas);
+      assert.ok(clipped.maxPriorityFeePerGas > fastTip && clipped.maxPriorityFeePerGas < bumpedTip);
+      assert.equal((await replay(25, { spent: 20 })).signed.length, 0);
+      const retained = BigInt(Math.ceil(5 / ethUsd * 1e18));
+      const permittedTip = 2_100_000_000n;
+      const limitedProceeds = ((nextBase + permittedTip) * paddedGas + retained) * 10n / 9n + 2n;
+      const [profitClipped] = (await replay(10, { profit: limitedProceeds, finalProfit: limitedProceeds })).signed;
+      assert.equal(profitClipped.maxPriorityFeePerGas, permittedTip, 'the execution reserve and $5 owner floor limit the increase');
+
+      // With enough headroom for the tip itself, the quote maximum still wins.
+      const largeProfit = oneEth / 5n;
+      const [ceiling] = (await replay(25, { price: 100, fastPriority: 99_000_000_000n,
+        profit: largeProfit, finalProfit: largeProfit })).signed;
+      assert.equal(ceiling.maxPriorityFeePerGas, 100_000_000_000n);
+      const [publicTx] = (await replay(10, { protectedDirect: false })).signed;
+      assert.equal(publicTx.maxPriorityFeePerGas, fastTip);
+      const bundleTerms = { submission: 'bundle', base: 1_000_000_000n };
+      const [originalBundle] = (await replay(0, bundleTerms)).signed;
+      const [configuredBundle] = (await replay(10, bundleTerms)).signed;
+      assert.ok(originalBundle && configuredBundle);
+      assert.deepEqual(configuredBundle, originalBundle, 'bundle fees and the encoded builder payment stay identical');
+      const [tied] = (await replay(10, { base: 100_000_000n, fastPriority: 1_000_000_000n })).signed;
+      assert.equal(tied.maxPriorityFeePerGas, 1_000_000_000n, 'an equal regular and premium bid remains regular');
+      assert.equal((await replay(10, { profit: oneEth / 300n, finalProfit: oneEth / 300n })).signed.length, 0);
+
+      const manual = { base: 1_000_000_000n, maximumDirectGasUsd: 5, protectedBlocks: 3 };
+      const matched = await replay(10, { ...manual, maximumTestGasUsd: 5 });
+      assert.equal(matched.journaled[0].opp.gasOnlyTestId, testId);
+      assert.equal(matched.signed[0].maxPriorityFeePerGas, fastTip);
+      const explicit = await replay(10, { ...manual, beforeBlock(worker) {
+        worker.file.proxyContract = address(2);
+        worker.queueGasOnlyTest('explicit-premium-control', 5, true, true, false, 0.05);
+      } });
+      assert.equal(explicit.journaled[0].opp.gasOnlyTestId, 'explicit-premium-control');
+      assert.equal(explicit.signed[0].maxPriorityFeePerGas, fastTip);
+
+      let queuedAfterBump = false;
+      const late = await replay(10, { ...manual, beforeBlock(worker) {
+        worker.file.proxyContract = address(2);
+        const prepare = worker.prepareLive.bind(worker);
+        worker.prepareLive = async (...args) => {
+          const result = await prepare(...args);
+          if (!queuedAfterBump && result?.fees.maxPriorityFeePerGas === bumpedTip) {
+            queuedAfterBump = true;
+            worker.queueGasOnlyTest('late-premium-control', 5);
+          }
+          return result;
+        };
+      } });
+      assert.ok(queuedAfterBump);
+      assert.ok(late.signed.every(tx => tx.maxPriorityFeePerGas <= fastTip));
+      if (!late.journaled.some(p => p.opp.gasOnlyTestId === 'late-premium-control')) assert.equal(late.test.status, 'queued');
+    } finally {
+      Object.assign(MEV, originalMev);
+      Date.now = realNow;
     }
   }
 

@@ -358,9 +358,9 @@ interface PreparedOffer {
   test?: GasOnlyTest;
   premium?: boolean;
   privateSubmission?: true;
-  // A shortened automatic deadline cannot satisfy a later test. A longer deadline
-  // prepared for a queued test can only be broadcast for that same request.
-  windowTest?: GasOnlyTest | null;
+  // A deadline or bid specific to automatic execution requires the queue to stay
+  // empty. A longer deadline prepared for a queued test belongs to that request.
+  requiredTestIntent?: GasOnlyTest | null;
   contract: Address;
   ethUsd: number;
   data: Hex;
@@ -1595,6 +1595,7 @@ export class MevSearcher {
     const minimumPolicy = profitTest ? { ...policy, minNetUsd: requestedNet } : policy;
     let minimumNet = test && !profitTest ? 0n : this.minimumNet(ethUsd, minimumPolicy);
     let premium = false;
+    let raisedPremiumTip = false;
     const direct = MEV.submission === 'direct';
     const privateSubmission = direct && (test?.privateSubmission ?? MEV.directProtected) ? true : undefined;
     const privateGasOnly = privateSubmission && gasOnly;
@@ -1707,6 +1708,13 @@ export class MevSearcher {
             affordableFees = faster;
             minimumNet = retained;
             premium = true;
+            // Premium eligibility is established at the original priority before applying the configured increase.
+            if (automaticWindow !== undefined && MEV.directPremiumTipBumpPct > 0 && !this.activeGasOnlyTest()) {
+              const requested = premiumTip * BigInt(100 + MEV.directPremiumTipBumpPct) / 100n;
+              const capped = requested < PREMIUM_QUOTE_CAP_WEI ? requested : PREMIUM_QUOTE_CAP_WEI;
+              affordableFees = affordableDirectFees(r.nextBaseFee, gas, capped, minimumTip, maximum, feeHorizon) ?? faster;
+              raisedPremiumTip = affordableFees.maxPriorityFeePerGas > faster.maxPriorityFeePerGas;
+            }
           }
         }
         if (!affordableFees) {
@@ -1727,10 +1735,10 @@ export class MevSearcher {
       const tip = desiredTip < swapFeeCap - gasBudget ? desiredTip : swapFeeCap - gasBudget;
       if (!direct && tip === 0n) return this.skipOpportunity(opp, 'profit does not cover a builder payment above the configured floor');
       const minimumProfit = gasOnly ? 1n : tip + gasBudget + minimumNet;
-      const windowTest = privateLive && protectedBlocks < MAX_DIRECT_PROTECTED_BLOCKS
-        && (automaticWindow !== undefined || feeHorizon > protectedBlocks)
+      const requiredTestIntent = raisedPremiumTip || (privateLive && protectedBlocks < MAX_DIRECT_PROTECTED_BLOCKS
+        && (automaticWindow !== undefined || feeHorizon > protectedBlocks))
         ? queuedForWindow : undefined;
-      return { offer, contract, ethUsd, gas, gasBudget, tip, fees, target: targetBlock(), minimumProfit, test, premium, privateSubmission, windowTest, data: encode(tip, minimumProfit), net: afterGas - tip };
+      return { offer, contract, ethUsd, gas, gasBudget, tip, fees, target: targetBlock(), minimumProfit, test, premium, privateSubmission, requiredTestIntent, data: encode(tip, minimumProfit), net: afterGas - tip };
     } catch (e) {
       opp.status = 'failed';
       opp.note = `gas estimate: ${reasonOf(e)}`;
@@ -1749,7 +1757,7 @@ export class MevSearcher {
     const stillLive = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
       && !this.deploying && !this.host.tradePending() && this.canMeetSendDeadline(r) && (!settlementEligible || settlementEligible());
     const canSend = () => stillLive() && (!settlementEligible || !this.walletPending()) && (!startup || !this.activeGasOnlyTest())
-      && (prepared.windowTest === undefined || this.activeGasOnlyTest() === prepared.windowTest)
+      && (prepared.requiredTestIntent === undefined || this.activeGasOnlyTest() === prepared.requiredTestIntent)
       && (!offer.path || (this.pathRelease === offer.release && !this.activeGasOnlyTest())) && (!test || this.activeGasOnlyTest() === test);
     if (!canSend()) return skip('target slot passed or MEV became unavailable before signing');
     if (this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
@@ -1817,7 +1825,7 @@ export class MevSearcher {
           && (queued.minimumNetUsd === undefined || queued === test || (minimumProfit - gasBudget) >=
             BigInt(Math.ceil(queued.minimumNetUsd / (currentEthUsd ?? ethUsd) * 1e18))) ? queued : null;
       };
-      if (prepared.windowTest && matchingTest() !== prepared.windowTest) return skip('extended private window requires the matching queued test');
+      if (prepared.requiredTestIntent && matchingTest() !== prepared.requiredTestIntent) return skip('extended private window requires the matching queued test');
       const signingStarted = performance.now();
       const signed = await account.signTransaction({
         chainId: publicClient.chain.id, type: 'eip1559', to: contract, data, nonce, gas,
@@ -1861,7 +1869,7 @@ export class MevSearcher {
           ? { routeId: pathRouteId(offer.path, offer.release), grossProfitWei: offer.path.grossProfit.toString() } : undefined,
         gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(reportedNet) * ethUsd, directSimulation, builders: [],
       };
-      const matched = prepared.windowTest === undefined ? matchingTest() : prepared.windowTest;
+      const matched = prepared.requiredTestIntent === undefined ? matchingTest() : prepared.requiredTestIntent;
       Object.assign(opp, {
         gasOnlyTestId: matched?.id,
         hash, status: 'sent', grossEth: reportedGrossEth, gasEth: submission.gasEth, tipEth: submission.tipEth,
@@ -1889,7 +1897,7 @@ export class MevSearcher {
       this.updateScanQuote(opp);
       // A signed test is consumed on the durable nonce journal, even if the RPC times out.
       if (matched) this.queuedTest = null;
-      const submissionTest = test ?? prepared.windowTest;
+      const submissionTest = test ?? prepared.requiredTestIntent;
       const canSubmit = () => stillLive() && (!submissionTest || Date.now() < submissionTest.expiresAt) && this.pending === pending;
       const flight = direct ? this.submitSignedDirect(pending, signed, canSubmit, journalStarted)
         : this.submitSignedBundle(pending, submission, signed, canSubmit);
@@ -2644,6 +2652,7 @@ export class MevSearcher {
         loanLimitMode: Number.isFinite(MEV.maxLoanUsd) ? 'usd-cap' : 'lender-liquidity',
         direct: { maxGasUsd: Math.min(CONFIG.maxSwapNetworkFeeUsd, MEV.directMaxGasUsd), dailyGasUsd: MEV.directDailyGasUsd, protected: MEV.directProtected, protectedBlocks: MEV.directProtectedBlocks,
           premiumMaxGasUsd: Math.min(CONFIG.maxSwapNetworkFeeUsd, MEV.directPremiumMaxGasUsd), premiumDailyGasUsd: MEV.directPremiumMaxGasUsd, premiumMinNetUsd: PREMIUM_MIN_NET_USD,
+          premiumTipBumpPct: MEV.directPremiumTipBumpPct,
           broadcastRpcCount: 1 + MEV.directBroadcastRpcUrls.length, spentGasUsd: this.directGasSpent(now), enabled: directBudgetConfigured() },
         tipPct: MEV.builderTipPct, minNetUsd: MEV.minNetUsd, minPoolWeth: MEV.minPoolWeth,
         activeProfitPolicy: this.profitPolicy(Date.now()),
