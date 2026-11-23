@@ -68,6 +68,7 @@ export interface SolanaScanConfig {
   wallet: string;
   rpcUrl?: string;
   jupiterApiKey?: string;
+  fetchBuild?: (url: URL, init: RequestInit) => Promise<Response>;
   loanUsdc?: number;
   clampLoanToReserve?: boolean;
   // Unlimited ordinary planning keeps token amounts in atomic units through transaction assembly.
@@ -225,6 +226,7 @@ function deadline(signal?: AbortSignal) {
 export async function buildSwap(
   wallet: Address, input: Address, output: Address, destination: Address,
   amount: bigint, venues: ReturnVenue | readonly ReturnVenue[], apiKey?: string, slippageBps = TEST_SLIPPAGE_BPS, signal?: AbortSignal,
+  fetchBuild: NonNullable<SolanaScanConfig['fetchBuild']> = fetch,
 ): Promise<JupiterBuild | null> {
   if (amount <= 0n || amount > MAX_SOLANA_LOAN_UNITS) throw new Error('Jupiter input amount is outside the token u64 range');
   const allowedVenues: readonly string[] = typeof venues === 'string' ? [venues] : venues;
@@ -234,7 +236,7 @@ export async function buildSwap(
     destinationTokenAccount: destination, wrapAndUnwrapSol: 'false',
     slippageBps: String(slippageBps), dexes: allowedVenues.join(','), maxAccounts: '22', transactionVersion: '0',
   }).toString();
-  const result = await fetch(url, {
+  const result = await fetchBuild(url, {
     headers: apiKey ? { 'x-api-key': apiKey } : {},
     signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
@@ -434,13 +436,15 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
     };
     let quote: Pick<SolanaRoute, 'expectedNetBeforeNetworkUsdc' | 'quotedNetBeforeNetworkUsdc'> | undefined;
     try {
-      const first = firstQuote ?? await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy, config.jupiterApiKey, slippageBps);
+      const first = firstQuote ?? await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy,
+        config.jupiterApiKey, slippageBps, undefined, config.fetchBuild);
       if (!first) return { buy, sell, status: 'no-route', detail: 'No direct first-leg route' };
       reusableFirst = first;
       const firstMinimum = execute ? routeMinimum(first, wallet, usdcAta.ata, solAta.ata, slippageBps) : rawAmount(first.otherAmountThreshold);
       if (firstMinimum <= 0n) throw new Error('Jupiter did not guarantee any first-leg output');
       const exits = compareReturns ? returnVenues.filter((venue) => venue !== buy) : pairedVenue;
-      const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, exits, config.jupiterApiKey, slippageBps, signal);
+      const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, exits,
+        config.jupiterApiKey, slippageBps, signal, config.fetchBuild);
       if (!second) {
         const unavailable: SolanaRoute = { buy, sell, status: 'no-route', detail: 'No direct return route' };
         return compareReturns ? tryPairedReturn(first, unavailable) : unavailable;

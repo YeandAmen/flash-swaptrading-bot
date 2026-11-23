@@ -11,6 +11,7 @@ import {
 } from './protocol.js';
 import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
 import { SolanaLiveWorker } from './worker.js';
+import { SolanaScanCadence } from './scan-cadence.js';
 import { queueFlashTest, validSolanaSwapLossUsdc } from '../network-test.js';
 import { scanSolanaCycle, solanaDiscoveryPairs, solanaScanConfig, solanaVenuePairs } from './scan.js';
 
@@ -845,6 +846,45 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     groupedExit = undefined;
     returnOut = '250250000';
     requestedExits.length = 0;
+  });
+  await t.test('a late successful grouped return cannot erase its sibling’s Build cooldown', async t => {
+    const cadence = new SolanaScanCadence();
+    t.mock.method(performance, 'now', () => 1_000);
+    t.mock.method(Date, 'now', () => 1_800_000_000_000);
+    const baseFetch = globalThis.fetch;
+    let started!: () => void;
+    const bothExits = new Promise<void>(resolve => { started = resolve; });
+    let builds = 0;
+    t.mock.method(globalThis, 'fetch', async (input: URL | RequestInfo, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.origin === 'https://api.jup.ag') {
+        builds++;
+        const venues = url.searchParams.get('dexes')!.split(',');
+        if (venues.length > 1) {
+          if (venues.includes('BisonFi')) {
+            await bothExits;
+            return Response.json({}, { status: 429, headers: { 'retry-after': '35' } });
+          }
+          started();
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
+      }
+      return baseFetch(input, init);
+    });
+    groupedExit = 'Kipseli';
+    returnOut = '250065000';
+    try {
+      const result = await scanSolanaCycle({ ...config, venuePair: solanaDiscoveryPairs[2], compareReturnVenues: true,
+        fetchBuild: cadence.fetchBuild }, async () => assert.fail('No route qualified for execution'));
+      assert.deepEqual(result.routes.map(route => route.status), ['quote-error', 'below-profit-floor']);
+      assert.equal(builds, 4);
+      assert.equal(cadence.complete(false), 35_000);
+      assert.equal(cadence.delay(true), 35_000);
+      assert.equal(cadence.providerCooldownUntil, Date.now() + 35_000);
+    } finally {
+      groupedExit = undefined;
+      returnOut = '250250000';
+    }
   });
   await t.test('compares other direct exits and records the actual venue with one quote per leg', async () => {
     const settings = { ...config, venuePair: solanaDiscoveryPairs[2], compareReturnVenues: true };

@@ -5,6 +5,7 @@ import { NetworkActivity } from './network-activity.js';
 import { LIGHTHOUSE } from './solana/guard.js';
 import { JUPITER, KAMINO } from './solana/protocol.js';
 import { ArbitrumWorker } from './arbitrum/worker.js';
+import { liveScanDelayMs, SolanaScanCadence } from './solana/scan-cadence.js';
 import { isValidSolanaLoanLimit, SolanaMarketPlanner, type SolanaMarketProbe } from './solana/market.js';
 import type { SolanaScanResult } from './solana/scan.js';
 import type { SolanaLiveWorker } from './solana/worker.js';
@@ -12,6 +13,7 @@ import type { SolanaLiveWorker } from './solana/worker.js';
 const arbitrum = new ArbitrumWorker();
 const solanaEnabled = process.env.SOLANA === 'on' && !CONFIG.forkMode;
 const solanaCanArm = solanaEnabled && CONFIG.allowLiveTrading && process.env.SOLANA_LIVE === 'on';
+const solanaCadence = solanaCanArm && process.env.SOLANA_FAST_SCAN === 'on' ? new SolanaScanCadence() : null;
 let solanaLive: SolanaLiveWorker | null = null;
 let solanaStopBeforeInit = false;
 let solanaResult: SolanaScanResult | null = null;
@@ -28,8 +30,20 @@ const solanaVenueRotation = [0, 1, 0, 2] as const;
 let solanaMarket: SolanaMarketPlanner | undefined;
 let solanaMarketProbe: (SolanaMarketProbe & { limitMode?: 'lender-liquidity' }) | null = null;
 let solanaTestScans = 0;
+let solanaNextScanAt: number | null = null;
 let stopping = false;
 const schedule = new Set<ReturnType<typeof setTimeout>>();
+
+function ordinarySolanaReady() {
+  const status = solanaLive?.summary;
+  return !!status?.armed && status.ready && !status.pending && !solanaLive?.activeTest();
+}
+
+function scheduleSolanaScan(wait: number) {
+  solanaNextScanAt = Date.now() + wait;
+  // Check pending receipts while a longer quota hold blocks Build. Never pass huge header values to a Node timer.
+  return Math.min(wait, liveScanDelayMs);
+}
 
 async function poll(task: () => Promise<number | void>, delay: number, reportError: (text: string) => void) {
   if (stopping) return;
@@ -52,8 +66,16 @@ export function startExpansion() {
     return arbitrum.summary.prunedRoutes > 0 && !arbitrum.summary.pending ? 4_000 : undefined;
   }, 6_000, (error) => arbitrum.scanError(error));
   if (solanaEnabled) void poll(async () => {
+    // Recheck at wake-up in case a manual test, pending intent or disarm arrived during the shorter wait.
+    const wait = solanaCadence?.delay(ordinarySolanaReady()) ?? 0;
+    if (wait > 0) {
+      if (wait >= liveScanDelayMs && solanaLive?.summary.pending) await solanaLive.reconcile();
+      return scheduleSolanaScan(wait);
+    }
+    solanaNextScanAt = null;
     const { scanSolanaCycle, solanaScanConfig, solanaDiscoveryPairs, solanaVenuePairs } = await import('./solana/scan.js');
     const config = solanaScanConfig();
+    if (solanaCadence) config.fetchBuild = solanaCadence.fetchBuild;
     let liveError: string | null = null;
     if (solanaCanArm) {
       try {
@@ -72,6 +94,11 @@ export function startExpansion() {
     const worker = solanaLive;
     const execution = !liveError && worker?.summary.armed && worker.summary.ready && !worker.summary.pending ? worker : null;
     const test = execution?.activeTest();
+    // Initialization and receipt reconciliation can yield to a control request after the timer fires.
+    if (solanaCadence && (!execution || test)) {
+      const normalWait = solanaCadence.delay(false);
+      if (normalWait > 0) return scheduleSolanaScan(normalWait);
+    }
     const lenderLimited = config.loanUsdc === Infinity;
     let probe: SolanaMarketProbe | undefined;
     if (test) {
@@ -100,7 +127,9 @@ export function startExpansion() {
     if (test) execution?.recordTestScan(test.id, solanaResult.routes.length);
     const quoteFailure = solanaResult.routes.length > 0 && solanaResult.routes.every((route) => route.status === 'quote-error')
       ? solanaResult.routes[0].detail ?? 'The venue quotes are unavailable' : null;
-    solanaStatus = liveError ?? quoteFailure ?? (execution ? 'Guarded live scan completed' : 'Unsigned scan completed');
+    const coolingDown = solanaCadence?.providerCooldownUntil != null;
+    solanaStatus = liveError ?? (coolingDown ? 'Waiting for the Jupiter Build rate limit' : quoteFailure)
+      ?? (execution ? 'Guarded live scan completed' : 'Unsigned scan completed');
     solanaUpdatedAt = Date.now();
     if (probe) {
       probe.loanUsdc = solanaResult.loanUsdc;
@@ -142,8 +171,16 @@ export function startExpansion() {
     const terms = solanaResult.routes.some((route) => route.quotedNetBeforeNetworkUsdc !== undefined)
       ? ' Expected / guaranteed net USDC before network fees.' : '';
     const report = `Slot ${solanaResult.slot}.${sizing} ${solanaResult.slippageBps} bp/leg.${terms} ${routes.join(' | ') || solanaResult.status}.`;
-    solanaActivity.record(quoteFailure || liveError ? 'warn' : 'info', report);
-  }, solanaCanArm ? 12_000 : 30_000, (error) => {
+    solanaActivity.record(quoteFailure || liveError || coolingDown ? 'warn' : 'info', report);
+    if (solanaCadence) {
+      // A simulated candidate may have reached a final worker check. Only accelerate clean quote-only scans.
+      const healthy = !!execution && !test && ordinarySolanaReady() && solanaResult.routes.length === 2
+        && solanaResult.routes.every(route => route.status === 'below-profit-floor' && !route.detail);
+      return scheduleSolanaScan(solanaCadence.complete(healthy));
+    }
+    return undefined;
+  }, solanaCanArm ? liveScanDelayMs : 30_000, (error) => {
+    if (solanaCadence) scheduleSolanaScan(solanaCadence.complete(false));
     solanaStatus = error;
     solanaActivity.record('error', error);
   });
@@ -156,6 +193,7 @@ export function expansionView() {
     status: solanaStatus,
     execution: solanaLive?.summary ?? null,
     updatedAt: solanaUpdatedAt,
+    ...(solanaCadence ? { scanCadence: { nextScanAt: solanaNextScanAt, providerCooldownUntil: solanaCadence.providerCooldownUntil } } : {}),
     result: solanaResult,
     marketProbe: solanaMarketProbe,
     deployment: {
