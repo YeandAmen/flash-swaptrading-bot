@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseEther, zeroAddress, type Address } from 'viem';
+import { decodeFunctionData, parseEther, toHex, zeroAddress, type Address, type Hex } from 'viem';
 import { scanArbitrumPaths } from './paths.js';
 import type { ArbitrumClient } from './market.js';
+import { prepareArbitrumOrder } from './execution.js';
+import { arbitrumReleaseHash } from './proxy.js';
+import { ARBITRUM_FLASH_ARB_LOGIC_V2_ABI } from './artifact-logic-v2.js';
 
 const weth = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
 const usdc = '0xaf88d065e77c8cc2239327c5edb3a432268e5831';
@@ -328,6 +331,50 @@ test('an intermediate USDC loan clears the net floor on the same market where th
   assert.equal(unavailable.result.refinement.tried, 1);
   assert.equal(unavailable.result.refinement.quoted, 0);
   assert.equal(unavailable.result.refinement.bestPayoutUsd, null);
+});
+
+test('a fixed gross payout above $0.05 but below the cushioned floor leaves room for an executable interior size', async () => {
+  const market = sizingFixture(1800n, 208_333_333_333n);
+  const result = await scanArbitrumPaths(market.client, block, 2000, 250);
+  assert.deepEqual(market.firstLoans, [50_000_000n, 250_000_000n, 135_379_620n]);
+  assert.deepEqual(result.refinement, { tried: 1, quoted: 1, baselineBestPayoutUsd: 0.052948, bestPayoutUsd: 0.087885 });
+
+  for (const quote of result.opportunities) {
+    const client = {
+      getBlock: async () => ({ number: block, timestamp: BigInt(Math.floor(Date.now() / 1000)) }),
+      getBlockNumber: async () => block,
+      estimateGas: async () => 800_000n,
+      estimateFeesPerGas: async () => ({ maxFeePerGas: 10_000_000n, maxPriorityFeePerGas: 0n }),
+      call: async ({ data }: { data: Hex }) => {
+        const decoded = decodeFunctionData({ abi: ARBITRUM_FLASH_ARB_LOGIC_V2_ABI, data });
+        assert.ok(decoded.functionName === 'executePath');
+        const [release, path] = decoded.args;
+        assert.equal(release, arbitrumReleaseHash);
+        assert.equal(path.asset.toLowerCase(), usdc);
+        assert.equal(path.amountIn, quote.amountIn);
+        assert.equal(path.minProfit, 70_000n); // $0.05 net plus $0.02 padded gas.
+        return { data: toHex(quote.payout, { size: 32 }) };
+      },
+    } as unknown as ArbitrumClient;
+    const prepared = await prepareArbitrumOrder(client, zeroAddress, zeroAddress, quote, 2000, 0.05, 0.50, false, arbitrumReleaseHash);
+    if (quote.amountIn === 135_379_620n) {
+      assert.ok(prepared.ok);
+      assert.equal(prepared.worstGasUsd, 0.02);
+      assert.equal(prepared.netUsd, 0.067885);
+    } else assert.deepEqual(prepared, { ok: false, reason: 'net-floor' });
+  }
+});
+
+test('refinement compares whole repayment units and skips estimated payouts that cannot fund the reserve', async () => {
+  // Fixed gross 52,948 micro-USDC leaves exactly 47,653 micro-USDC after the reserve.
+  for (const [floorUsd, expectedTried] of [[0.047653, 0], [0.0476530001, 1], [0.08, 0]] as const) {
+    const market = sizingFixture(1800n, 208_333_333_333n);
+    const result = await scanArbitrumPaths(market.client, block, 2000, 250, floorUsd);
+    assert.equal(result.refinement.baselineBestPayoutUsd, 0.052948);
+    assert.equal(result.refinement.tried, expectedTried);
+    assert.equal(result.refinement.quoted, expectedTried);
+    assert.equal(market.firstLoans.length, 2 + expectedTried);
+  }
 });
 
 test('an already qualifying ladder quote and a losing market both skip every refinement read', async () => {

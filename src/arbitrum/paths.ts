@@ -1,5 +1,6 @@
 import { formatUnits, parseAbi, zeroAddress, type Address } from 'viem';
 import { loanLimitWei, MAX_FLASH_LOAN_WEI } from '../mev/cadence.js';
+import { minimumNetInAsset, requiredGrossPayout } from './profit.js';
 import type { ArbitrumClient } from './market.js';
 
 const weth: Address = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
@@ -24,7 +25,7 @@ const assets = [weth, usdc, arb, usdg] as const;
 const symbols = new Map<Address, string>([[weth, 'WETH'], [usdc, 'USDC'], [arb, 'ARB'], [usdg, 'USDG']]);
 type Pool = { kind: 2 | 6; pool: Address; token0: Address; token1: Address; tier: number };
 type Edge = { pool: Pool; input: Address; output: Address; rate: number; inputDepth: number };
-type Trial = { path: Edge[]; asset: Address; symbol: 'WETH' | 'USDC'; usd: number; decimals: number; amountIn: bigint; out: bigint };
+type Trial = { path: Edge[]; asset: Address; symbol: 'WETH' | 'USDC'; usd: number; decimals: number; minimumGross: bigint; amountIn: bigint; out: bigint };
 const marketCache = new WeakMap<ArbitrumClient, { block: bigint; pools: Pool[] }>();
 export type ArbPathLeg = { kind: 2 | 6; pool: Address; tokenOut: Address; tickSpacing: number };
 export interface ArbPathQuote {
@@ -113,7 +114,7 @@ async function optionalQuotes<T>(request: Promise<T[]>, deadline: number): Promi
   }
 }
 
-function refineSizes(completed: Trial[], baseline: Trial[], minimumNetUsd: number) {
+function refineSizes(completed: Trial[], baseline: Trial[]) {
   const bestExact = new Map<Address, bigint>();
   for (const t of completed) {
     const payout = t.out - t.amountIn;
@@ -137,7 +138,7 @@ function refineSizes(completed: Trial[], baseline: Trial[], minimumNetUsd: numbe
     if (amountIn <= x || amountIn >= y || baseline.some(t => t.path === upper.path && t.amountIn === amountIn)) continue;
     const estimated = amountIn * (a - b * amountIn) / (x * y * (y - x));
     if (estimated <= (bestExact.get(upper.asset) ?? 0n) || estimated <= (best.get(upper.asset)?.estimated ?? 0n)) continue;
-    if (Number(formatUnits(estimated, upper.decimals)) * upper.usd < minimumNetUsd) continue;
+    if (estimated < upper.minimumGross) continue;
     best.set(upper.asset, { trial: { ...upper, amountIn, out: amountIn }, estimated });
   }
   return [...best.values()].map(({ trial }) => trial);
@@ -196,6 +197,9 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
     if (!available || !usd) continue;
     const decimals = i === 0 ? 18 : 6;
     const symbol = i === 0 ? 'WETH' : 'USDC';
+    const priceE8 = BigInt(Math.round(usd * 1e8));
+    if (priceE8 <= 0n) continue;
+    const minimumGross = requiredGrossPayout(minimumNetInAsset(minimumNetUsd, 10n ** BigInt(decimals), priceE8));
     const scale = 10n ** BigInt(18 - decimals);
     const amountForUsd = (size: number) => (loanLimitWei(size, usd) ?? 0n) / scale;
     const configured = maxLoanUsd === Infinity ? MAX_FLASH_LOAN_WEI : amountForUsd(maxLoanUsd);
@@ -216,7 +220,7 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
     const selectedPaths = new Set<Edge[]>();
     for (const amountIn of amounts) for (const { path } of shortlist(cycles, amountIn, block)) {
       selectedPaths.add(path);
-      baseline.push({ path, asset, symbol, usd, decimals, amountIn, out: amountIn });
+      baseline.push({ path, asset, symbol, usd, decimals, minimumGross, amountIn, out: amountIn });
     }
     result.paths += selectedPaths.size;
   }
@@ -226,11 +230,11 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
     let trials = baseline;
     let deadline: number | undefined;
     if (refining) {
-      // Hand an already qualifying base quote straight to preparation.
-      if (refinement.baselineBestPayoutUsd === null || refinement.baselineBestPayoutUsd >= minimumNetUsd) break;
+      // Preserve the fast path as soon as any fixed size covers the floor after the execution reserve, before gas.
+      if (!completed.length || completed.some(t => t.out - t.amountIn >= t.minimumGross)) break;
       deadline = Math.min(startedAt + 10_000, Date.now() + 1500);
       if (Date.now() >= deadline) break;
-      trials = refineSizes(completed, baseline, minimumNetUsd);
+      trials = refineSizes(completed, baseline);
       refinement.tried = trials.length;
     }
     for (let hop = 0; trials.length && hop < 4; hop++) {

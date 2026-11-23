@@ -2,6 +2,7 @@ import { BaseError, ExecutionRevertedError, formatEther, formatUnits, encodeFunc
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
 import { ARBITRUM_FLASH_ARB_LOGIC_V2_ABI } from './artifact-logic-v2.js';
 import { arbitrumPinnedCall, arbitrumSupportsPaths } from './proxy.js';
+import { minimumNetInAsset, requiredGrossPayout } from './profit.js';
 import type { ArbitrumClient, ArbQuote } from './market.js';
 import type { ArbPathQuote } from './paths.js';
 
@@ -25,7 +26,7 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
     const assetPrice = BigInt(Math.round(assetUsd * 1e8));
     const scale = 10n ** BigInt(decimals);
     const ceil = (n: bigint, d: bigint) => (n + d - 1n) / d;
-    const minNet = gasOnlyTest ? 0n : ceil(BigInt(Math.ceil(minimumNetUsd * 1e8)) * scale, assetPrice);
+    const minNet = gasOnlyTest ? 0n : minimumNetInAsset(minimumNetUsd, scale, assetPrice);
     if (candidate.payout <= minNet) return reject('net-floor');
     const head = await client.getBlock();
     const stale = 'legs' in candidate ? head.number < candidate.block || head.number - candidate.block > 50n
@@ -54,8 +55,9 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
     const worstGasUsd = Number(formatEther(gasBudget)) * ethUsd;
     if (worstGasUsd > maximumFeeUsd) return reject('fee-cap');
     const gasInAsset = ceil(gasBudget * BigInt(Math.round(ethUsd * 1e8)) * scale, 10n ** 18n * assetPrice);
-    if (!gasOnlyTest && candidate.payout * 9n / 10n < gasInAsset + minNet) return reject('net-floor');
     const minimum = gasOnlyTest ? 1n : gasInAsset + minNet;
+    const requiredPayout = gasOnlyTest ? 1n : requiredGrossPayout(minimum);
+    if (!gasOnlyTest && candidate.payout < requiredPayout) return reject('net-floor');
     const data = encode(minimum);
     const tx = { to: contract, data, gas, ...fees };
     rpcStage = 'simulation-rpc';
@@ -68,7 +70,7 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
     if (exact > gas) return reject('gas-estimate-changed');
     if (!finalState.data || finalState.data === '0x') return reject('simulation-unavailable');
     const payout = decodeFunctionResult({ abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', data: finalState.data });
-    if ((gasOnlyTest ? payout : payout * 9n / 10n) < minimum) return reject('net-floor');
+    if (payout < requiredPayout) return reject('net-floor');
     return { ok: true as const, tx, deadline, worstGasUsd, gasBudget, netUsd: Number(formatUnits(payout, decimals)) * assetUsd - worstGasUsd };
   } catch (error) {
     const reverted = error instanceof BaseError && error.walk((cause) => cause instanceof ExecutionRevertedError) instanceof ExecutionRevertedError;
