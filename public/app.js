@@ -617,9 +617,12 @@ function submissionDetails(submission, openSubmissions) {
   const key = `${kind === 'direct' ? 'direct' : 'bundle'}-${target}`;
   const open = openSubmissions.has(key) ? ' open' : '';
   if (kind === 'direct') {
-    const head = submission.relayAtTargetHead;
+    const laterHeads = Array.isArray(submission.relayAtLaterTargetHeads) ? submission.relayAtLaterTargetHeads : [];
+    const observedHeads = [submission.relayAtTargetHead, ...laterHeads].filter(Boolean);
     const relay = [['after acknowledgement', submission.relayAfterAck],
-      [`when requested at block ${head?.block}`, head && (head.result ?? { status: 'No response recorded' })], ['after expiry', submission.relayAfterExpiry]]
+      ...observedHeads.map(head => [`when requested at block ${head.block}${head.inWindow === false ? ' (reply outside verified window)' : ''}`,
+        head.result ?? { status: 'No response recorded' }]),
+      ['after expiry', submission.relayAfterExpiry]]
       .filter(([, result]) => result)
       .map(([when, result]) => {
         const fields = [result.status, result.simError, result.revertReason];

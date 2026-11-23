@@ -693,6 +693,26 @@ try {
     const alternatives = (path, share = 80n) => [path, { ...withHop(path, { fee: 500, tickSpacing: 10 }),
       estimatedNet: path.estimatedNet * share / 100n }];
     assert.equal((await select(alternatives))[1][1].fee, 500, 'a comparable, separate V4 key gets first execution checks');
+    const later = structuredClone(missed);
+    later.submission.relayAtTargetHead.result = { status: 'PENDING', checkedAt: now };
+    later.submission.relayAtLaterTargetHeads = [{ block: 102, blockHash: hash(102), requestedAt: now, inWindow: true,
+      result: { ...failure, maxBlockNumber: 103 } }];
+    assert.equal((await select(alternatives, later))[1][1].fee, 500, 'a verified second eligible observation informs the exact retry');
+    const third = structuredClone(later);
+    const second = third.submission.relayAtLaterTargetHeads[0];
+    third.submission.relayAtLaterTargetHeads.push({ ...second, block: 103, blockHash: hash(103) });
+    second.result = { status: 'PENDING', simError: 'ExecutionReverted', checkedAt: now };
+    assert.equal((await select(alternatives, third))[1][1].fee, 500, 'an uninformative second read does not mask a verified third diagnostic');
+    for (const invalid of [
+      s => { s.inWindow = false; }, s => { s.block = 104; }, s => { s.result.maxBlockNumber = 104; },
+      s => { delete s.inWindow; },
+      s => { s.result.status = 'FAILED'; }, s => { s.result.revertReason = 'expired'; },
+      s => { s.requestedAt = now - 12_000; }, s => { s.result.checkedAt = now - 1; },
+    ]) {
+      const ignored = structuredClone(later);
+      invalid(ignored.submission.relayAtLaterTargetHeads[0]);
+      assert.equal((await select(alternatives, ignored))[1][1].fee, 3000, 'unverified, late and terminal reads do not change order');
+    }
     assert.equal((await select(alternatives, missed, hops => hops[1].fee === 500 ? 0n : coversGas))[1][1].fee, 3000,
       'if the alternate no longer qualifies, the original can still execute on this block');
     assert.equal((await select(p => [p]))[1][1].fee, 3000, 'the sole candidate still signs on the same head');
@@ -704,7 +724,8 @@ try {
     }
     const old = structuredClone(missed);
     old.submission.startedAt = now - 180_000;
-    old.submission.relayAtTargetHead.result.checkedAt = now - 120_000;
+    old.submission.relayAtTargetHead.requestedAt = now - 120_000;
+    old.submission.relayAtTargetHead.result.checkedAt = now - 115_000;
     old.submission.relayAfterExpiry = { ...failure, checkedAt: now };
     assert.equal((await select(alternatives, old))[1][1].fee, 3000, 'the terminal lookup cannot refresh the ranking penalty');
     const legacy = structuredClone(missed);
@@ -983,58 +1004,74 @@ try {
       journal.file.recent = [p.opp];
       journal.save();
     };
-    let height = 100n;
+    let height = 100n, observedHash, observedTime;
     const requests = [];
     const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+    const observe = async (searcher, block, blockHash, timestamp) => {
+      height = BigInt(block);
+      observedHash = blockHash ?? hash(height);
+      observedTime = timestamp ?? BigInt(Math.floor(Date.now() / 1000));
+      await searcher.head();
+    };
+    const reply = async (index, body) => { requests[index](body); await nextTurn(); };
+    const repayment = { status: 'PENDING', simError: 'ExecutionReverted', revertReason: 'loan repayment' };
     try {
       CONFIG.forkMode = false;
       mevReadClient.getBlock = async ({ blockTag }) => {
         assert.equal(blockTag, 'latest');
-        return { number: height, hash: hash(height) };
+        return { number: height, hash: observedHash, parentHash: hash(height - 1n), timestamp: observedTime };
       };
       mevReadClient.getTransactionCount = async () => 7;
       globalThis.fetch = async (url, { method }) => {
         assert.equal(method, 'GET');
         assert.equal(url, 'https://protect.flashbots.net/tx/' + multi.submitted[0].hash);
         const body = await new Promise(resolve => requests.push(resolve));
-        return new Response(JSON.stringify({ ...body, hash: multi.submitted[0].hash, maxBlockNumber: 103 }));
+        if (body === null) throw new Error('mock status read failed');
+        return new Response(JSON.stringify({ hash: multi.submitted[0].hash, maxBlockNumber: 103, ...body }));
       };
       writePending(freshPending());
+      const started = restore();
+      await observe(started, 100);
+      assert.equal(requests.length, 0, 'submission block is too early');
+      await observe(started, 101);
+      await observe(started, 101);
+      await observe(restore(), 101);
+      assert.equal(requests.length, 1, 'a durable checkpoint covers restarts while an eligible read is outstanding');
+      await reply(0, { status: 'PENDING' });
       const recovered = restore();
       recovered.receipt = async () => null;
-      await recovered.head();
-      assert.equal(requests.length, 0, 'submission block is too early');
-      height = 101n;
-      await recovered.head();
-      assert.equal(requests.length, 1);
-      await recovered.head();
-      height = 102n;
-      await restore().head();
-      assert.equal(requests.length, 1, 'repeat polls and restart while the query is outstanding are bounded');
-      requests[0]({ status: 'PENDING', simError: 'ExecutionReverted', revertReason: 'loan repayment' });
-      await nextTurn();
+      await observe(recovered, 102);
+      await observe(recovered, 102);
+      assert.equal(requests.length, 2);
+      await reply(1, repayment);
+      await observe(recovered, 103);
+      assert.equal(requests.length, 2, 'a specific in-window diagnostic stops later reads');
       const checked = restore().file.pending.opp.submission;
       assert.deepEqual(checked.relayAfterAck, { status: 'PENDING', checkedAt: now });
       assert.equal(checked.relayAtTargetHead.block, 101);
       assert.equal(checked.relayAtTargetHead.blockHash, hash(101));
       assert.equal(checked.relayAtTargetHead.result.status, 'PENDING');
-      assert.equal(checked.relayAtTargetHead.result.revertReason, 'loan repayment');
-      assert.ok(checked.relayAtTargetHead.result.checkedAt >= checked.relayAtTargetHead.requestedAt);
+      assert.equal(checked.relayAtTargetHead.result.revertReason, undefined);
+      assert.equal(checked.relayAtTargetHead.inWindow, true);
+      const [later] = checked.relayAtLaterTargetHeads;
+      assert.equal(later.block, 102);
+      assert.equal(later.blockHash, hash(102));
+      assert.equal(later.result.revertReason, 'loan repayment');
+      assert.equal(later.inWindow, true);
+      assert.ok(later.result.checkedAt >= later.requestedAt);
       assert.equal(checked.relayAfterExpiry, undefined);
       assert.equal(recovered.file.pending.opp.status, 'sent');
-      await restore().head();
-      assert.equal(requests.length, 1);
 
       height = 105n;
       await recovered.reconcileWallet();
       assert.equal(recovered.file.pending, null);
       assert.equal(recovered.file.recent[0].status, 'not included');
-      assert.equal(requests.length, 2);
-      requests[1]({ status: 'FAILED', simError: 'ExecutionReverted', revertReason: 'expired' });
-      await nextTurn();
+      assert.equal(requests.length, 3);
+      await reply(2, { status: 'FAILED', simError: 'ExecutionReverted', revertReason: 'expired' });
       const settled = restore().file.recent[0].submission;
       assert.deepEqual(settled.relayAfterAck, checked.relayAfterAck);
       assert.deepEqual(settled.relayAtTargetHead, checked.relayAtTargetHead);
+      assert.deepEqual(settled.relayAtLaterTargetHeads, checked.relayAtLaterTargetHeads);
       assert.equal(settled.relayAfterExpiry.revertReason, 'expired');
 
       for (const [observed, update] of [
@@ -1046,23 +1083,110 @@ try {
       ]) {
         const p = freshPending();
         update(p);
-        height = observed;
         writePending(p);
-        await restore().head();
-        assert.equal(requests.length, 2);
+        await observe(restore(), observed);
+        assert.equal(requests.length, 3);
       }
       // An ACK may survive a restart before its first status callback finishes.
       const p = freshPending();
       delete p.opp.submission.relayAfterAck;
       writePending(p);
-      height = 102n;
       const resumed = restore();
-      await resumed.head();
-      assert.equal(requests.length, 3);
-      requests[2]({ status: 'INCLUDED' });
-      await nextTurn();
+      await observe(resumed, 102);
+      assert.equal(requests.length, 4);
+      await reply(3, { status: 'INCLUDED' });
       assert.equal(resumed.file.pending.opp.status, 'sent', 'relay status cannot settle a wallet nonce');
       assert.equal(resumed.file.pending.opp.submission.relayAtTargetHead.block, 102);
+      await observe(resumed, 103);
+      assert.equal(requests.length, 4, 'a terminal relay status stops sampling');
+
+      writePending(freshPending());
+      const concurrent = restore();
+      await observe(concurrent, 101);
+      await observe(concurrent, 102);
+      await reply(5, repayment);
+      await reply(4, { status: 'PENDING', simError: 'OutOfGas' });
+      const reordered = restore().file.pending.opp.submission;
+      assert.equal(reordered.relayAtTargetHead.result.simError, 'OutOfGas');
+      assert.equal(reordered.relayAtTargetHead.inWindow, false, 'the observed head changed before the first read completed');
+      assert.equal(reordered.relayAtLaterTargetHeads[0].result.revertReason, 'loan repayment');
+      assert.equal(reordered.relayAtLaterTargetHeads[0].inWindow, true);
+      await observe(concurrent, 103);
+      assert.equal(requests.length, 6);
+
+      const longer = freshPending();
+      longer.target = '106';
+      longer.opp.submission.target = 106;
+      writePending(longer);
+      const partial = restore();
+      await observe(partial, 101);
+      await reply(6, null);
+      const retry = restore();
+      await observe(retry, 101);
+      assert.equal(requests.length, 7, 'a failed read cannot be retried for the same height');
+      await observe(retry, 102);
+      await reply(7, { ...repayment, revertReason: '0x', maxBlockNumber: 106 });
+      await observe(retry, 103);
+      await reply(8, { status: 'UNKNOWN', maxBlockNumber: 106 });
+      await observe(retry, 104);
+      assert.equal(requests.length, 9, 'three eligible attempts cap the automatic status budget');
+      const attempts = restore().file.pending.opp.submission;
+      assert.equal(attempts.relayAtTargetHead.result, undefined);
+      assert.equal(attempts.relayAtLaterTargetHeads[0].result.revertReason, undefined);
+      assert.deepEqual(attempts.relayAtLaterTargetHeads.map(s => s.block), [102, 103]);
+
+      // Legacy single-head journals remain readable and cannot duplicate a request.
+      const original = freshPending();
+      original.opp.submission.relayAtTargetHead = { block: 101, blockHash: hash(101), requestedAt: now,
+        result: { ...repayment, checkedAt: now } };
+      writePending(original);
+      const reorg = restore();
+      await observe(reorg, 101);
+      await observe(reorg, 101, hash(111));
+      assert.equal(requests.length, 9);
+      assert.equal(reorg.file.pending.opp.submission.relayAtTargetHead.inWindow, false, 'reorg invalidates an orphaned diagnosis');
+      await observe(reorg, 102);
+      await reply(9, { ...repayment, maxBlockNumber: 102 });
+      assert.equal(reorg.file.pending.opp.submission.relayAtLaterTargetHeads[0].inWindow, false, 'mismatched relay deadline');
+      await observe(reorg, 103);
+      reorg.receipt = async () => null;
+      height = 105n;
+      await reorg.reconcileWallet();
+      assert.equal(reorg.file.pending, null);
+      await reply(11, { status: 'FAILED', simError: 'ExecutionReverted', revertReason: 'expired' });
+      await reply(10, repayment);
+      const outcome = restore().file.recent[0];
+      assert.equal(outcome.status, 'not included');
+      assert.equal(outcome.gasEth, 0);
+      assert.equal(outcome.submission.relayAfterExpiry.revertReason, 'expired');
+      assert.equal(outcome.submission.relayAtLaterTargetHeads[1].result.revertReason, 'loan repayment');
+      assert.equal(outcome.submission.relayAtLaterTargetHeads[1].inWindow, false, 'a post-settlement reply is diagnostic only');
+
+      writePending(freshPending());
+      const late = restore();
+      await observe(late, 101, hash(101), BigInt(Math.floor(Date.now() / 1000) - 12));
+      await reply(12, repayment);
+      assert.equal(late.file.pending.opp.submission.relayAtTargetHead.inWindow, false, 'a stale observed head cannot qualify a late reply');
+      await observe(late, 102);
+      const replaced = late.file.pending.opp;
+      late.finishBundle({ ...replaced, status: 'not included', note: 'a different confirmed transaction used the nonce' });
+      const replacement = freshPending();
+      replacement.hash = replacement.opp.hash = hash(222);
+      late.file.pending = replacement;
+      late.file.recent.unshift(replacement.opp);
+      await reply(13, repayment);
+      assert.equal(late.file.pending, replacement);
+      assert.equal(replacement.opp.status, 'sent');
+      assert.equal(replacement.opp.submission.relayAtLaterTargetHeads, undefined);
+      assert.equal(replaced.submission.relayAtLaterTargetHeads[0].inWindow, false);
+
+      writePending(freshPending());
+      const diskError = restore();
+      diskError.writeState = () => { throw new Error('mock checkpoint failed'); };
+      await observe(diskError, 101);
+      assert.equal(requests.length, 14, 'a read with no durable checkpoint cannot be dispatched');
+      assert.equal(diskError.file.pending.opp.status, 'sent');
+      assert.equal(diskError.file.pending.opp.submission.relayAtTargetHead, undefined);
     } finally {
       CONFIG.forkMode = forkMode;
       globalThis.fetch = oldFetch;

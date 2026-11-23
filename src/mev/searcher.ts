@@ -121,6 +121,14 @@ function retainRecent(rows: MevOpp[], limit: number, bundleLimit: number): MevOp
   return rows.filter((row) => row.submission ? bundlesLeft-- > 0 : otherRowsLeft-- > 0);
 }
 
+interface RelayHeadSample {
+  block: number;
+  blockHash: Hex;
+  requestedAt: number;
+  result?: PrivateRelayStatus & { checkedAt: number };
+  inWindow?: boolean;
+}
+
 interface BundleSubmission {
   kind?: 'direct';
   privateSubmission?: true;
@@ -132,7 +140,8 @@ interface BundleSubmission {
   gasLimit?: string;
   maxFeePerGasWei?: string;
   relayAfterAck?: PrivateRelayStatus & { checkedAt: number };
-  relayAtTargetHead?: { block: number; blockHash: Hex; requestedAt: number; result?: PrivateRelayStatus & { checkedAt: number } };
+  relayAtTargetHead?: RelayHeadSample;
+  relayAtLaterTargetHeads?: RelayHeadSample[];
   relayAfterExpiry?: PrivateRelayStatus & { checkedAt: number };
   pathQuote?: { routeId: Hex; grossProfitWei: string };
   directSimulation?: { preparedNetUsd: number; blockNetUsd: number; pendingNetUsd: number };
@@ -140,6 +149,19 @@ interface BundleSubmission {
   tipEth: number;
   netUsd: number;
   builders: BuilderResult[];
+}
+
+function relayHeadSamples(submission: BundleSubmission): RelayHeadSample[] {
+  const later = Array.isArray(submission.relayAtLaterTargetHeads)
+    ? submission.relayAtLaterTargetHeads.slice(0, PRIVATE_LIVE_WINDOW - 1) : [];
+  return [submission.relayAtTargetHead, ...later].filter((s): s is RelayHeadSample => Boolean(s));
+}
+
+function decisiveRelayStatus(sample: PrivateRelayStatus | undefined, target: number): boolean {
+  if (!sample || (sample.maxBlockNumber !== undefined && sample.maxBlockNumber !== target)) return false;
+  if (sample.status === 'FAILED' || sample.status === 'CANCELLED' || sample.status === 'INCLUDED') return true;
+  if (sample.simError === 'ExecutionReverted') return Boolean(sample.revertReason);
+  return Boolean(sample.simError && sample.simError !== 'Other');
 }
 
 interface MevStats {
@@ -347,6 +369,7 @@ function reasonOf(e: unknown): string {
 export class MevSearcher {
   private readonly scheduledTraces = new WeakSet<BuilderResult>();
   private readonly requestedExpiryStatuses = new WeakSet<BundleSubmission>();
+  private readonly closedRelayWindows = new WeakSet<PendingBundle>();
   file: MevFile;
   tokens: ArbToken[] = [];
   status = 'starting';
@@ -922,9 +945,15 @@ export class MevSearcher {
       const quote = sub?.pathQuote;
       if (row.status !== 'not included' || row.gasOnlyTestId || sub?.kind !== 'direct' || !sub.privateSubmission || !quote
         || failedGross.has(quote.routeId) || typeof quote.grossProfitWei !== 'string' || !/^[1-9]\d{0,77}$/.test(quote.grossProfitWei)) continue;
-      const failed = [sub.relayAtTargetHead?.result, sub.relayAfterAck].some(sample =>
-        sample?.simError === 'ExecutionReverted' && sample.revertReason === 'loan repayment'
-        && sample.checkedAt >= sub.startedAt && sample.checkedAt <= now && now - sample.checkedAt < PATH_REPAYMENT_RETRY_MS);
+      const freshRepayment = (sample: PrivateRelayStatus | undefined, at: number) => sample?.status === 'PENDING'
+        && sample.simError === 'ExecutionReverted' && sample.revertReason === 'loan repayment'
+        && (sample.maxBlockNumber === undefined || sample.maxBlockNumber === sub.target)
+        && at >= sub.startedAt && at <= now && now - at < PATH_REPAYMENT_RETRY_MS;
+      const failed = (sub.relayAfterAck && freshRepayment(sub.relayAfterAck, sub.relayAfterAck.checkedAt))
+        || relayHeadSamples(sub).some(s => (s.inWindow === true || (s.inWindow === undefined && s === sub.relayAtTargetHead))
+          && s.block > row.block && s.block <= sub.target
+          && s.result && s.result.checkedAt >= s.requestedAt && s.result.checkedAt <= now
+          && s.result.checkedAt - s.requestedAt < SLOT_MS && freshRepayment(s.result, s.requestedAt));
       if (failed) failedGross.set(quote.routeId, BigInt(quote.grossProfitWei));
     }
     if (!failedGross.size) return paths;
@@ -1773,6 +1802,7 @@ export class MevSearcher {
     const p = this.pending;
     if (!p) return;
     const target = BigInt(p.target);
+    if (p.privateSubmission && current > target) this.closedRelayWindows.add(p);
     const confirmations = CONFIG.forkMode ? 0n : RECEIPT_CONFIRMATIONS;
     if (p.kind !== 'direct' && current < target + confirmations) return;
     const receipt = await this.receipt(p.hash);
@@ -1896,7 +1926,7 @@ export class MevSearcher {
   private schedulePrivateStatusAfterAck(pending: PendingBundle) {
     const submission = pending.opp.submission!;
     const lastSlot = submission.startedAt + submission.leadMs + (submission.target - pending.opp.block - 1) * SLOT_MS;
-    const eligible = () => !this.stopping && this.pending === pending && Date.now() < lastSlot
+    const eligible = () => !this.stopping && this.pending === pending && !this.closedRelayWindows.has(pending) && Date.now() < lastSlot
       && (this.lastBlock?.number ?? pending.opp.block) < submission.target;
     if (!eligible()) return;
     // Leave time for a reply before the final eligible slot, even with a one-block order.
@@ -1906,23 +1936,53 @@ export class MevSearcher {
     }, delay).unref();
   }
 
-  private samplePrivateStatusAtHead(pending: PendingBundle, head: { number: bigint; hash: Hex }) {
+  private samplePrivateStatusAtHead(pending: PendingBundle, head: { number: bigint; hash: Hex; parentHash: Hex; timestamp: bigint }) {
     const submission = pending.opp.submission;
-    if (CONFIG.forkMode || this.stopping || !pending.privateSubmission || submission?.kind !== 'direct'
-      || !submission.privateSubmission || submission.rpcAckMs === undefined || submission.relayAtTargetHead
-      || head.number <= BigInt(pending.opp.block) || head.number > BigInt(pending.target)) return;
-    const early = submission.relayAfterAck;
-    if (early && ((early.status !== 'PENDING' && early.status !== 'UNKNOWN') || (early.simError && early.simError !== 'Other'))) return;
-    // Checkpoint the request on the pending journal. Startup can sample an acknowledged
-    // order in its remaining blocks without duplicating a read already in flight.
-    const sample: NonNullable<BundleSubmission['relayAtTargetHead']> = {
-      block: Number(head.number), blockHash: head.hash, requestedAt: Date.now(),
-    };
-    submission.relayAtTargetHead = sample;
-    this.save();
+    if (CONFIG.forkMode || this.stopping || this.pending !== pending || !pending.privateSubmission || submission?.kind !== 'direct'
+      || !submission.privateSubmission || submission.rpcAckMs === undefined) return;
+    const block = Number(head.number);
+    const samples = relayHeadSamples(submission);
+    let changed = false;
+    for (const s of samples) {
+      // The relay supplies no simulated block hash. A reply still outstanding when
+      // the observed head changes, or any sample on an orphaned head, is telemetry only.
+      const orphaned = s.block > block || (s.block === block && s.blockHash !== head.hash)
+        || (s.block === block - 1 && head.parentHash !== undefined && s.blockHash !== head.parentHash);
+      if (s.inWindow !== false && (orphaned || (!s.result && s.block < block))) {
+        s.inWindow = false;
+        changed = true;
+      }
+    }
+    if (head.number > BigInt(pending.target)) this.closedRelayWindows.add(pending);
+    const limit = pending.opp.gasOnlyTestId ? 1 : PRIVATE_LIVE_WINDOW;
+    if (this.closedRelayWindows.has(pending) || block <= pending.opp.block || samples.length >= limit
+      || decisiveRelayStatus(submission.relayAfterAck, submission.target)
+      || samples.some(s => s.block >= block || (s.inWindow !== false && decisiveRelayStatus(s.result, submission.target)))) {
+      if (changed) this.save();
+      return;
+    }
+    const sample: RelayHeadSample = { block, blockHash: head.hash, requestedAt: Date.now() };
+    const first = !submission.relayAtTargetHead;
+    if (first) submission.relayAtTargetHead = sample;
+    else (submission.relayAtLaterTargetHeads ??= []).push(sample);
+    // Dispatch only after a durable checkpoint, including when a restart finds an uncompleted read.
+    try {
+      this.writeState();
+    } catch {
+      if (first) delete submission.relayAtTargetHead;
+      else submission.relayAtLaterTargetHeads!.pop();
+      this.host.log('MEV relay status request could not be journaled.', 'error');
+      return;
+    }
     void requestPrivateRelayStatus(pending.hash).then(status => {
-      if (!status || this.stopping || !this.file.recent.some(row => row.submission === submission)) return;
-      sample.result = { ...status, checkedAt: Date.now() };
+      if (!status || this.stopping || !this.file.recent.some(row => row.hash === pending.hash && row.submission === submission)) return;
+      const checkedAt = Date.now();
+      const headTime = Number(head.timestamp) * 1000;
+      sample.inWindow = sample.inWindow !== false && this.pending === pending && !this.closedRelayWindows.has(pending)
+        && checkedAt >= sample.requestedAt && checkedAt - sample.requestedAt < SLOT_MS
+        && sample.requestedAt >= headTime && checkedAt < headTime + SLOT_MS
+        && (status.maxBlockNumber === undefined || status.maxBlockNumber === submission.target);
+      sample.result = { ...status, checkedAt };
       this.save();
     });
   }
