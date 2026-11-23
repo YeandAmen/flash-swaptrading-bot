@@ -19,7 +19,7 @@ import { submitDirect } from './direct-broadcast.js';
 import { directCadence, extraRoutes, loanLimitWei } from './cadence.js';
 import { EthereumPathPlanner, type EthereumPathCandidate, type EthereumPathResult } from './multihop.js';
 import { HeadBackfill } from './head-backfill.js';
-import { createHeadWake } from './head-wake.js';
+import { createHeadWake, type HeadHint, type HeadWakeResult } from './head-wake.js';
 import { encodePathArbitrage, releaseSupportsPath, pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
 import { comparableRouteQuote, rankRouteNet, routeInputSizes, type RouteQuoteSample } from './sizing.js';
 import { NextVenueKind, UNISWAP_V4_MANAGER } from './next-pools.js';
@@ -257,6 +257,26 @@ interface InventoryProbe {
   sell: ArbPool;
 }
 
+type LoopWake = HeadWakeResult | { source: 'initial' | 'backoff' | 'startup' };
+interface HeadRequestTiming {
+  at: number;
+  start: number;
+  httpMs?: number;
+}
+interface ObservedHeadRequest {
+  block: number;
+  hash: Hex;
+  wake: LoopWake['source'];
+  wakeHash?: string;
+  httpMs: number;
+}
+interface HeadDiscovery extends ObservedHeadRequest {
+  httpStartAgeMs: number;
+  wsAgeMs?: number;
+  wsToHttpStartMs?: number;
+  previousHttp?: ObservedHeadRequest & { startBeforeMs: number };
+}
+
 interface BlockRead {
   blockNumber: bigint;
   timestamp: number;
@@ -270,6 +290,7 @@ interface BlockRead {
   readMs: number;
   snapshotReadyAt?: number; // Process-local monotonic time, used only to measure selection and preparation.
   headAgeMs?: number;
+  headDiscovery?: HeadDiscovery;
   failedChunks: number;
 }
 
@@ -377,7 +398,7 @@ export class MevSearcher {
   tokens: ArbToken[] = [];
   status = 'starting';
   lastError: string | null = null;
-  lastBlock: { number: number; at: number; candidates: number; readMs: number; headAgeMs?: number; decisionMs: number | null; failedChunks: number; inventoryPruned?: number; v3InventoryPruned?: number } | null = null;
+  lastBlock: { number: number; at: number; candidates: number; readMs: number; headAgeMs?: number; headDiscovery?: HeadDiscovery; decisionMs: number | null; failedChunks: number; inventoryPruned?: number; v3InventoryPruned?: number } | null = null;
   private deploying = false;
   private reads: ReturnType<typeof buildStateReads> | null = null;
   private inventoryExits = new Set<string>();
@@ -411,6 +432,7 @@ export class MevSearcher {
     return this.contractReady && release && releaseSupportsPath(release) ? release : null;
   }
   private headWake: ReturnType<typeof createHeadWake> = null;
+  private discoveryObservation?: { data: HeadDiscovery; slotAt: number; requestStart: number };
 
   constructor(private host: MevHost, private persist = true) {
     this.file = this.load();
@@ -566,7 +588,9 @@ export class MevSearcher {
     for (const outcome of this.file.recent) {
       if (outcome?.status === 'not included' && this.traceMissedBundle(outcome) && ++recoveredTraces >= MAX_STARTUP_TRACE_BUNDLES) break;
     }
-    if (!this.stopping && !CONFIG.forkMode && MEV.submission === 'direct') this.headWake = createHeadWake(CONFIG.rpcUrl);
+    if (!this.stopping && !CONFIG.forkMode && MEV.submission === 'direct') {
+      this.headWake = createHeadWake(CONFIG.rpcUrl, hint => this.noteHeadHint(hint));
+    }
     void this.loop();
     if (this.universe.broad && !this.stopping) void this.discoverMorePools();
   }
@@ -621,13 +645,20 @@ export class MevSearcher {
     }
   }
 
-  private async waitForHead(ms: number): Promise<void> {
-    if (this.startupHint && this.contractReady && this.restoredGeneration === this.armGeneration) return;
-    const nextHead = this.headWake?.wait(ms) ?? sleep(ms);
-    if (!this.startupHint) { await nextHead; return; }
-    const verified = new Promise<void>(resolve => { this.wakeAfterVerification = resolve; });
-    try { await Promise.race([nextHead, verified]); }
+  private async waitForHead(ms: number): Promise<LoopWake> {
+    if (this.startupHint && this.contractReady && this.restoredGeneration === this.armGeneration) return { source: 'startup' };
+    const nextHead = this.headWake?.wait(ms) ?? sleep(ms).then(() => ({ source: 'timer' as const }));
+    if (!this.startupHint) return nextHead;
+    const verified = new Promise<LoopWake>(resolve => { this.wakeAfterVerification = () => resolve({ source: 'startup' }); });
+    try { return await Promise.race([nextHead, verified]); }
     finally { this.wakeAfterVerification = undefined; }
+  }
+
+  private noteHeadHint(hint: HeadHint) {
+    const reading = this.discoveryObservation;
+    if (this.stopping || !reading || reading.data.hash.toLowerCase() !== hint.hash || reading.data.wsAgeMs !== undefined) return;
+    reading.data.wsAgeMs = hint.at - reading.slotAt;
+    reading.data.wsToHttpStartMs = Math.round(reading.requestStart - hint.monotonic);
   }
 
   // Called by the head loop only, after the preceding block's ordinary candidates have finished.
@@ -649,19 +680,38 @@ export class MevSearcher {
 
   private async loop() {
     let last: { hash: Hex; number: bigint } | null = null;
+    let wake: LoopWake = { source: 'initial' };
+    let lastHttp: { result: ObservedHeadRequest; start: number } | undefined;
     let backoff = 0;
     while (!this.stopping) {
       try {
         if (!this.universe.broad && Date.now() - this.poolsAt > 24 * HOUR) await this.refreshPools();
-        const head = await this.head();
+        const timing: HeadRequestTiming | undefined = !CONFIG.forkMode && MEV.submission === 'direct'
+          ? { at: Date.now(), start: performance.now() } : undefined;
+        const head = await this.head(timing);
+        const previousHttp = lastHttp;
+        lastHttp = timing?.httpMs === undefined ? undefined : {
+          result: { block: Number(head.number), hash: head.hash, wake: wake.source, wakeHash: 'hash' in wake ? wake.hash : undefined,
+            httpMs: timing.httpMs }, start: timing.start,
+        };
         if (head.hash === last?.hash || (last && head.number < last.number)) {
           await this.reconsiderStartupHead(head);
           const ageMs = Date.now() - Number(head.timestamp) * 1000;
-          await this.waitForHead(ageMs < SLOT_MS + 3000 ? HEAD_RETRY_MS : 1000);
+          wake = await this.waitForHead(ageMs < SLOT_MS + 3000 ? HEAD_RETRY_MS : 1000);
           continue;
         }
         if (MEV.submission === 'direct') void directPriorityFee(directPriorityCap()).catch(() => {});
+        let headDiscovery: HeadDiscovery | undefined;
+        if (timing && lastHttp) {
+          const slotAt = Number(head.timestamp) * 1000;
+          headDiscovery = { ...lastHttp.result, httpStartAgeMs: timing.at - slotAt,
+            previousHttp: previousHttp && { ...previousHttp.result, startBeforeMs: Math.round(timing.start - previousHttp.start) } };
+          this.discoveryObservation = { data: headDiscovery, slotAt, requestStart: timing.start };
+          const hint = this.headWake?.hintFor?.(head.hash);
+          if (hint) this.noteHeadHint(hint);
+        }
         const r = await this.read(head);
+        if (headDiscovery) r.headDiscovery = headDiscovery;
         this.lastError = null;
         await this.onBlock(r);
         const previous = last;
@@ -670,9 +720,10 @@ export class MevSearcher {
         if (this.beforeNextSlot(r)) this.backfill.run((height) => this.scanHistorical(height));
         backoff = 0;
         // Start checking for the next execution head at the expected slot boundary.
-        await this.waitForHead(Math.min(SLOT_MS, Math.max(HEAD_RETRY_MS, r.timestamp * 1000 + SLOT_MS - Date.now())));
+        wake = await this.waitForHead(Math.min(SLOT_MS, Math.max(HEAD_RETRY_MS, r.timestamp * 1000 + SLOT_MS - Date.now())));
       } catch (e) {
         this.lastError = errMsg(e);
+        wake = { source: 'backoff' };
         backoff = Math.min(backoff * 2 + 750, 6_000);
         await sleep(backoff);
       }
@@ -696,8 +747,9 @@ export class MevSearcher {
   }
 
   // ------------------------------------------------------------------ per block
-  private async head() {
+  private async head(timing?: HeadRequestTiming) {
     const head = await mevReadClient.getBlock({ blockTag: 'latest' });
+    if (timing) timing.httpMs = Math.round(performance.now() - timing.start);
     this.file.stats.rpcCalls++;
     if (this.pending) this.samplePrivateStatusAtHead(this.pending, head);
     return head;
@@ -875,7 +927,7 @@ export class MevSearcher {
     }
     this.inventoryExits = new Set([...nextInventory].sort((a, b) => b[1] - a[1])
       .slice(0, MAX_INVENTORY_PROBES).map(([address]) => address));
-    const block = { number: Number(r.blockNumber), at: now, inventoryPruned, v3InventoryPruned, candidates: cands.length, readMs: r.readMs, headAgeMs: r.headAgeMs, decisionMs: null as number | null, failedChunks: r.failedChunks };
+    const block = { number: Number(r.blockNumber), at: now, inventoryPruned, v3InventoryPruned, candidates: cands.length, readMs: r.readMs, headAgeMs: r.headAgeMs, headDiscovery: r.headDiscovery, decisionMs: null as number | null, failedChunks: r.failedChunks };
     this.lastBlock = block;
     if (est) {
       const hb = this.hourBest();

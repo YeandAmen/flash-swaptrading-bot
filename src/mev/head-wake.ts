@@ -1,8 +1,17 @@
 const ALCHEMY_ETHEREUM_HOST = 'eth-mainnet.g.alchemy.com';
 const SUBSCRIBE = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['newHeads'] });
 
+export interface HeadHint {
+  hash: string;
+  at: number;
+  monotonic: number;
+}
+
+export type HeadWakeResult = { source: 'notification' | 'buffered'; hash: string } | { source: 'timer' | 'stopped' };
+
 interface HeadWake {
-  wait(ms: number): Promise<void>;
+  wait(ms: number): Promise<HeadWakeResult>;
+  hintFor(hash: string): HeadHint | undefined;
   stop(): void;
 }
 
@@ -14,7 +23,7 @@ interface HeadMessage {
 }
 
 /** Use WebSocket notifications as wake hints. All head reads and checks still use HTTP. */
-export function createHeadWake(rpcUrl: string): HeadWake | null {
+export function createHeadWake(rpcUrl: string, onHint?: (hint: HeadHint) => void): HeadWake | null {
   if (typeof WebSocket === 'undefined') return null;
   let url: URL;
   try {
@@ -33,11 +42,13 @@ export function createHeadWake(rpcUrl: string): HeadWake | null {
   let stopped = false;
   let buffered = false;
   let lastHash: string | undefined;
-  const waiters = new Set<() => void>();
+  // Preserve the first arrival across interleaved heads and delayed HTTP responses.
+  const hints = new Map<string, HeadHint>();
+  const waiters = new Set<(result: HeadWakeResult) => void>();
 
-  function notify() {
+  function notify(hash: string) {
     buffered = waiters.size === 0;
-    for (const wake of waiters) wake();
+    for (const wake of waiters) wake({ source: 'notification', hash });
   }
 
   function retry() {
@@ -77,7 +88,7 @@ export function createHeadWake(rpcUrl: string): HeadWake | null {
       retry();
     }, { once: true });
     stream.addEventListener('message', ({ data }) => {
-      if (stopped || typeof data !== 'string') return;
+      if (stopped || stream !== socket || typeof data !== 'string') return;
       let msg: HeadMessage | null;
       try {
         msg = JSON.parse(data);
@@ -93,35 +104,45 @@ export function createHeadWake(rpcUrl: string): HeadWake | null {
       const hash = msg.params.result?.hash;
       if (typeof hash !== 'string' || !/^0x[\da-f]{64}$/i.test(hash)) return;
       resetTimeout(45_000);
-      if (hash === lastHash) return;
-      lastHash = hash;
-      notify();
+      const key = hash.toLowerCase();
+      if (key === lastHash) return;
+      lastHash = key;
+      if (!hints.has(key)) {
+        const hint = { hash: key, at: Date.now(), monotonic: performance.now() };
+        hints.set(key, hint);
+        if (hints.size > 4) hints.delete(hints.keys().next().value!);
+        onHint?.(hint);
+      }
+      notify(key);
     });
   }
 
   connect();
   return {
     wait(ms) {
-      if (stopped || buffered) {
+      if (stopped) return Promise.resolve({ source: 'stopped' });
+      if (buffered && lastHash) {
         buffered = false;
-        return Promise.resolve();
+        return Promise.resolve({ source: 'buffered', hash: lastHash });
       }
-      return new Promise<void>((resolve) => {
-        const wake = () => {
+      return new Promise<HeadWakeResult>((resolve) => {
+        const wake = (result: HeadWakeResult) => {
           clearTimeout(timer);
           waiters.delete(wake);
-          resolve();
+          resolve(result);
         };
-        const timer = setTimeout(wake, ms);
+        const timer = setTimeout(() => wake({ source: 'timer' }), ms);
         waiters.add(wake);
       });
     },
+    hintFor(hash) { return hints.get(hash.toLowerCase()); },
     stop() {
       stopped = true;
       clearTimeout(reconnect);
       clearTimeout(timeout);
       socket?.close();
-      for (const wake of waiters) wake();
+      hints.clear();
+      for (const wake of waiters) wake({ source: 'stopped' });
     },
   };
 }

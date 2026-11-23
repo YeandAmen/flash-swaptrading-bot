@@ -122,6 +122,77 @@ try {
     });
   }
 
+  // Drive the production head loop through one stale HTTP response and a same-height reorg.
+  {
+    const worker = newSearcher(() => assert.fail('head discovery cannot sign'));
+    const original = { getBlock: mevReadClient.getBlock, fees: mevReadClient.getFeeHistory, fork: CONFIG.forkMode,
+      now: Date.now, monotonic: performance.now };
+    const slotAt = Math.floor(now / 1000) * 1000;
+    const hints = new Map(), published = [], pollDelays = [];
+    let clock = 1000, requested = 0;
+    const hint = (blockHash, at) => {
+      const info = { hash: blockHash, at: slotAt + at, monotonic: at };
+      hints.set(blockHash, info);
+      worker.noteHeadHint(info);
+    };
+    try {
+      CONFIG.forkMode = false;
+      Date.now = () => slotAt + clock;
+      performance.now = () => clock;
+      worker.poolsAt = slotAt;
+      worker.reconcileWallet = async () => {};
+      worker.scanPaths = () => undefined;
+      worker.save = () => {};
+      worker.read = async header => ({ ...snapshot(Date.now()), blockNumber: header.number, hash: header.hash,
+        timestamp: Number(header.timestamp), tokens: [], at: [], results: [] });
+      const process = worker.onBlock.bind(worker);
+      worker.onBlock = async row => { await process(row); published.push(worker.lastBlock.headDiscovery); };
+      mevReadClient.getFeeHistory = async () => ({ reward: [[100_000_000n, 300_000_000n]] });
+      mevReadClient.getBlock = async () => {
+        const i = requested++;
+        if (i > 3) { worker.stopping = true; throw Error('extra head request'); }
+        const number = i < 2 ? 100n : 101n;
+        clock += i === 1 ? 20 : 30;
+        return { number, hash: hash(i === 3 ? 111 : number), timestamp: BigInt(slotAt / 1000 - (i < 2 ? 12 : 0)) };
+      };
+      worker.headWake = {
+        hintFor: key => hints.get(key),
+        wait: async ms => {
+          pollDelays.push(ms);
+          switch (pollDelays.length) {
+            case 1: hint(hash(101), 1050); clock = 1060; return { source: 'notification', hash: hash(101) };
+            case 2: clock = 1480; return { source: 'timer' };
+            case 3: clock = 1540; return { source: 'timer' };
+            default:
+              hint(hash(101), 1580); // The prior fork's result must keep its original first arrival.
+              hint(hash(111), 1595); // This hint arrives after HTTP and dashboard publication.
+              worker.stopping = true;
+              hint(hash(111), 1610);
+              return { source: 'stopped' };
+          }
+        },
+      };
+      await worker.loop();
+      assert.equal(worker.lastError, null);
+      assert.equal(requested, 4);
+      assert.equal(pollDelays[1], 400, 'the stale response used the existing fallback timer');
+      assert.deepEqual(published.map(p => [p.block, p.hash, p.wake]), [
+        [100, hash(100), 'initial'], [101, hash(101), 'timer'], [101, hash(111), 'timer'],
+      ]);
+      assert.equal(published[0].wsAgeMs, undefined, 'a child hint cannot be attributed to the HTTP parent');
+      assert.deepEqual(published[1], { block: 101, hash: hash(101), wake: 'timer', wakeHash: undefined,
+        httpStartAgeMs: 1480, httpMs: 30, wsAgeMs: 1050, wsToHttpStartMs: 430,
+        previousHttp: { block: 100, hash: hash(100), wake: 'notification', wakeHash: hash(101), httpMs: 20, startBeforeMs: 420 } });
+      assert.equal(published[2].wsAgeMs, 1595);
+      assert.equal(published[2].wsToHttpStartMs, -55, 'a negative delta records a hint after HTTP started');
+    } finally {
+      Object.assign(mevReadClient, { getBlock: original.getBlock, getFeeHistory: original.fees });
+      CONFIG.forkMode = original.fork;
+      Date.now = original.now;
+      performance.now = original.monotonic;
+    }
+  }
+
   // A virtual v4 reserve can imply a large trade even when the manager holds only token dust.
   // Both pool states and the optional exit-specific balance are returned by the same pinned call.
   {
