@@ -21,10 +21,25 @@ const rent = 4_079_040;
 const walletBalance = 20_000_000;
 const expires = 150n;
 
-function testCandidate(wallet: Address, blockhash = '11111111111111111111111111111111'): PreparedSolanaCycle {
+function loanInstructions(loan: bigint, borrowIndex: number) {
+  const borrow = Buffer.alloc(16);
+  const repay = Buffer.alloc(17);
+  Buffer.from('87e734a70734d4c1', 'hex').copy(borrow);
+  Buffer.from('b97500cb60f5b4ba', 'hex').copy(repay);
+  borrow.writeBigUInt64LE(loan, 8);
+  repay.writeBigUInt64LE(loan, 8);
+  repay[16] = borrowIndex;
+  return { borrow, repay };
+}
+
+function testCandidate(wallet: Address, blockhash = '11111111111111111111111111111111',
+  flash?: ReturnType<typeof loanInstructions>): PreparedSolanaCycle {
   assertIsBlockhash(blockhash);
   const sequence = [LIGHTHOUSE, LIGHTHOUSE, KAMINO, JUPITER, JUPITER, KAMINO, LIGHTHOUSE, LIGHTHOUSE];
-  const message = appendTransactionMessageInstructions(sequence.map((programAddress) => ({ programAddress })),
+  const instructions = sequence.map((programAddress, index) => ({
+    programAddress, data: index === 2 ? flash?.borrow : index === 5 ? flash?.repay : undefined,
+  }));
+  const message = appendTransactionMessageInstructions(instructions,
     setTransactionMessageLifetimeUsingBlockhash({ blockhash, lastValidBlockHeight: expires },
       setTransactionMessageFeePayer(wallet, createTransactionMessage({ version: 0 }))));
   return {
@@ -40,13 +55,7 @@ async function testLossCandidate(wallet: Address, id: string, blockhash: string,
   assertIsBlockhash(blockhash);
   const swapLossGuard = { cap: 20_000n, baselineUsdc: 1_000_000n, baselineWsol: 90_000_000n, baselineLamports: BigInt(walletBalance) };
   const nativeFloor = swapLossGuard.baselineLamports - BigInt(fee);
-  const borrow = Buffer.alloc(16);
-  const repay = Buffer.alloc(17);
-  Buffer.from('87e734a70734d4c1', 'hex').copy(borrow);
-  Buffer.from('b97500cb60f5b4ba', 'hex').copy(repay);
-  borrow.writeBigUInt64LE(base.loan, 8);
-  repay.writeBigUInt64LE(base.loan, 8);
-  repay[16] = 4;
+  const { borrow, repay } = loanInstructions(base.loan, 4);
   const template = setTransactionMessageComputeUnitPrice(1_000n, setTransactionMessageComputeUnitLimit(1_400_000,
     setTransactionMessageLifetimeUsingBlockhash({ blockhash, lastValidBlockHeight: expires },
       setTransactionMessageFeePayer(wallet, createTransactionMessage({ version: 0 })))));
@@ -258,6 +267,7 @@ test('Solana journals before raw send and restores one pending signature across 
   assert.equal(rawSendCount, 1);
   assert.ok(pendingSignature);
   assert.equal(original.summary.pending, pendingSignature);
+  const ordinaryPending = JSON.parse(fs.readFileSync(journal, 'utf8')).pending;
   await original.submit(candidate);
   assert.equal(rawSendCount, 1);
   original.stop();
@@ -410,5 +420,67 @@ test('Solana journals before raw send and restores one pending signature across 
     assert.equal(recovered.summary.test?.status, 'failed');
     assert.equal(recovered.summary.armed, false);
     recovered.stop();
+  });
+
+  await t.test('only verified positive ordinary receipts update the durable autonomous profit record', async (t) => {
+    // initialize() verifies the test key with a challenge. No submission or cryptographic signing is needed for reconciliation.
+    t.mock.method(crypto.subtle, 'sign', async () => new Uint8Array(64).buffer);
+    t.mock.method(crypto.subtle, 'verify', async () => true);
+    const legacy = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    delete legacy.lastAutoProfit;
+    legacy.lastOutcome = { ...legacy.lastOutcome, status: 'finalized', netUsdc: 12 };
+    fs.writeFileSync(journal, JSON.stringify(legacy));
+    const readDisk = () => JSON.parse(fs.readFileSync(journal, 'utf8'));
+    const cases = [
+      { status: 'finalized', gross: 420_000, net: 0.128182, missingLoan: true },
+      { status: 'finalized', gross: 420_000, net: 0.128182, ordinaryProfit: true },
+      { status: 'finalized', gross: 650_000, net: 0.358182, wrongPrincipal: true },
+      { status: 'finalized', gross: 650_000, net: 0.358182, wrongRepayIndex: true },
+      { status: 'finalized', gross: 650_000, net: 0.358182, manualHashOnly: true },
+      { status: 'finalized', gross: 650_000, net: 0.358182, manual: true },
+      { status: 'failed', gross: 0 }, { status: 'expired', gross: 0 },
+      { status: 'invariant-breach', gross: 300_000, net: 0.008182 },
+      { status: 'invariant-breach', gross: 291_818, net: 0 },
+      { status: 'invariant-breach', gross: 0, net: -0.291818 },
+      { status: 'finalized', gross: 500_000, net: 0.208182, ordinaryProfit: true },
+    ] as const;
+    let expected: typeof original.summary.lastAutoProfit = null;
+    const sends = rawSendCount;
+    for (const [i, scenario] of cases.entries()) {
+      const principal = BigInt(ordinaryPending.loan);
+      const flash = loanInstructions(principal, 'wrongRepayIndex' in scenario ? 1 : 2);
+      if ('wrongPrincipal' in scenario) flash.repay.writeBigUInt64LE(principal + 1n, 8);
+      candidate = testCandidate(wallet, ordinaryPending.blockhash, 'missingLoan' in scenario ? undefined : flash);
+      const tx = getBase58Decoder().decode(new Uint8Array(64).fill(50 + i));
+      const state = readDisk();
+      const manual = 'manual' in scenario;
+      const now = Date.now();
+      state.pending = { ...ordinaryPending, signature: tx, ...(manual ? { testId: 'manual-profit', minimumNet: '1' } : {}) };
+      if (manual || 'manualHashOnly' in scenario) state.test = { id: 'manual-profit', queuedAt: now, expiresAt: now + 60_000,
+        status: manual ? 'submitted' : 'landed', hash: tx, checked: 1, note: 'Offline receipt fixture' };
+      fs.writeFileSync(journal, JSON.stringify(state));
+      pendingSignature = tx;
+      seenSignatures.add(tx);
+      finalizedReceipt = scenario.status === 'expired' ? 'none' : scenario.status === 'failed' ? 'failed' : 'success';
+      height = 210 + i;
+      slot = 300 + i;
+      blockhashValid = false;
+      simulationMeta.preTokenBalances = preTokens;
+      simulationMeta.postTokenBalances = [token(USDC, String(1_000_000 + scenario.gross), 6), token(WRAPPED_SOL, '90000000', 9)];
+      simulationMeta.postBalances = [walletBalance - fee - rent];
+      const resumed = makeWorker();
+      await resumed.initialize();
+      assert.deepEqual(resumed.summary.lastAutoProfit, expected, 'restart preserves a proven fill and leaves ambiguous legacy history empty');
+      await resumed.reconcile();
+      const outcome = resumed.summary.lastOutcome;
+      assert.equal(outcome?.signature, tx);
+      assert.equal(outcome.status, scenario.status);
+      if ('net' in scenario) assert.equal(outcome.netUsdc, scenario.net, 'counts the actual wallet debit, including rent');
+      if ('ordinaryProfit' in scenario) expected = { signature: outcome.signature, at: outcome.at, netUsdc: scenario.net, slot };
+      assert.deepEqual(resumed.summary.lastAutoProfit, expected);
+      assert.deepEqual(readDisk().lastAutoProfit, expected, 'settlement and marker persist together');
+      resumed.stop();
+    }
+    assert.equal(rawSendCount, sends);
   });
 });

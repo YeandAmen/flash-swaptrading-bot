@@ -191,6 +191,33 @@ function renderNetworkSettlement(network, pending, outcome) {
   setNetworkMarkup(network + 'Settlement', links.join('') || '<span class="sub">No settled transaction recorded.</span>');
 }
 
+function renderAutoProfit(network, record) {
+  const id = network + 'AutoProfit';
+  $(id).hidden = record === undefined;
+  if (record === undefined) return;
+  if (record === null) {
+    setNetworkMarkup(id, 'No confirmed profitable automatic trade recorded.');
+    return;
+  }
+  const solana = network === 'solana';
+  const net = solana ? record.netUsdc : record.netUsd;
+  const link = networkLink(network, 'tx', solana ? record.signature : record.hash, 'View transaction ↗');
+  if (!link || !Number.isFinite(net) || net <= 0 || !Number.isFinite(record.at) || record.at <= 0) {
+    setNetworkMarkup(id, 'Automatic trade receipt unavailable.');
+    return;
+  }
+  const amount = solana ? net.toLocaleString('en-US', { maximumFractionDigits: 6 }) + ' USDC' : '≈' + networkUsd(net);
+  setNetworkMarkup(id, 'Last profitable automatic trade · <b class="pos">' + amount + ' net</b> · ' + esc(time(record.at)) + ' · ' + link);
+}
+
+function mevRowLabel(row) {
+  if (row.status === 'failed' && !row.hash && !row.submission && /^(?:multi-hop )?simulation:/i.test(row.note ?? '')) {
+    return 'Simulation failed';
+  }
+  if (row.status === 'failed' && row.note === 'confirmed revert; gas spent') return 'Confirmed revert';
+  return row.status;
+}
+
 function arbitrumRecoveryDetail(recovery) {
   if (!(recovery?.remaining > 0)) return '';
   const counts = [
@@ -314,6 +341,9 @@ function renderNetworks(networks) {
 function render() {
   if (!S) return;
   renderNetworks(S.networks);
+  renderAutoProfit('ethereum', S.mev?.lastAutoProfit);
+  renderAutoProfit('arbitrum', S.networks?.arbitrum?.lastAutoProfit);
+  renderAutoProfit('solana', S.networks?.solana?.execution?.lastAutoProfit);
   const c = S.chain;
   $('cBlock').textContent = c ? c.block.toLocaleString() : '–';
   const g = (x) => (x < 0.01 ? x.toPrecision(2) : x.toFixed(2));
@@ -548,7 +578,7 @@ function render() {
       : `${B.grossEth.toFixed(5)} <span class="sub">vs ${B.gasEth.toFixed(5)} ETH gas</span>`;
     $('mevGap').innerHTML = bestVal + (B ? `<div class="sub">${esc(B.symbol)}${direct ? '' : ' · before builder bid'}</div>` : '');
     $('mevSims').textContent = `${st.simulated} / ${st.profitable}`;
-    $('mevSubmissionLabel').textContent = direct ? 'Direct attempts / landed' : 'Bundles sent / landed';
+    $('mevSubmissionLabel').textContent = direct ? 'All direct attempts / landed' : 'All bundles sent / landed';
     $('mevBundles').textContent = direct
       ? `${st.directAttempts ?? 0} / ${st.directLanded ?? 0}`
       : `${st.bundles} / ${st.landed - (st.directLanded ?? 0)}`;
@@ -560,7 +590,7 @@ function render() {
     mevBody.innerHTML = (X.recent || []).length ? X.recent.map((o) => `<tr><td>${hm(o.t)}</td><td><b>${esc(o.symbol)}</b></td>
       <td class="why">${esc(o.buy)} → ${esc(o.sell)}${o.funding ? `<div class="sub">${esc(o.funding)}</div>` : ''}</td><td class="r">${o.sizeEth.toFixed(3)}</td><td class="r">${o.grossEth.toFixed(5)}</td>
       <td class="r">${o.gasEth.toFixed(5)}</td><td class="r ${cls(o.netEth)}">${o.netEth.toFixed(5)}</td>
-      <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(o.status)}</span>${o.gasOnlyTestId ? ' <span class="sub">Manual test</span>' : ''}${o.count > 1 ? ` <span class="sub">×${o.count}</span>` : ''}
+      <td><span class="tag ${rTag[o.status] || 'flat'}">${esc(mevRowLabel(o))}</span>${o.gasOnlyTestId ? ' <span class="sub">Manual test</span>' : ''}${o.count > 1 ? ` <span class="sub">${networkNumber(o.count)} evaluations</span>` : ''}
       <span class="why">${esc(o.note || '')}</span>${o.hash && (o.status === 'landed' || (o.submission?.kind === 'direct' && !S.forkMode)) ? ` <a href="https://etherscan.io/tx/${esc(o.hash)}" target="_blank" rel="noopener noreferrer">tx↗</a>` : ''}${submissionDetails(o.submission, openSubmissions)}</td></tr>`).join('')
       : '<tr><td colspan="8" class="empty">No price gap has beaten pool fees + gas yet. Small gaps are usually closed by professional bots in the same block.</td></tr>';
   }

@@ -188,11 +188,12 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
       <h3 id="ethereumMevHeading">Ethereum MEV &amp; flash loans <span id="mevMode"></span></h3>
       <div class="sub" id="mevStatus" style="margin:-4px 0 10px">Starting…</div>
       <p class="sub" id="ethPathStatus" hidden></p>
+      <p class="sub" id="ethereumAutoProfit" hidden></p>
       <div class="stats">
         <div class="stat"><div class="l">Blocks scanned</div><div class="v" id="mevBlocks">–</div></div>
         <div class="stat"><div class="l" title="Best successful on-chain simulation this hour, before transaction costs">Best simulation this hour</div><div class="v" id="mevGap">–</div></div>
         <div class="stat"><div class="l">Simulated / profitable</div><div class="v" id="mevSims">–</div></div>
-        <div class="stat"><div class="l" id="mevSubmissionLabel">Submissions / landed</div><div class="v" id="mevBundles">–</div></div>
+        <div class="stat"><div class="l" id="mevSubmissionLabel" title="Includes automatic trades and manual tests">All submissions / landed</div><div class="v" id="mevBundles">–</div></div>
         <div class="stat"><div class="l">MEV profit (after gas)</div><div class="v" id="mevProfit">–</div></div>
         <div class="stat"><div class="l">RPC calls used</div><div class="v" id="mevRpc">–</div></div>
       </div>
@@ -250,6 +251,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
         <div class="network-detail">
           <h4>Latest transaction</h4>
           <div id="arbitrumSettlement" class="network-links">–</div>
+          <p class="sub" id="arbitrumAutoProfit" hidden></p>
           <p id="arbitrumTest" class="network-test" hidden></p>
         </div>
         <div class="network-detail">
@@ -278,6 +280,7 @@ footer{max-width:1320px;margin:0 auto;padding:0 20px 40px;color:var(--muted);fon
         <div class="network-detail">
           <h4>Latest transaction</h4>
           <div id="solanaSettlement" class="network-links">–</div>
+          <p class="sub" id="solanaAutoProfit" hidden></p>
           <p id="solanaTest" class="network-test" hidden></p>
         </div>
         <div class="network-detail">

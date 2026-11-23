@@ -12,6 +12,7 @@ const adminSlot = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5
 const previousRelease = keccak256(ARBITRUM_FLASH_ARB_LOGIC_RUNTIME);
 export const arbitrumReleaseHash = keccak256(ARBITRUM_FLASH_ARB_LOGIC_V2_RUNTIME);
 export const arbitrumSupportsPaths = (release: Hex | null | undefined) => release?.toLowerCase() === arbitrumReleaseHash;
+export const reviewedArbitrumRelease = (release: Hex) => release === previousRelease || release === arbitrumReleaseHash;
 
 export type ArbitrumExecutor =
   | { kind: 'standalone'; implementation: null; releaseHash: null }
@@ -52,7 +53,7 @@ export async function verifyArbitrumExecutor(
   const releaseHash = keccak256(code);
   const configured = process.env.ARBITRUM_RELEASE_HASH?.toLowerCase();
   if (requiredRelease ? releaseHash !== requiredRelease.toLowerCase()
-    : releaseHash !== arbitrumReleaseHash && releaseHash !== previousRelease && releaseHash !== configured) {
+    : !reviewedArbitrumRelease(releaseHash) && releaseHash !== configured) {
     throw new Error('Arbitrum proxy implementation does not match an approved release');
   }
   return { kind: 'proxy', implementation, releaseHash };

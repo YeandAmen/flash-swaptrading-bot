@@ -1,6 +1,8 @@
 # ETH Token Bot
 
-A local Ethereum mainnet dashboard for Uniswap v3 spot strategies and two-pool arbitrage. It runs on Node.js on macOS, Linux, or Windows. The spot engine can use momentum rules or a calibrated ML model. The MEV engine scans supported pools using a consistent Ethereum block and simulates candidates before considering a transaction.
+This Node.js bot runs Ethereum spot strategies and scans for flash-loan arbitrage on Ethereum, Arbitrum and Solana. It runs on macOS, Linux and Windows. The Ethereum spot engine supports momentum rules or a calibrated ML model. Each arbitrage worker checks loan repayment, fees and expected proceeds before submitting a trade.
+
+Each network on the dashboard shows its last confirmed profitable automatic trade and links to the transaction. This record starts with automatic orders submitted by a release that tracks their origin and survives restarts. Manual tests appear in the activity history and count toward the Ethereum submission totals. A failed simulation is an off-chain evaluation.
 
 `ALLOW_LIVE_TRADING=off` is the default. It disables all mainnet signing from the bot, including trades, gas top-ups, contract deployment, and MEV bundles. Paper spot and MEV scans use public state and leave the wallet unfunded. Ethereum starts disarmed by default. With `ETHEREUM_AUTO_ARM=on`, the service restores explicitly armed modes after startup readiness checks. An explicit disarm or panic saves the stop across restarts.
 

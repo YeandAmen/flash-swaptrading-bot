@@ -8,7 +8,7 @@ import { writeJson } from '../persistence.js';
 import { loadOrCreateWallet } from '../wallet.js';
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
 import { broadcastArbitrum, type ArbitrumBroadcast } from './broadcast.js';
-import { arbitrumSupportsPaths, verifyArbitrumExecutor, type ArbitrumExecutor } from './proxy.js';
+import { arbitrumSupportsPaths, reviewedArbitrumRelease, verifyArbitrumExecutor, type ArbitrumExecutor } from './proxy.js';
 import { ARBITRUM_FLASH_ARB_LOGIC_V2_ABI } from './artifact-logic-v2.js';
 import { scanArbitrumPaths, type ArbPathQuote } from './paths.js';
 import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
@@ -42,11 +42,30 @@ const preparationStatus: Record<ArbitrumOrderRejection, string> = {
   'fee-rpc': 'Arbitrum RPC failed during fee estimation',
   'simulation-rpc': 'Arbitrum RPC failed during pending simulation',
 };
-type Pending = ArbitrumIntent & { ethUsd: number; budgetUsd: number; executor?: Address; owner?: Address;
+type Pending = ArbitrumIntent & { ethUsd: number; budgetUsd: number; executor?: Address; owner?: Address; automatic?: boolean;
   path?: { asset: Address; decimals: number; assetUsd: number; amount: string; hops: number } };
 type Settlement = { hash: Hash; status: 'landed' | 'reverted' | 'unverified' | 'replaced' | 'expired'; gasUsd: number; netUsd: number; at: number;
   loanUsd?: number; replacementHash?: Hash };
-type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest };
+type AutoProfit = { hash: Hash; owner: Address; at: number; netUsd: number; block: number };
+type Journal = { pending: Pending | null; recent: Settlement[]; test?: FlashTest; lastAutoProfit?: AutoProfit };
+
+function matchesOwner(signer: unknown, owner: Address) {
+  return typeof signer === 'string' && isAddress(signer, { strict: false }) && signer.toLowerCase() === owner.toLowerCase();
+}
+
+function ownerAutoProfit(fill: AutoProfit | undefined, owner: Address): AutoProfit | null {
+  if (!fill || !matchesOwner(fill.owner, owner) || typeof fill.hash !== 'string' || !/^0x[\da-f]{64}$/i.test(fill.hash)
+    || !Number.isSafeInteger(fill.block) || fill.block <= 0 || !Number.isSafeInteger(fill.at) || fill.at <= 0
+    || !Number.isFinite(fill.netUsd) || fill.netUsd <= 0) return null;
+  return { owner: fill.owner, hash: fill.hash, at: fill.at, block: fill.block, netUsd: fill.netUsd };
+}
+
+function readJournal(): Journal {
+  if (!fs.existsSync(journalFile)) return { pending: null, recent: [] };
+  const journal: Journal = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+  if (!Array.isArray(journal.recent) || !Object.hasOwn(journal, 'pending')) throw new Error('Invalid Arbitrum trade journal');
+  return journal;
+}
 
 function receiptStatus(broadcast?: ArbitrumBroadcast): string {
   const alternate = broadcast?.via === 'alternate';
@@ -124,9 +143,14 @@ export class ArbitrumWorker {
     preparationRejections: {} as Partial<Record<ArbitrumOrderRejection, number>>,
     executor: isAddress(this.contract) ? this.contract : null,
     balanceEth: null as string | null, pending: null as Hash | null, settled: null as Settlement | null,
+    lastAutoProfit: null as AutoProfit | null,
   };
 
-  constructor(private readonly scanPaths = scanArbitrumPaths) {}
+  constructor(private readonly scanPaths = scanArbitrumPaths) {
+    // A disarmed or offline restart can still display an already confirmed fill.
+    try { this.summary.lastAutoProfit = ownerAutoProfit(readJournal().lastAutoProfit, this.owner); }
+    catch { /* Live initialization reports an invalid journal before trading. */ }
+  }
 
   view() {
     return { ...this.summary, deployment: this.deployment, logs: this.activity.view(),
@@ -400,6 +424,7 @@ export class ArbitrumWorker {
       const hash = keccak256(serializedTransaction);
       this.save({ ...this.journal, pending: { hash, nonce, ethUsd, budgetUsd: prepared.worstGasUsd,
         owner: account.address, executor: this.contract,
+        automatic: !test && (release === null ? this.deployment.kind === 'standalone' : reviewedArbitrumRelease(release)),
         ...('legs' in candidate ? { path: { asset: candidate.asset, decimals: candidate.decimals, assetUsd: candidate.assetUsd,
           amount: candidate.amountIn.toString(), hops: candidate.legs.length } } : {}),
         signedAtBlock: head.toString(), deadline: prepared.deadline.toString() },
@@ -438,15 +463,10 @@ export class ArbitrumWorker {
   }
 
   private openJournal() {
-    if (fs.existsSync(journalFile)) {
-      const journal: Journal = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
-      if (!Array.isArray(journal.recent) || !Object.hasOwn(journal, 'pending')) throw new Error('Invalid Arbitrum trade journal');
-      this.journal = journal;
-    } else {
-      this.journal = { pending: null, recent: [] };
-    }
+    this.journal = readJournal();
     this.summary.pending = this.journal.pending?.hash ?? null;
     this.summary.settled = this.journal.recent[0] ?? null;
+    this.summary.lastAutoProfit = ownerAutoProfit(this.journal.lastAutoProfit, this.owner);
     if (this.summary.settled) this.logSettlement(this.summary.settled);
   }
 
@@ -476,6 +496,7 @@ export class ArbitrumWorker {
     this.journal = next;
     this.summary.pending = next.pending?.hash ?? null;
     this.summary.settled = next.recent[0] ?? null;
+    this.summary.lastAutoProfit = ownerAutoProfit(next.lastAutoProfit, this.owner);
   }
 
   private async reconcile() {
@@ -500,6 +521,14 @@ export class ArbitrumWorker {
     const [funding] = parseEventLogs({ abi: ARBITRUM_FLASH_ARB_ABI, eventName: 'FundedBy', logs });
     const fee = receipt.gasUsed * receipt.effectiveGasPrice;
     const gasUsd = Number(formatEther(fee)) * pending.ethUsd;
+    const settle = (status: Settlement['status'], netUsd: number, loanUsd: number | undefined, paidOwner: boolean) => {
+      const outcome = { hash: pending.hash, at: now, status, netUsd, gasUsd, loanUsd };
+      const confirmedAutoProfit = pending.automatic === true && matchesOwner(pending.owner, this.owner) && journal.test?.hash !== pending.hash
+        && paidOwner && status === 'landed' && gasUsd > 0 && Number.isFinite(netUsd) && netUsd > 0;
+      this.save({ ...journal, pending: null, recent: [outcome, ...recent],
+        ...(confirmedAutoProfit ? { lastAutoProfit: { hash: pending.hash, owner, at: now, netUsd, block: Number(receipt.blockNumber) } } : {}),
+      });
+    };
     if (pending.path) {
       const path = pending.path;
       const [cycle] = parseEventLogs({ abi: ARBITRUM_FLASH_ARB_LOGIC_V2_ABI, eventName: 'PathArbitrage', logs });
@@ -514,18 +543,16 @@ export class ArbitrumWorker {
         && transferred(morpho, executor, principal) && transferred(executor, morpho, principal)
         && transferred(executor, owner, cycle.args.profit);
       const gainUsd = landed ? Number(formatUnits(cycle.args.profit, path.decimals)) * path.assetUsd : 0;
-      this.save({ ...journal, pending: null, recent: [{
-        hash: pending.hash, status: landed ? 'landed' : receipt.status === 'success' ? 'unverified' : 'reverted', gasUsd,
-        netUsd: gainUsd - gasUsd, loanUsd: landed ? Number(formatUnits(principal, path.decimals)) * path.assetUsd : undefined, at: now,
-      }, ...recent] });
+      settle(landed ? 'landed' : receipt.status === 'success' ? 'unverified' : 'reverted', gainUsd - gasUsd,
+        landed ? Number(formatUnits(principal, path.decimals)) * path.assetUsd : undefined, !!landed);
       return;
     }
     const landed = receipt.status === 'success' && event;
     const proceeds = landed ? event.args.profit - event.args.tip : 0n;
-    this.save({ ...journal, pending: null, recent: [{
-      hash: pending.hash, status: landed ? 'landed' : 'reverted', gasUsd,
-      netUsd: Number(formatEther(proceeds - fee)) * pending.ethUsd, at: now,
-      loanUsd: landed && funding ? Number(formatEther(funding.args.amount)) * pending.ethUsd : undefined,
-    }, ...recent] });
+    // The reviewed executor emits Arbitrage only after its native ETH payment to owner succeeds.
+    const paidOwner = !!landed && event.args.tip === 0n && event.args.amountIn > 0n
+      && funding?.args.funding === 1 && funding.args.amount === event.args.amountIn;
+    settle(landed ? 'landed' : 'reverted', Number(formatEther(proceeds - fee)) * pending.ethUsd,
+      landed && funding ? Number(formatEther(funding.args.amount)) * pending.ethUsd : undefined, paidOwner);
   }
 }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decodeFunctionData } from 'viem';
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, parseAbiParameters } from 'viem';
 
 const temporary = mkdtempSync(join(tmpdir(), 'eth-mev-cadence-'));
 const loopback = 'http://127.0.0.1:18647';
@@ -681,6 +681,7 @@ try {
   assert.deepEqual(released.waits, [150]);
   assert.equal(released.signed.length, 1);
   assert.equal(released.submitted.length, 1);
+  assert.equal(released.submitted[0].autonomous, true);
   assert.deepEqual([...released.finalStates.keys()].sort(), ['pending', 'pinned']);
   assert.deepEqual(released.finalStates.get('pinned'), released.finalStates.get('pending'));
   assert.deepEqual(released.finalStates.get('pinned'), {
@@ -1192,9 +1193,16 @@ try {
   assert.equal(insufficientPendingGross.signed.length, 0, 'gas-only testing cannot skip pending repayment verification');
   assert.equal(insufficientPendingGross.test.status, 'queued');
 
-  const ordinaryTest = await scan({ age: 24 * minute, profit: coversGas, maximumTestGasUsd: 2 });
+  const ordinaryTest = await scan({ age: 24 * minute, profit: coversGas, maximumTestGasUsd: 2,
+    beforeBlock(worker, block) {
+      CONFIG.allowLiveTrading = true;
+      CONFIG.forkMode = false;
+      worker.scanPaths = () => undefined;
+      Date.now = () => block.timestamp * 1000 + 100;
+    } });
   assert.equal(ordinaryTest.signed.length, 1);
   assert.equal(ordinaryTest.submitted[0].opp.gasOnlyTestId, testId);
+  assert.equal(ordinaryTest.submitted[0].autonomous, undefined);
   assert.equal(ordinaryTest.test.status, 'submitted');
   assert.ok(decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: ordinaryTest.signed[0].data }).args[0].minProfit > 1n,
     'a normal-level profit opportunity consumes the request without lowering its profit floor');
@@ -1440,6 +1448,89 @@ try {
       globalThis.fetch = oldFetch;
       mevReadClient.getBlock = oldHead;
       mevReadClient.getTransactionCount = oldCount;
+    }
+  }
+
+  {
+    const originals = { fork: CONFIG.forkMode, getBlock: publicClient.getBlock };
+    const restore = () => newSearcher(() => assert.fail('confirming profit must never sign'));
+    const worker = restore();
+    worker.host.exec.noteNonceUsed = () => {};
+    assert.equal(worker.view().lastAutoProfit, null, 'legacy totals and landed rows lack proof of automatic origin');
+    const blockNumber = 350n, timestamp = 1_790_000_000n, blockHash = hash(350);
+    const from = address(1), to = address(2), gasUsed = 50_000n, effectiveGasPrice = 2_000_000_000n;
+    const gasWei = gasUsed * effectiveGasPrice;
+    const topics = encodeEventTopics({ abi: FLASH_ARB_LOGIC_V3_ABI, eventName: 'Arbitrage', args: { token: address(4) } });
+    const event = (profit, tip, emitter = to) => ({ address: emitter, topics,
+      data: encodeAbiParameters(parseAbiParameters('address, address, uint256, uint256, uint256'),
+        [address(5), address(6), 2n * oneEth, profit, tip]) });
+    let nonce = 350;
+    const pending = (options = {}) => {
+      const tx = hash(++nonce);
+      worker.file.pending = { autonomous: true, hash: tx, nonce, kind: 'direct', contract: to, ethUsd: 2_000, target: '351',
+        opp: { hash: tx, t: 1, block: 349, sizeEth: 99, netUsd: 100, status: 'sent' }, ...options };
+      return tx;
+    };
+    const receipt = (tx, logs, options = {}) => { worker.receipt = async () => ({
+      transactionHash: tx, from, to, status: 'success', blockNumber, blockHash, gasUsed, effectiveGasPrice, logs, ...options,
+    }); };
+    try {
+      CONFIG.forkMode = false;
+      publicClient.getBlock = async () => ({ number: blockNumber, hash: blockHash, timestamp });
+      const tx = pending({ kind: undefined });
+      const profit = 7n * gasWei, tip = gasWei, netEth = Number(profit - tip - gasWei) / 1e18;
+      receipt(tx, [event(profit, tip)]);
+      await worker.checkPending(blockNumber + 1n);
+      assert.equal(worker.view().lastAutoProfit, null);
+      await worker.checkPending(blockNumber + 3n);
+      const landed = { hash: tx, block: Number(blockNumber), blockHash, at: Number(timestamp) * 1000, sender: from, contract: to,
+        loanEth: 2, netEth, netUsd: netEth * 2_000 };
+      assert.deepEqual(restore().view().lastAutoProfit, landed, 'confirmed bundle payout deducts actual gas and the event tip once');
+      for (const [options, logs, patch] of [
+        [{ autonomous: undefined }, [event(profit, 0n)]], [{}, []], [{}, [event(profit, 0n, address(7))]],
+        [{}, [event(gasWei, 0n)]], [{}, [event(gasWei - 1n, 0n)]], [{}, [event(profit, 0n)], { status: 'reverted' }],
+      ]) {
+        receipt(pending(options), logs, patch);
+        await worker.checkPending(blockNumber + 3n);
+        assert.deepEqual(worker.view().lastAutoProfit, landed);
+      }
+      const manual = pending();
+      worker.file.pending.opp.gasOnlyTestId = testId;
+      receipt(manual, [event(profit, 0n)]);
+      await worker.checkPending(blockNumber + 3n);
+      CONFIG.forkMode = true;
+      receipt(pending(), [event(profit, 0n)]);
+      await worker.checkPending(blockNumber + 3n);
+      assert.deepEqual(worker.view().lastAutoProfit, landed);
+      CONFIG.forkMode = false;
+      const path = pending();
+      worker.file.pending.opp.symbol = 'WETH → USDC → DAI → WETH';
+      for (const mismatch of [{ transactionHash: hash(999) }, { from: address(7) }, { to: address(7) }]) {
+        receipt(path, [event(profit, 0n)], mismatch);
+        await assert.rejects(worker.checkPending(blockNumber + 3n), /unexpected transaction/);
+        assert.equal(worker.file.pending.hash, path);
+      }
+      receipt(path, [event(profit, 0n)], { blockHash: hash(351) });
+      await worker.checkPending(blockNumber + 3n);
+      assert.deepEqual(worker.view().lastAutoProfit, landed);
+      assert.equal(worker.file.pending.hash, path);
+      receipt(path, [event(profit, 0n)]);
+      worker.writeState();
+      const write = worker.writeState.bind(worker);
+      worker.writeState = () => { throw Error('checkpoint failed'); };
+      await assert.rejects(worker.checkPending(blockNumber + 3n), /checkpoint failed/);
+      assert.deepEqual(worker.view().lastAutoProfit, landed);
+      assert.equal(restore().file.pending.hash, path);
+      worker.writeState = write;
+      await worker.checkPending(blockNumber + 3n);
+      worker.file.recent = [];
+      worker.writeState();
+      const pathNet = Number(profit - gasWei) / 1e18;
+      assert.deepEqual(restore().view().lastAutoProfit, { ...landed, hash: path, netEth: pathNet, netUsd: pathNet * 2_000 },
+        'multi-hop emits the same Arbitrage event with zero tip and survives recent-row eviction');
+    } finally {
+      publicClient.getBlock = originals.getBlock;
+      CONFIG.forkMode = originals.fork;
     }
   }
 

@@ -227,13 +227,27 @@ interface MevFile {
   recent: MevOpp[];
   best: HourBest[];
   pending: PendingBundle | null;
+  lastAutoProfit?: ConfirmedAutoProfit;
   directGas?: { hour: number; usd: number }[];
   lastGasOnlyTest?: { id: string; hash: Hex };
+}
+
+interface ConfirmedAutoProfit {
+  hash: Hex;
+  block: number;
+  blockHash: Hex;
+  at: number; // Timestamp of the confirmed inclusion block, in milliseconds.
+  sender: Address;
+  contract: Address;
+  loanEth: number;
+  netEth: number;
+  netUsd: number; // Valued at the order's recorded ETH/USD price.
 }
 
 interface PendingBundle {
   kind?: 'direct';
   privateSubmission?: true;
+  autonomous?: true;
   hash: Hex;
   nonce: number;
   target: string;
@@ -498,6 +512,12 @@ export class MevSearcher {
       f.deployStartedAt ??= null;
       f.deployNonce ??= null;
       f.pending ??= null;
+      const fill = f.lastAutoProfit;
+      if (fill !== undefined && (!fill || !/^0x[0-9a-f]{64}$/i.test(fill.hash) || !/^0x[0-9a-f]{64}$/i.test(fill.blockHash)
+        || typeof fill.sender !== 'string' || fill.sender.toLowerCase() !== this.host.account.address.toLowerCase()
+        || !/^0x[0-9a-f]{40}$/i.test(fill.contract) || !Number.isSafeInteger(fill.block) || fill.block <= 0
+        || !Number.isSafeInteger(fill.at) || fill.at <= 0 || !validPrice(fill.loanEth)
+        || !validPrice(fill.netEth) || !validPrice(fill.netUsd))) delete f.lastAutoProfit;
       if (f.lastGasOnlyTest !== undefined && (!f.lastGasOnlyTest || typeof f.lastGasOnlyTest.id !== 'string' || !TEST_ID.test(f.lastGasOnlyTest.id)
         || !/^0x[0-9a-f]{64}$/i.test(f.lastGasOnlyTest.hash))) throw new Error('invalid gas-only test journal');
       // Earlier direct journals kept the count but lacked a dedicated confirmation timestamp.
@@ -1776,7 +1796,8 @@ export class MevSearcher {
         hash, status: 'sent', grossEth: reportedGrossEth, gasEth: submission.gasEth, tipEth: submission.tipEth,
         netEth: eth(reportedNet), netUsd: submission.netUsd, note: direct ? 'awaiting direct RPC submission' : 'awaiting builder replies', submission,
       });
-      const pending = { kind, privateSubmission, hash, nonce, target: target.toString(), contract, ethUsd, opp };
+      const pending: PendingBundle = { kind, privateSubmission, autonomous: !CONFIG.forkMode && !test && !matched ? true : undefined,
+        hash, nonce, target: target.toString(), contract, ethUsd, opp };
       const recent = this.file.recent.slice();
       const attempts = this.file.stats.directAttempts;
       const lastTest = this.file.lastGasOnlyTest;
@@ -1915,12 +1936,15 @@ export class MevSearcher {
     const receipt = await this.receipt(p.hash);
     if (receipt) {
       if (current < receipt.blockNumber + confirmations) return;
-      if (p.kind === 'direct' && (receipt.from.toLowerCase() !== this.host.account.address.toLowerCase()
-        || receipt.to?.toLowerCase() !== p.contract.toLowerCase())) throw new Error('unexpected direct transaction receipt');
+      if ((p.kind === 'direct' || p.autonomous === true) && (receipt.from.toLowerCase() !== this.host.account.address.toLowerCase()
+        || receipt.to?.toLowerCase() !== p.contract.toLowerCase())) throw new Error('unexpected transaction receipt');
+      if (p.autonomous === true && receipt.transactionHash?.toLowerCase() !== p.hash.toLowerCase()) throw new Error('unexpected transaction hash');
+      let blockTime: bigint | undefined;
       if (!CONFIG.forkMode) {
         const canonical = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
         this.file.stats.rpcCalls++;
-        if (canonical.hash !== receipt.blockHash) return;
+        if (canonical.hash !== receipt.blockHash || (p.autonomous === true && canonical.number !== receipt.blockNumber)) return;
+        blockTime = canonical.timestamp;
       }
       this.host.exec.noteNonceUsed(p.nonce);
       const gasWei = receipt.gasUsed * receipt.effectiveGasPrice;
@@ -1930,6 +1954,7 @@ export class MevSearcher {
         eventName: 'Arbitrage',
       })[0];
       const outcome = { ...p.opp, gasEth: eth(gasWei) };
+      let autoProfit: ConfirmedAutoProfit | undefined;
       if (receipt.status === 'success' && ev) {
         outcome.status = 'landed';
         outcome.grossEth = eth(ev.args.profit);
@@ -1942,8 +1967,13 @@ export class MevSearcher {
           outcome.funding = FUNDING_NAMES[financing.args.funding as RouteFunding];
           outcome.lenderFeeEth = eth(financing.args.premium);
         }
-        outcome.netEth = eth(ev.args.profit - ev.args.tip - gasWei);
+        const netWei = ev.args.profit - ev.args.tip - gasWei;
+        outcome.netEth = eth(netWei);
         outcome.note = `block ${receipt.blockNumber}`;
+        if (p.autonomous === true && !p.opp.gasOnlyTestId && this.file.lastGasOnlyTest?.hash !== p.hash && netWei > 0n && blockTime) {
+          autoProfit = { hash: p.hash, block: Number(receipt.blockNumber), blockHash: receipt.blockHash, at: Number(blockTime) * 1000,
+            sender: receipt.from, contract: p.contract, loanEth: eth(ev.args.amountIn), netEth: outcome.netEth, netUsd: outcome.netEth * p.ethUsd };
+        }
       } else {
         outcome.status = 'failed';
         outcome.grossEth = 0;
@@ -1952,7 +1982,7 @@ export class MevSearcher {
         outcome.note = receipt.status === 'success' ? 'confirmed without a verified arbitrage event' : 'confirmed revert; gas spent';
       }
       outcome.netUsd = outcome.netEth * p.ethUsd;
-      this.finishBundle(outcome, true);
+      this.finishBundle(outcome, true, autoProfit);
       this.host.log(`[mev] ${p.kind === 'direct' ? 'Direct transaction' : 'Bundle'} ${p.hash} ${outcome.status}: ${outcome.note}`, outcome.status === 'landed' ? 'trade' : 'warn');
       return;
     }
@@ -1997,10 +2027,11 @@ export class MevSearcher {
     }
   }
 
-  private finishBundle(outcome: MevOpp, included = false) {
+  private finishBundle(outcome: MevOpp, included = false, autoProfit?: ConfirmedAutoProfit) {
     const f = this.file;
-    const previous = { pending: f.pending, recent: f.recent, stats: f.stats, directGas: f.directGas };
+    const previous = { pending: f.pending, recent: f.recent, stats: f.stats, directGas: f.directGas, lastAutoProfit: f.lastAutoProfit };
     f.pending = null;
+    if (autoProfit && (!f.lastAutoProfit || autoProfit.block >= f.lastAutoProfit.block)) f.lastAutoProfit = autoProfit;
     f.recent = retainRecent([outcome, ...f.recent.filter((item) => item.hash !== outcome.hash)], RECENT_LIMIT, RECENT_BUNDLE_LIMIT);
     if (included) {
       const landed = outcome.status === 'landed';
@@ -2489,6 +2520,7 @@ export class MevSearcher {
       venues,
       coverage: this.universe.view(),
       multiHop: { supported: Boolean(this.pathRelease), market: this.pathMarket },
+      lastAutoProfit: f.lastAutoProfit ?? null,
       lastBlock: this.lastBlock,
       cadence: this.cadence(now),
       gasOnlyTest: this.gasOnlyTestView(),

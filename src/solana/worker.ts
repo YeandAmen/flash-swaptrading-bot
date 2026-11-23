@@ -68,6 +68,12 @@ interface Outcome {
   walletDebitLamports: number;
   netUsdc: number | null;
 }
+interface AutoProfit {
+  signature: Signature;
+  at: number;
+  netUsdc: number;
+  slot: number;
+}
 interface FeeSpend {
   at: number;
   feeLamports: number;
@@ -78,6 +84,7 @@ interface Journal {
   armed: boolean;
   pending: Pending | null;
   lastOutcome: Outcome | null;
+  lastAutoProfit?: AutoProfit | null;
   fees: FeeSpend[];
   test?: FlashTest;
 }
@@ -131,6 +138,13 @@ function decodeJournal(text: string, wallet: Address): Journal {
       || !(o.slot === null || naturalInteger(o.slot)) || !naturalInteger(o.feeLamports)
       || !naturalInteger(o.walletDebitLamports) || !(o.netUsdc === null || Number.isFinite(o.netUsdc))) {
       throw new Error('Invalid Solana settlement journal');
+    }
+  }
+  if (state.lastAutoProfit != null) {
+    const profit = state.lastAutoProfit;
+    signature(profit.signature);
+    if (!naturalInteger(profit.at) || !naturalInteger(profit.slot) || !Number.isFinite(profit.netUsdc) || profit.netUsdc <= 0) {
+      throw new Error('Invalid Solana autonomous profit journal');
     }
   }
   if (state.test !== undefined) {
@@ -354,7 +368,7 @@ export class SolanaLiveWorker {
       ready, armed: ready && this.journal?.armed === true, wallet: this.wallet,
       status: this.status, pending: pending?.signature ?? null,
       pendingFeeLamports: pending ? Number(pending.feeLamports) : 0,
-      lastOutcome: this.journal?.lastOutcome ?? null,
+      lastOutcome: this.journal?.lastOutcome ?? null, lastAutoProfit: this.journal?.lastAutoProfit ?? null,
       test: flashTestView(this.journal?.test),
       spentFeeLamports: Number(this.spentFees()), dailyFeeCapLamports: Number(DAILY_FEE_CAP),
       nativeReserveLamports: Number(NATIVE_RESERVE), minimumNetUsdc: Number(this.minimumNet) / 1_000_000,
@@ -372,7 +386,7 @@ export class SolanaLiveWorker {
         this.journal = decodeJournal(readPrivateFile(this.journalPath, 128 * 1024), this.wallet);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('Solana live journal must be valid and owner-only');
-        const next: Journal = { version: 1, wallet: this.wallet, armed: false, pending: null, lastOutcome: null, fees: [] };
+        const next: Journal = { version: 1, wallet: this.wallet, armed: false, pending: null, lastOutcome: null, lastAutoProfit: null, fees: [] };
         writeJson(this.journalPath, next, true);
         this.journal = next;
       }
@@ -668,8 +682,9 @@ export class SolanaLiveWorker {
     const message = receipt.transaction.message;
     const lossGuard = decodeLossGuard(pending.swapLossGuard);
     const minimum = lossGuard ? -lossGuard.cap : uint(pending.minimumNet);
-    const wrongLoan = (pending.profitOnly || lossGuard) && !matchesKaminoLoan(message.accountKeys,
+    const verifiedLoan = matchesKaminoLoan(message.accountKeys,
       message.instructions.map((ix) => ({ data: ix.data, programAddressIndex: Number(ix.programIdIndex) })), loan);
+    const wrongLoan = (pending.profitOnly || lossGuard) && !verifiedLoan;
     const wrongBalance = lossGuard && !meta.err && !matchesSolanaSwapLossBalances(meta, message.accountKeys,
       this.wallet, ...await walletAtas(this.wallet), lossGuard, measured.fee);
     const breached = wrongLoan || wrongBalance || measured.fee !== uint(pending.feeLamports) || measured.cost > uint(pending.maximumLamportDebit)
@@ -677,10 +692,10 @@ export class SolanaLiveWorker {
     const status = breached ? 'invariant-breach' : meta.err ? 'failed' : 'finalized';
     this.finish(pending, { signature: pending.signature, status, at: Date.now(), slot: Number(receipt.slot),
       feeLamports: Number(measured.fee), walletDebitLamports: Number(measured.cost),
-      netUsdc: measured.net === null ? null : Number(measured.net) / 1_000_000 });
+      netUsdc: measured.net === null ? null : Number(measured.net) / 1_000_000 }, verifiedLoan);
   }
 
-  private finish(pending: Pending, outcome: Outcome): void {
+  private finish(pending: Pending, outcome: Outcome, verifiedLoan = false): void {
     if (this.stopped || !this.journal || this.journal.pending?.signature !== pending.signature) return;
     const fees = outcome.feeLamports > 0 ? [...this.journal.fees, { at: outcome.at, feeLamports: outcome.feeLamports }] : this.journal.fees;
     let test = this.journal.test;
@@ -695,8 +710,12 @@ export class SolanaLiveWorker {
             : 'The test reverted. Check the finalized fee and transaction receipt.';
       test = { ...test, status, note };
     }
+    const { signature, at, netUsdc, slot } = outcome;
+    const lastAutoProfit = verifiedLoan && pending.testId === undefined && this.journal.test?.hash !== signature
+      && outcome.status === 'finalized' && netUsdc !== null && netUsdc > 0 && slot !== null
+      ? { signature, at, netUsdc, slot } : this.journal.lastAutoProfit ?? null;
     this.save({ ...this.journal, armed: this.journal.armed && outcome.status !== 'invariant-breach',
-      pending: null, lastOutcome: outcome, fees, test });
+      pending: null, lastOutcome: outcome, lastAutoProfit, fees, test });
     this.status = `Solana transaction ${outcome.status}`;
   }
 }
