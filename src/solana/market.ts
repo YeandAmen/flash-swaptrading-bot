@@ -35,14 +35,15 @@ export class SolanaMarketPlanner {
     const maxLoanUsdc = maxLoanUnits / usdcUnits;
     this.samples = this.samples.filter((sample) => sample.at >= now - quoteMaxAgeMs
       && sample.at <= now && sample.loanUsdc <= maxLoanUsdc);
+    const small = Math.min(25, maxLoanUsdc / 20);
+    const smallestDiscovery = boundedLoan(small, maxLoanUnits);
     if (this.probes++ % 4 === 3) {
-      const refinement = this.refine(maxLoanUnits);
+      const refinement = this.refine(maxLoanUnits, smallestDiscovery);
       if (refinement) return refinement;
     }
 
     // Sweep every venue at each depth before repeating. Geometric spacing keeps the low probe useful with a high cap.
-    const small = Math.min(25, maxLoanUsdc / 20);
-    const sizes = [...new Set([boundedLoan(small, maxLoanUnits),
+    const sizes = [...new Set([smallestDiscovery,
       boundedLoan(Math.sqrt(Math.max(1, small) * maxLoanUsdc), maxLoanUnits), maxLoanUsdc])];
     const discovery = this.discoveries++;
     const venue = discovery % this.venueCount;
@@ -58,8 +59,10 @@ export class SolanaMarketPlanner {
     }
   }
 
-  private refine(maxLoanUnits: number): SolanaMarketProbe | undefined {
-    const leads = this.samples.filter((sample) => sample.edgeBps >= minRefineEdgeBps)
+  private refine(maxLoanUnits: number, smallestDiscovery: number): SolanaMarketProbe | undefined {
+    // A near miss can test below the shallow discovery size. Continue from that smaller size only on a positive quote.
+    const leads = this.samples.filter((sample) => sample.edgeBps >= minRefineEdgeBps
+      && (sample.loanUsdc >= smallestDiscovery || sample.quotedNetUsdc > 0))
       .sort((a, b) => {
         // For positive quotes prefer the best absolute return. For near misses compare spread across sizes.
         if (a.quotedNetUsdc > 0 || b.quotedNetUsdc > 0) return b.quotedNetUsdc - a.quotedNetUsdc || b.at - a.at;
