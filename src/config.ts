@@ -218,10 +218,12 @@ const configuredMevV3 = str('MEV_V3_CONTRACT_ADDRESS').trim();
 const mevBuilderTipPct = num('MEV_BUILDER_TIP_PCT', 0.5);
 const mevMinNetUsd = num('MEV_MIN_NET_USD', 0.05);
 export type MevFundingMode = 'auto' | 'pool' | 'aave' | 'morpho' | 'balancer' | 'spark';
+export const MAX_DIRECT_PROTECTED_BLOCKS = 3;
 export const MEV = {
   enabled: str('MEV', 'on') !== 'off',
   submission: str('MEV_SUBMISSION', 'bundle') as 'bundle' | 'direct',
   directProtected: str('MEV_DIRECT_PROTECTED', 'off') === 'on',
+  directProtectedBlocks: num('MEV_DIRECT_PROTECTED_BLOCKS', MAX_DIRECT_PROTECTED_BLOCKS),
   maxLoanUsd: str('MEV_MAX_LOAN_USD').trim().toLowerCase() === 'unlimited' ? Infinity : num('MEV_MAX_LOAN_USD', 1_000_000),
   directCadenceMaxRoutes: num('MEV_DIRECT_CADENCE_MAX_ROUTES', 8),
   directMinNetUsd: num('MEV_DIRECT_MIN_NET_USD', mevMinNetUsd),
@@ -284,6 +286,8 @@ check(GAS_TOPUP.usd >= 1 && GAS_TOPUP.usd <= 100, 'GAS_TOPUP_USD must be 1..100'
 check(Number.isInteger(GAS_TOPUP.maxPerDay) && GAS_TOPUP.maxPerDay >= 1 && GAS_TOPUP.maxPerDay <= 24, 'GAS_TOPUP_MAX_PER_DAY must be 1..24');
 check(['bundle', 'direct'].includes(MEV.submission), 'MEV_SUBMISSION must be bundle or direct');
 check(['on', 'off'].includes(str('MEV_DIRECT_PROTECTED', 'off')), 'MEV_DIRECT_PROTECTED must be on or off');
+check(Number.isInteger(MEV.directProtectedBlocks) && MEV.directProtectedBlocks >= 1 && MEV.directProtectedBlocks <= MAX_DIRECT_PROTECTED_BLOCKS,
+  'MEV_DIRECT_PROTECTED_BLOCKS must be 1..3');
 check(MEV.maxLoanUsd === Infinity || (MEV.maxLoanUsd >= 1 && Number.isSafeInteger(Math.floor(MEV.maxLoanUsd * 1_000_000))),
   'MEV_MAX_LOAN_USD must be unlimited or a positive USD limit of at least 1 within safe micro-USD precision');
 check(Number.isInteger(MEV.directCadenceMaxRoutes) && MEV.directCadenceMaxRoutes >= 1 && MEV.directCadenceMaxRoutes <= 10,

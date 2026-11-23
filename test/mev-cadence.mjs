@@ -23,6 +23,7 @@ Object.assign(process.env, {
   MEV_DIRECT_DAILY_GAS_USD: '25',
   MEV_DIRECT_MIN_NET_USD: '0.05',
   MEV_DIRECT_MAX_PRIORITY_GWEI: '0.25',
+  MEV_DIRECT_PROTECTED_BLOCKS: '3',
   MEV_MAX_SIMS_PER_BLOCK: '3',
   MEV_DIRECT_CADENCE_MAX_ROUTES: '8',
   MEV_MAX_LOAN_USD: '1000000',
@@ -66,6 +67,16 @@ try {
   const { directCadence, extraRoutes, loanLimitWei } = await import('../dist/mev/cadence.js');
   const { mevReadClient, publicClient } = await import('../dist/chain.js');
   const { CONFIG, MEV } = await import('../dist/config.js');
+  try {
+    for (const raw of [undefined, '1', '2', '3', '0', '4', '-1', '1.5', 'bad']) {
+      if (raw === undefined) delete process.env.MEV_DIRECT_PROTECTED_BLOCKS;
+      else process.env.MEV_DIRECT_PROTECTED_BLOCKS = raw;
+      const config = import('../dist/config.js?protected-window=' + raw);
+      if (raw === undefined || ['1', '2', '3'].includes(raw)) {
+        assert.equal((await config).MEV.directProtectedBlocks, Number(raw ?? 3));
+      } else await assert.rejects(config, /MEV_DIRECT_PROTECTED_BLOCKS/);
+    }
+  } finally { process.env.MEV_DIRECT_PROTECTED_BLOCKS = '3'; }
   const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
   const { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_RUNTIME } = await import('../dist/mev/artifact-proxy.js');
   const { FLASH_ARB_LOGIC_V3_RUNTIME } = await import('../dist/mev/artifact-logic-v3.js');
@@ -562,13 +573,15 @@ try {
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
     protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport,
-    pathHistory, pathCandidates, pendingForPath, startup, snapshotTiming, atJournal, beforeBlock }) {
+    pathHistory, pathCandidates, pendingForPath, startup, snapshotTiming, atJournal, beforeBlock,
+    protectedBlocks = MEV.directProtectedBlocks, onEstimate }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
     const journaled = [];
     const seenAtSign = [];
     const finalStates = new Map();
+    const estimates = [];
     const block = snapshot(nearingNextBlock ? Math.floor(now / 1_000) * 1_000 - 11_000 : now);
     Object.assign(block, snapshotTiming);
     const searcher = newSearcher(async (tx) => {
@@ -597,7 +610,7 @@ try {
       }
     };
     searcher.head = async () => {
-      const number = staleHead || (headChangesDuringSigning && signed.length) ? 101n : 100n;
+      const number = block.blockNumber + (staleHead || (headChangesDuringSigning && signed.length) ? 1n : 0n);
       return { number, hash: hash(number), timestamp: BigInt(block.timestamp) };
     };
     if (pathRelease) {
@@ -622,7 +635,7 @@ try {
     };
     searcher.submitSignedBundle = async (pending) => { submitted.push(pending); };
     if (!startup) searcher.simulate = async (token, _buy, _sell, amount, _maxBlock, blockNumber) => {
-      assert.equal(blockNumber, 100n);
+      assert.equal(blockNumber, block.blockNumber);
       assert.ok(amount <= 500n * oneEth, 'every simulated amount stays under the $1m WETH cap');
       await beforeSimulate?.(token.token.symbol);
       simulated.add(token.token.symbol);
@@ -632,8 +645,10 @@ try {
       assert.deepEqual(rewardPercentiles, [50, 90]);
       return { reward: [[100_000_000n, 300_000_000n]] };
     };
-    mevReadClient.estimateGas = async ({ blockNumber }) => {
-      assert.equal(blockNumber, 100n);
+    mevReadClient.estimateGas = async ({ blockNumber, data }) => {
+      assert.equal(blockNumber, block.blockNumber);
+      estimates.push(data);
+      onEstimate?.(searcher);
       return estimatedGas;
     };
     mevReadClient.call = async ({ blockNumber, blockTag, to, data, gas, maxFeePerGas, stateOverride }) => {
@@ -664,13 +679,14 @@ try {
         const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: inner }).args[0];
         return { data: hash(pendingForToken ? pendingForToken(order.token, order.amountIn) : pendingProfit) };
       }
-      assert.equal(blockNumber, 100n);
+      assert.equal(blockNumber, block.blockNumber);
       finalStates.set('pinned', call);
       return { data: hash(finalProfit) };
     };
     mevReadClient.getBalance = async () => oneEth;
 
-    const original = { funding: MEV.funding, submission: MEV.submission, directMaxGasUsd: MEV.directMaxGasUsd, directProtected: MEV.directProtected };
+    const original = { funding: MEV.funding, submission: MEV.submission, directMaxGasUsd: MEV.directMaxGasUsd,
+      directProtected: MEV.directProtected, directProtectedBlocks: MEV.directProtectedBlocks };
     const originalConfig = { allowLiveTrading: CONFIG.allowLiveTrading, forkMode: CONFIG.forkMode };
     const originalNow = Date.now;
     try {
@@ -684,6 +700,7 @@ try {
       if (pathRelease) MEV.funding = 'morpho';
       MEV.directMaxGasUsd = maximumDirectGasUsd;
       MEV.directProtected = protectedDirect;
+      MEV.directProtectedBlocks = protectedBlocks;
       if (maximumTestGasUsd !== undefined) {
         MEV.funding = 'aave';
         searcher.file.proxyContract = address(2);
@@ -730,7 +747,7 @@ try {
           await searcher.reconsiderStartupHead(head);
         } finally { unblock(); Object.assign(publicClient, originals); }
       }
-      return { searcher, simulated, signed, liveQuoteTokens, submitted, journaled, seenAtSign, finalStates, test: searcher.view().gasOnlyTest };
+      return { searcher, simulated, signed, liveQuoteTokens, submitted, journaled, seenAtSign, finalStates, estimates, test: searcher.view().gasOnlyTest };
     } finally {
       Object.assign(MEV, original);
       Object.assign(CONFIG, originalConfig);
@@ -1036,6 +1053,86 @@ try {
   const oneBlockOnly = 250_000_000_000_000n;
   const protectedInput = { age: 24 * minute, profit: oneBlockOnly, finalProfit: oneBlockOnly, protectedDirect: true };
   const protectedTrade = await scan(protectedInput);
+  const sourceHeight = 26_478_267n;
+  const configuredOrders = [];
+  const deadlineOf = data => decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data }).args[0].maxBlock;
+  for (const depth of [1, 2, 3]) {
+    const target = sourceHeight + BigInt(depth);
+    const ingress = [];
+    const example = await scan({ age: minute, profit: coversGas, protectedDirect: true, protectedBlocks: depth,
+      snapshotTiming: { blockNumber: sourceHeight, hash: hash(sourceHeight) },
+      beforeBlock(worker) { assert.equal(worker.view().settings.direct.protectedBlocks, depth); },
+      privateTransport: async (wire, maximum, canSend) => {
+        assert.equal(wire, '0xc0');
+        assert.ok(canSend());
+        ingress.push(maximum);
+        return hash(99);
+      } });
+    assert.equal(example.signed.length, 1);
+    const [signed] = example.signed;
+    assert.ok(example.estimates.length > 0 && example.estimates.every(data => deadlineOf(data) === target));
+    assert.equal(deadlineOf(signed.data), target);
+    assert.equal(example.finalStates.get('pending').data, signed.data);
+    assert.equal(example.finalStates.get('pinned').data, signed.data);
+    assert.deepEqual(ingress, [target]);
+    const [pending] = example.journaled;
+    assert.equal(pending, example.submitted[0]);
+    assert.equal(pending.target, target.toString());
+    assert.equal(pending.opp.submission.target, Number(target));
+    assert.equal(signed.maxPriorityFeePerGas, 250_000_000n);
+    assert.equal(signed.maxFeePerGas, [1_250_000_000n, 1_375_000_000n, 1_515_625_000n][depth - 1]);
+    configuredOrders.push(pending);
+  }
+
+  const shortPath = await scan({ ...pathOptions, protectedDirect: true, protectedBlocks: 1 });
+  assert.equal(shortPath.signed.length, 1);
+  assert.equal(decodeFunctionData({ abi: FLASH_ARB_LOGIC_V3_ABI, data: shortPath.signed[0].data }).args[4], 101n);
+  assert.equal(shortPath.journaled[0].target, '101');
+
+  // A pre-existing manual request keeps its established matching window and its own execution terms.
+  const alreadyQueued = await scan({ age: minute, profit: coversGas, protectedDirect: true, protectedBlocks: 1, maximumTestGasUsd: 2 });
+  assert.equal(alreadyQueued.submitted[0].opp.gasOnlyTestId, testId);
+  assert.equal(alreadyQueued.submitted[0].target, '103');
+  const unmatched = await scan({ age: minute, profit: coversGas, protectedDirect: true, protectedBlocks: 1, maximumTestGasUsd: 0.01 });
+  assert.ok(unmatched.estimates.some(data => deadlineOf(data) === 103n));
+  assert.ok(unmatched.signed.every(tx => deadlineOf(tx.data) === 101n), 'a longer manual window cannot authorize an unmatched ordinary signature');
+  assert.equal(unmatched.test.status, 'queued');
+  for (const [id, terms, target] of [
+    ['private-gas-test', [false, true, false], '105'],
+    ['private-profit-test', [true, true, false, 0.05], '105'],
+    ['public-functional-test', [false, false, true], '108'],
+  ]) {
+    const scenario = await scan({ age: minute, profit: coversGas, protectedDirect: true, protectedBlocks: 1,
+      beforeBlock(worker, block) {
+        worker.file.proxyContract = address(2);
+        worker.queueGasOnlyTest(id, 2, ...terms);
+        const simulate = worker.simulate.bind(worker);
+        worker.simulate = (...args) => args[5] < block.blockNumber ? Promise.resolve({ ok: true, profit: coversGas }) : simulate(...args);
+      } });
+    assert.equal(scenario.journaled[0]?.opp.gasOnlyTestId, id);
+    assert.equal(scenario.journaled[0].target, target);
+    assert.equal(deadlineOf(scenario.signed[0].data), BigInt(target));
+  }
+  for (const submission of ['direct', 'bundle']) {
+    const publicOrder = await scan({ age: minute, profit: coversGas, submission, protectedBlocks: 2 });
+    assert.equal(publicOrder.journaled[0].privateSubmission, undefined);
+    assert.equal(publicOrder.journaled[0].target, '101');
+    assert.equal(deadlineOf(publicOrder.signed[0].data), 101n);
+  }
+  {
+    const id = 'manual-arriving-during-estimate';
+    let queued = false;
+    const late = await scan({ age: minute, profit: symbol => symbol === 'TEST0' ? coversGas : underGas,
+      protectedDirect: true, protectedBlocks: 1, beforeBlock(worker) { worker.file.proxyContract = address(2); },
+      onEstimate(worker) {
+        if (queued) return;
+        queued = true;
+        worker.queueGasOnlyTest(id, 2, true, true);
+      } });
+    assert.ok(queued && late.estimates.some(data => deadlineOf(data) === 101n));
+    assert.ok(late.journaled.every(p => p.opp.gasOnlyTestId !== id || BigInt(p.target) > 101n));
+    if (!late.journaled.some(p => p.opp.gasOnlyTestId === id)) assert.equal(late.test.status, 'queued');
+  }
   assert.equal(protectedTrade.signed.length, 1);
   assert.equal(protectedTrade.submitted.length, 1);
   assert.equal(protectedTrade.journaled.length, 1);
@@ -1418,6 +1515,47 @@ try {
     'a normal-level profit opportunity consumes the request without lowering its profit floor');
 
   const journal = newSearcher(async () => assert.fail('receipt settlement must not sign'));
+  {
+    const previous = { fork: CONFIG.forkMode, depth: MEV.directProtectedBlocks, nonce: mevReadClient.getTransactionCount,
+      state: structuredClone(journal.file) };
+    try {
+      CONFIG.forkMode = false;
+      MEV.directProtectedBlocks = 1;
+      for (const index of [0, 2]) {
+        const order = structuredClone(configuredOrders[index]);
+        const target = BigInt(order.target);
+        journal.file.pending = order;
+        journal.file.recent = [order.opp];
+        journal.save();
+        const restored = newSearcher(() => assert.fail('reconciliation must never sign a replacement'));
+        const nonceChecks = [];
+        restored.traceMissedBundle = () => false;
+        restored.receipt = async h => { assert.equal(h, order.hash); return null; };
+        mevReadClient.getTransactionCount = async ({ address: owner, blockNumber }) => {
+          assert.equal(owner, address(1));
+          nonceChecks.push(blockNumber);
+          return order.nonce;
+        };
+        for (let height = sourceHeight + 1n; height < target + 2n; height++) {
+          await restored.checkPending(height);
+          assert.equal(restored.file.pending?.target, order.target, 'restart restores the signed deadline even when configuration changed');
+          assert.deepEqual(nonceChecks, []);
+        }
+        await restored.checkPending(target + 2n);
+        assert.deepEqual(nonceChecks, [target]);
+        assert.equal(restored.file.pending, null);
+        assert.equal(restored.file.recent[0].status, 'not included');
+        assert.equal(restored.file.recent[0].hash, order.hash);
+        assert.equal(target + 2n, index === 0 ? 26_478_270n : 26_478_272n);
+      }
+    } finally {
+      CONFIG.forkMode = previous.fork;
+      MEV.directProtectedBlocks = previous.depth;
+      mevReadClient.getTransactionCount = previous.nonce;
+      journal.file = previous.state;
+      journal.save();
+    }
+  }
   const priorPremium = MEV.directPremiumMaxGasUsd;
   MEV.directPremiumMaxGasUsd = 20;
   assert.equal(journal.availableDirectGasUsd(now), 5);

@@ -567,11 +567,14 @@ function render() {
     const loanCap = X.settings?.loanLimitMode === 'lender-liquidity' ? ' · Loan size follows lender liquidity'
       : Number.isFinite(maxLoanUsd) ? ` · Loan cap ${usd(maxLoanUsd, Number.isInteger(maxLoanUsd) ? 0 : 2)}` : '';
     const padding = P?.gasPaddingPct == null ? '' : ` · ${Math.round(P.gasPaddingPct * 100)}% gas buffer`;
+    const eligibleBlocks = X.settings?.direct?.protectedBlocks;
+    const privateWindow = direct && X.settings?.direct?.protected && Number.isInteger(eligibleBlocks)
+      ? ` · private orders valid for ${eligibleBlocks} block${eligibleBlocks === 1 ? '' : 's'}` : '';
     const bidding = direct && Number.isFinite(P?.minNetUsd) ? ` · ${usd(P.minNetUsd)} minimum net per attempt${padding}`
       : P?.idle ? ` · idle bidding with a ${usd(P.minNetUsd)} net floor and up to ${Math.round(P.builderTipPct * 100)}% of after-gas profit bid${padding}` : '';
     const transport = X.mode === 'live' ? '' : direct ? 'Direct Ethereum transactions · ' : 'Private bundles · ';
     $('mevStatus').textContent = (staleScan ? 'Scan is stale · ' : '') + `${transport}${X.status} · watching ${X.tokens} tokens in ${X.pools} pools${venues ? ` (${venues})` : ''}` +
-      coverage + loanCap + bidding + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
+      coverage + loanCap + bidding + privateWindow + (lb ? ` · last block ${lb.number.toLocaleString()} ${ago(lb.at)}` : '') + timing + missingReads + (X.lastError ? ` · last error: ${X.lastError}` : '');
     const path = X.multiHop?.market;
     $('ethPathStatus').hidden = !path;
     if (path) {
