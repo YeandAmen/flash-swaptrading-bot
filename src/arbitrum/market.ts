@@ -1,6 +1,6 @@
 import {
-  ContractFunctionExecutionError, createPublicClient, encodeAbiParameters, fallback, formatEther, HttpRequestError, http,
-  keccak256, parseAbi, parseAbiParameters, parseEther, zeroAddress, type Address, type Hash,
+  BaseError, ContractFunctionExecutionError, createPublicClient, encodeAbiParameters, fallback, formatEther, HttpRequestError, http,
+  keccak256, parseAbi, parseAbiParameters, parseEther, RpcRequestError, TimeoutError, zeroAddress, type Address, type Hash,
 } from 'viem';
 import { arbitrum } from 'viem/chains';
 import { loanLimitWei } from '../mev/cadence.js';
@@ -248,7 +248,22 @@ function aggregateFailure(error: unknown): error is ContractFunctionExecutionErr
 
 export function emptyArbitrumQuoteRecovery() {
   return { before: 0, recovered: 0, remaining: 0, individualFailures: 0, resolvedIndividual: 0,
-    outOfGas: 0, rateLimited: 0, alternateAttempted: 0, alternateRecovered: 0 };
+    outOfGas: 0, rateLimited: 0, alternateAttempted: 0, alternateRecovered: 0,
+    untriedCap: 0, untriedNoReader: 0, retryOutOfGas: 0, retryTimeout: 0, retryRateLimited: 0, retryOther: 0 };
+}
+
+function retryFailureCounter(error: unknown) {
+  // viem's full message embeds calldata. Inspect only the transport cause and its diagnostic text.
+  const transport = error instanceof BaseError && error.walk(cause => cause instanceof TimeoutError ||
+    ((cause instanceof HttpRequestError || cause instanceof RpcRequestError) && cause.status === 429));
+  if (transport instanceof TimeoutError) return 'retryTimeout';
+  if (transport) return 'retryRateLimited';
+  const reason = error instanceof BaseError ? `${error.details ?? ''} ${error.shortMessage}`
+    : error instanceof Error ? error.message : '';
+  if (/\bout of gas\b/i.test(reason)) return 'retryOutOfGas';
+  if (/rate.?limit|too many requests|quota exceeded/i.test(reason)) return 'retryRateLimited';
+  if (/timed?\s*out|timeout|deadline exceeded/i.test(reason)) return 'retryTimeout';
+  return 'retryOther';
 }
 
 type QuotePin = { blockNumber: bigint } | { blockHash: Hash; requireCanonical: true };
@@ -288,22 +303,33 @@ async function quoteArbitrumPools(client: ArbitrumClient, blockNumber: bigint, c
   if (!missing.length) return rows;
   const alternate = await alternateForBlock();
   const eligible = alternate ? missing : gasLimited;
+  counts.untriedNoReader += missing.length - eligible.length;
   if (!eligible.length) return rows;
   // Each failed leg gets at most one smaller retry, on a single reader.
   const selected = selectRetryLegs(eligible, blockNumber, canRepay);
+  counts.untriedCap += eligible.length - selected.length;
   if (alternate) counts.alternateAttempted += selected.length;
-  const retry = await (alternate ?? client).multicall({ ...pin, batchSize: 1400, contracts: selected.map(i => contracts[i]) })
-    .catch(() => []);
-  for (const [j, row] of retry.entries()) {
-    rows[selected[j]] = row;
-    if (row.status === 'success') {
+  let retry: typeof rows;
+  try {
+    retry = await (alternate ?? client).multicall({ ...pin, batchSize: 1400, contracts: selected.map(i => contracts[i]) });
+  } catch (error) {
+    counts[retryFailureCounter(error)] += selected.length;
+    return rows;
+  }
+  for (const [j, index] of selected.entries()) {
+    const row = retry?.[j];
+    if (row?.result !== undefined) {
+      rows[index] = row;
       counts.recovered++;
       counts.remaining--;
       if (alternate) counts.alternateRecovered++;
-    } else if (!aggregateFailure(row.error)) {
+    } else if (row?.error instanceof ContractFunctionExecutionError && row.error.functionName !== 'aggregate3') {
+      rows[index] = row;
       counts.individualFailures++;
       counts.resolvedIndividual++;
       counts.remaining--;
+    } else {
+      counts[retryFailureCounter(row?.error)]++;
     }
   }
   return rows;

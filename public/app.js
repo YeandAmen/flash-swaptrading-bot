@@ -191,6 +191,18 @@ function renderNetworkSettlement(network, pending, outcome) {
   setNetworkMarkup(network + 'Settlement', links.join('') || '<span class="sub">No settled transaction recorded.</span>');
 }
 
+function arbitrumRecoveryDetail(recovery) {
+  if (!(recovery?.remaining > 0)) return '';
+  const counts = [
+    [recovery.untriedCap, 'outside retry budget'], [recovery.untriedNoReader, 'without an eligible retry reader'],
+    [recovery.retryOutOfGas, 'out of gas on retry'], [recovery.retryTimeout, 'timed out on retry'],
+    [recovery.retryRateLimited, 'rate-limited on retry'], [recovery.retryOther, 'other or missing retry result'],
+  ];
+  if (counts.some(([n]) => !Number.isSafeInteger(n) || n < 0)) return '';
+  const reasons = counts.filter(([n]) => n > 0).map(([n, label]) => networkNumber(n) + ' ' + label);
+  return reasons.length ? ' · ' + reasons.join(', ') : '';
+}
+
 function renderArbitrum(arb) {
   const verified = arb?.deployment?.verified === true;
   const canArm = arb?.canArm && (arb.deployment ? verified : arb.executor && arb.block > 0);
@@ -205,7 +217,8 @@ function renderArbitrum(arb) {
     ? ` · Quoted loans up to ${usd(largestLoan, 0)}` : '';
   const screened = Number.isSafeInteger(arb?.prunedRoutes) && arb.prunedRoutes > 0
     ? ` · ${networkNumber(arb.prunedRoutes)} quotes screened out` : '';
-  $('arbitrumStatus').textContent = status + quoteDetail + depth + screened + (scanned ? networkAge(arb.updatedAt) : '');
+  $('arbitrumStatus').textContent = status + quoteDetail + depth + screened + arbitrumRecoveryDetail(arb?.quoteRecovery)
+    + (scanned ? networkAge(arb.updatedAt) : '');
   const pathStatus = $('arbitrumPathStatus');
   pathStatus.hidden = !arb?.pathStatus || arb.mode === 'off';
   const pathBlock = arb?.pathBlock > 0 ? ' · L2 block ' + networkNumber(arb.pathBlock) : '';

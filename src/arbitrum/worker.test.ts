@@ -221,6 +221,7 @@ test('a truncated Arbitrum activity entry retains the numeric count of unavailab
   assert.equal(f.worker.view().quoteRecovery.before, 2);
   assert.equal(f.worker.view().quoteRecovery.recovered, 0);
   assert.equal(f.worker.view().quoteRecovery.remaining, unavailableLegs);
+  assert.equal(f.worker.view().quoteRecovery.untriedNoReader, unavailableLegs);
   assert.equal(logs[0].message.length, 280);
   assert.match(logs[0].message, /^Block 100: 0 two-swap quotes across 2 pools, 2 unavailable quote legs\./);
   await f.worker.scan();
@@ -228,6 +229,8 @@ test('a truncated Arbitrum activity entry retains the numeric count of unavailab
   assert.equal(latest.quoteRecoveryTotals.scans, 2);
   assert.equal(latest.quoteRecoveryTotals.before, 2 + latest.quoteRecovery.before);
   assert.equal(latest.quoteRecoveryTotals.remaining, 2 + latest.quoteRecovery.remaining);
+  assert.equal(latest.quoteRecoveryTotals.untriedNoReader, 2 + latest.quoteRecovery.untriedNoReader);
+  assert.equal(latest.quoteRecoveryTotals.retryTimeout, 0);
   f.worker.stop();
   f.foundPaths.resolve();
 });
