@@ -9,6 +9,7 @@ import {
 import { redactDiagnostic } from '../diagnostics.js';
 import { validSolanaSwapLossUsdc, type FlashTest } from '../network-test.js';
 import { lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
+import { DEFAULT_SOLANA_LOAN_USDC, isValidSolanaLoanLimit, MAX_SAFE_SOLANA_LOAN_USDC } from './market.js';
 import {
   createKaminoFlashInstructions, createWalletAta, decodeKaminoUsdcReserve, decodeLookupTable, kaminoRepayment,
   JUPITER, KAMINO_MARKET_LOOKUP, KAMINO_USDC_RESERVE, MAINNET_GENESIS, SOLANA_PUBLIC_RPC, USDC, WRAPPED_SOL,
@@ -38,7 +39,6 @@ export const solanaDiscoveryPairs = [
 ] as const;
 const returnVenues = [...solanaDiscoveryPairs.flat(), 'Kipseli', 'ZeroFi'] as const;
 const JUPITER_BUILD = 'https://api.jup.ag/swap/v2/build';
-const defaultLoanUsdc = 250;
 export const SOLANA_TEST_MAX_FEE_LAMPORTS = 50_000n;
 
 type Rpc = ReturnType<typeof createSolanaRpc>;
@@ -68,6 +68,7 @@ export interface SolanaScanConfig {
   rpcUrl?: string;
   jupiterApiKey?: string;
   loanUsdc?: number;
+  clampLoanToReserve?: boolean;
   minNetUsdc?: number;
   maxFeeLamports?: number;
   venuePair?: VenuePair;
@@ -160,21 +161,27 @@ function envNumber(value: string | undefined): number | undefined {
 }
 
 export function solanaScanConfig(env: NodeJS.ProcessEnv = process.env): SolanaScanConfig {
+  const rawLoan = env.SOLANA_LOAN_USDC?.trim();
+  const loanUsdc = rawLoan === 'unlimited' ? Infinity : envNumber(rawLoan) ?? DEFAULT_SOLANA_LOAN_USDC;
+  if ((loanUsdc === Infinity && rawLoan !== 'unlimited') || !isValidSolanaLoanLimit(loanUsdc)) {
+    throw new Error('Loan size must be unlimited or a positive, safely representable USDC amount of at least 1');
+  }
   return {
     wallet: env.SOLANA_WALLET_ADDRESS ?? '',
     rpcUrl: env.SOLANA_RPC_URL,
     jupiterApiKey: env.JUPITER_API_KEY,
-    loanUsdc: envNumber(env.SOLANA_LOAN_USDC) ?? defaultLoanUsdc,
+    loanUsdc,
     minNetUsdc: envNumber(env.SOLANA_MIN_NET_USDC),
     maxFeeLamports: envNumber(env.SOLANA_MAX_FEE_LAMPORTS),
   };
 }
 
 function usdcAmount(value: number, minimum: number, maximum: number, label: string, round = Math.round): bigint {
-  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+  const units = round(value * Number(USDC_UNITS));
+  if (!Number.isSafeInteger(units) || value < minimum || value > maximum) {
     throw new Error(`${label} must be between ${minimum} and ${maximum} USDC`);
   }
-  return BigInt(round(value * Number(USDC_UNITS)));
+  return BigInt(units);
 }
 
 // A requested minimum is an inclusive floor in atomic USDC units, so sub-unit rounding is upward.
@@ -316,11 +323,9 @@ async function liveWalletState(rpc: Rpc, wallet: Address, usdAta: Address, solAt
     }
     return data.readBigUInt64LE(64);
   };
-  const missing = Number(!usdc) + Number(!wsol);
-  const rent = missing ? await rpc.getMinimumBalanceForRentExemption(165n, { commitment: COMMITMENT }).send(deadline(signal)) : 0n;
   return {
     lamports: payer.lamports, usdc: amount(usdc, USDC), wsol: amount(wsol, WRAPPED_SOL), slot: context.slot,
-    createUsdc: !usdc, createWsol: !wsol, rent: BigInt(missing) * rent,
+    createUsdc: !usdc, createWsol: !wsol,
   };
 }
 
@@ -342,8 +347,12 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   const slippageBps = test ? TEST_SLIPPAGE_BPS : ORDINARY_SLIPPAGE_BPS;
   const venues = config.venuePair ?? solanaVenuePairs[0];
   const limits = solanaTestMinimums(test);
-  const configuredLoan = usdcAmount(config.loanUsdc ?? defaultLoanUsdc, 1, 100_000, 'Loan size');
-  const loan = limits.minimumLoan !== undefined && limits.minimumLoan > configuredLoan ? limits.minimumLoan : configuredLoan;
+  const unlimited = config.loanUsdc === Infinity;
+  if (unlimited && test) throw new Error('Loan size for a manual Solana test must be between 1 and 100000 USDC');
+  const requested = unlimited ? DEFAULT_SOLANA_LOAN_USDC : config.loanUsdc ?? DEFAULT_SOLANA_LOAN_USDC;
+  const configuredLoan = usdcAmount(requested, 1, test ? 100_000 : MAX_SAFE_SOLANA_LOAN_USDC,
+    'Loan size', requested <= 100_000 ? Math.round : Math.floor);
+  const desiredLoan = limits.minimumLoan !== undefined && limits.minimumLoan > configuredLoan ? limits.minimumLoan : configuredLoan;
   const gasOnlyTest = !!test && limits.minimumNet === undefined;
   const lossCap = limits.maximumSwapLoss;
   const minimumNet = lossCap !== undefined ? -lossCap
@@ -368,7 +377,9 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
   if (String(genesis) !== MAINNET_GENESIS) throw new Error('Solana RPC is not connected to mainnet-beta');
   if (!account || account.executable) throw new Error('Could not load the Kamino USDC reserve');
   const reserve = decodeKaminoUsdcReserve(account.owner, Buffer.from(account.data[0], 'base64'));
-  const repay = reserve.active ? kaminoRepayment(loan, reserve) : null;
+  const clamp = !test && (unlimited || config.clampLoanToReserve === true);
+  const loan = clamp && desiredLoan > reserve.available ? reserve.available : desiredLoan;
+  const repay = reserve.active && loan >= USDC_UNITS ? kaminoRepayment(loan, reserve) : null;
   const result: SolanaScanResult = {
     chain: 'solana', mode: execute ? 'live' : 'paper', checkedAt: new Date().toISOString(),
     slot: Number(context.slot), wallet, walletSol: Number(balance) / Number(SOL_UNITS),
@@ -430,7 +441,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       ]);
       let swapLossGuard: SolanaSwapLossGuard | undefined;
       if (lossCap !== undefined) {
-        if (!baseline || baseline.createUsdc || baseline.createWsol || baseline.rent !== 0n || baseline.usdc < lossCap) {
+        if (!baseline || baseline.createUsdc || baseline.createWsol || baseline.usdc < lossCap) {
           throw new Error('The capped Solana test requires both existing wallet ATAs and USDC covering the swap loss cap');
         }
         swapLossGuard = { cap: lossCap, baselineUsdc: baseline.usdc, baselineWsol: baseline.wsol, baselineLamports: baseline.lamports };
@@ -457,15 +468,20 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       };
       let transaction = await assemble(createAccounts, []);
       let maxDebit = 0n;
+      let rentLamports = 0n;
       let exactFee: bigint | null = null;
       if (baseline) {
         const encoded = getBase64Decoder().decode(transaction.messageBytes) as TransactionMessageBytesBase64;
-        const feeQuote = await rpc.getFeeForMessage(encoded, { commitment: COMMITMENT, minContextSlot: requiredSlot }).send(deadline(signal));
+        const [feeQuote, rentPerAccount] = await Promise.all([
+          rpc.getFeeForMessage(encoded, { commitment: COMMITMENT, minContextSlot: requiredSlot }).send(deadline(signal)),
+          createAccounts.length ? rpc.getMinimumBalanceForRentExemption(165n, { commitment: COMMITMENT }).send(deadline(signal)) : 0n,
+        ]);
+        rentLamports = BigInt(createAccounts.length) * rentPerAccount;
         exactFee = feeQuote.value;
         if (exactFee === null || exactFee > maxFeeLamports) throw new Error('Solana fee quote exceeds its cap or is unavailable');
-        maxDebit = exactFee + baseline.rent;
+        maxDebit = exactFee + rentLamports;
         if (baseline.lamports <= maxDebit) throw new Error('Solana fee payer cannot cover the fee and required ATA rent');
-        const requiredUsdc = minimumNet + nativeCostInUsdc(gasOnlyTest ? baseline.rent : maxDebit, loan, firstMinimum);
+        const requiredUsdc = minimumNet + nativeCostInUsdc(gasOnlyTest ? rentLamports : maxDebit, loan, firstMinimum);
         if (beforeNetwork < requiredUsdc) return { buy, sell, status: 'below-profit-floor', ...quote };
         transaction = await assemble([
           lighthouseLamports(wallet, 'equal', baseline.lamports - exactFee),
@@ -513,7 +529,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
         && (exactFee === null || (fee === exactFee && costLamports <= maxDebit));
       if (qualified && execute && baseline && exactFee !== null) {
         const candidate = { ...(test ? { testId: test.id } : {}), transaction, lastValidBlockHeight: blockhash.lastValidBlockHeight,
-          simulationSlot: execution.slot, maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports: baseline.rent,
+          simulationSlot: execution.slot, maximumLamportDebit: maxDebit, feeLamports: exactFee, rentLamports,
           firstMinimum, loan, net, ...(swapLossGuard ? { swapLossGuard } : {}) };
         if (!submission) {
           // Give the first qualifying route to the signer while the opposite direction finishes.

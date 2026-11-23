@@ -111,16 +111,21 @@ function auditBuyPools(markets: Market[], scan: number): Set<Pool> {
   return selected;
 }
 
-export function arbitrumProbeSize(scan: number, lead: RecentArbitrumSizingLead | null, now: number): bigint | undefined {
+type ArbitrumSizeProbe = bigint | { fundedDepth: number };
+export function arbitrumProbeSize(scan: number, lead: RecentArbitrumSizingLead | null, now: number,
+  maxLoanUsd = 1_000_000): ArbitrumSizeProbe | undefined {
   if (scan % 2 === 0) return undefined;
   const extra = Math.floor(scan / 2);
   const round = Math.floor(extra / 2);
   const exploration = explorationSizes[round % explorationSizes.length];
+  // Use alternate deepest exploration slots for larger amounts without adding quote requests.
+  const fundingInterval = 8 * explorationSizes.length;
+  if (maxLoanUsd > 1_000_000 && (scan + 1) % fundingInterval === 0) return { fundedDepth: (scan + 1) / fundingInterval - 1 };
   // Keep the existing one extra size every other scan. Half of those slots explore independently of the quote signal.
   if (extra % 2 === 1 || !lead || lead.at > now || now - lead.at > quoteLeadMaxAge) return exploration;
   const [numerator, denominator] = refinementRatios[round % refinementRatios.length];
   const refined = lead.amount * numerator / denominator;
-  return refined >= explorationSizes[0] && refined <= explorationSizes[explorationSizes.length - 1]
+  return refined >= explorationSizes[0] && (maxLoanUsd > 1_000_000 || refined <= explorationSizes[explorationSizes.length - 1])
     && !amounts.includes(refined) ? refined : exploration;
 }
 
@@ -344,7 +349,7 @@ export async function arbitrumEthUsd(client: ArbitrumClient, blockNumber?: bigin
 }
 
 export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, markets: Market[],
-  test: boolean | number = false, extraSize?: bigint, maxLoanUsd = 1_000_000,
+  test: boolean | number = false, extraSize?: ArbitrumSizeProbe, maxLoanUsd = 1_000_000,
   screenRoundTrips: boolean | { auditScan: number } = false,
   price = arbitrumEthUsd(client, blockNumber), recovery?: QuoteRecoveryReaders & { blockHash: Hash }) {
   let pin: QuotePin = recovery ? { blockHash: recovery.blockHash, requireCanonical: true } : { blockNumber };
@@ -375,8 +380,15 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
         ? recovery.alternate : undefined).catch(() => undefined);
   };
   const usdLimit = loanLimitWei(maxLoanUsd, ethUsd) ?? 0n;
+  let probe: bigint | undefined;
+  if (typeof extraSize === 'object') {
+    const funded = usdLimit < available ? usdLimit : available;
+    const depths = [funded];
+    for (let amount = parseEther('256'); amount < funded; amount *= 4n) depths.push(amount);
+    probe = depths[extraSize.fundedDepth % depths.length];
+  } else probe = extraSize;
   const ladder = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
-    : test ? testAmounts : extraSize === undefined || amounts.includes(extraSize) ? amounts : [...amounts, extraSize];
+    : test ? testAmounts : probe === undefined || amounts.includes(probe) ? amounts : [...amounts, probe];
   const sizes = ladder.filter((size) => size > 0n && size <= available && size <= usdLimit);
   const audit = test === false && typeof screenRoundTrips === 'object' ? auditBuyPools(markets, screenRoundTrips.auditScan) : undefined;
   let prunedRoutes = 0;

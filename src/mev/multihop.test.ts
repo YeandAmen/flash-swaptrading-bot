@@ -3,6 +3,7 @@ import test from 'node:test';
 import { getAddress, parseEther, zeroAddress, type Address, type Hex } from 'viem';
 import type { PathEdge, PathReader } from './multihop-market.js';
 import type { EthereumPathScan } from './multihop.js';
+import { loanLimitWei } from './cadence.js';
 
 process.env.RPC_URL ??= 'http://127.0.0.1:8545';
 const { ADDR } = await import('../config.js');
@@ -92,6 +93,20 @@ test('failed or mismatched pinned reads, expired scans and nonclosing paths neve
   // Two intermediate visits to A or an early WETH return cannot make a valid four-hop path.
   assert.equal((await quoteEthereumPaths(settings(), never, [edge(WETH,a,0),edge(a,b,0),edge(b,a,0),edge(a,WETH,0)],
     parseEther('1'), labels)).cycles, 0);
+});
+
+test('a prior exact output above the V4 executor limit cannot become a V4 quote', async () => {
+  const edges = [edge(WETH, a, 2), edge(a, b, 5), edge(b, WETH, 0, 2n)];
+  const quoteInputs: (Address | undefined)[] = [];
+  const reader = client((rows, block) => rows.map((row, i) => {
+    if (!i) return block;
+    quoteInputs.push((row.args![0] as { tokenIn?: Address }).tokenIn);
+    return [1n << 127n, 1n << 96n];
+  }));
+  const result = await quoteEthereumPaths(settings(), reader, edges, parseEther('1'), labels);
+  assert.deepEqual(new Set(quoteInputs), new Set([WETH]));
+  assert.equal(result.exactQuotes, 0);
+  assert.deepEqual(result.candidates, []);
 });
 
 test('discovers the three known hookless stablecoin crossover keys and rotates extra markets', async () => {
@@ -208,6 +223,56 @@ test('an interior loan size clears the retained floor on the same three pool sta
   const full = await run('512', [first, otherVenue, middle, exit]);
   assert.equal(full.exactQuotes, 12, 'the interior trial fits inside the existing full budget');
   assert.equal(full.bestQuote?.amountIn, parseEther('0.1'));
+});
+
+test('deep paths quote the exact funded USD cap alongside small loans within the normal trial budget', async () => {
+  const scan = { ...settings(), maxLoanWei: loanLimitWei(2_000_000, 1720.91208951)! };
+  const first = edge(WETH, a, 2);
+  first.reserveOut = first.reserveIn * 101n / 100n;
+  first.rateN = 101n;
+  first.rateD = 100n;
+  const markets = [first, edge(a, b, 0), edge(b, WETH, 0)];
+  const run = async (funding: bigint, payoutPercent = 100n) => {
+    const inputs: bigint[] = [];
+    const reader = client((rows, block) => rows.map((row, i) => {
+      if (!i) return block;
+      const { amountIn } = row.args![0] as { amountIn: bigint };
+      inputs.push(amountIn);
+      return [constantOut(first, amountIn) * payoutPercent / 100n, 1n << 96n];
+    }));
+    const result = await quoteEthereumPaths(scan, reader, markets, funding, labels);
+    assert.ok(inputs.includes(parseEther('0.05')), 'small reference is still exact-quoted');
+    assert.ok(inputs.length <= 12 && inputs.length === new Set(inputs).size);
+    assert.equal(result.exactQuotes, inputs.length);
+    return { result, inputs };
+  };
+  const funded = await run(parseEther('16847'));
+  assert.ok(scan.maxLoanWei > parseEther('1162'));
+  assert.equal(funded.result.candidates[0]?.amountIn, scan.maxLoanWei);
+  assert.ok(funded.inputs.every(x => x <= scan.maxLoanWei));
+  const limited = parseEther('765.4321');
+  const smaller = await run(limited);
+  assert.equal(smaller.result.candidates[0]?.amountIn, limited);
+  assert.ok(smaller.inputs.every(x => x <= limited));
+
+  const adverse = await run(scan.maxLoanWei, 98n);
+  assert.ok(adverse.inputs.includes(scan.maxLoanWei));
+  assert.deepEqual(adverse.result.candidates, [], 'the large modeled gain cannot bypass an unprofitable exact quote');
+
+  scan.maxLoanWei = loanLimitWei(Infinity, 1720.91208951)!;
+  const lenderBalance = parseEther('17576');
+  const unlimited = await run(lenderBalance);
+  const best = unlimited.result.candidates[0];
+  assert.ok(best && best.amountIn > parseEther('1162') && best.amountIn < lenderBalance);
+  assert.ok(best.estimatedNet > funded.result.candidates[0].estimatedNet);
+  assert.ok(!unlimited.inputs.includes(lenderBalance), 'the full funded size loses money');
+  assert.ok(unlimited.inputs.every(amount => amount <= lenderBalance), 'funding bounds apply without a USD cap');
+
+  first.reserveIn /= 20n;
+  first.reserveOut /= 20n;
+  const shallow = await run(lenderBalance);
+  assert.ok(shallow.result.candidates.length);
+  assert.ok(shallow.inputs.every(x => x <= parseEther('512')), 'thin routes do not spend a quote on the new cap');
 });
 
 test('a full set of high-ranked three-hop trials leaves room for the four-hop audit', async () => {

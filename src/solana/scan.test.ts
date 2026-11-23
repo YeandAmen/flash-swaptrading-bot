@@ -12,14 +12,14 @@ import {
 import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
 import { SolanaLiveWorker } from './worker.js';
 import { queueFlashTest, validSolanaSwapLossUsdc } from '../network-test.js';
-import { scanSolanaCycle, solanaDiscoveryPairs, solanaVenuePairs } from './scan.js';
+import { scanSolanaCycle, solanaDiscoveryPairs, solanaScanConfig, solanaVenuePairs } from './scan.js';
 
 const wallet = address('23g1K6sr2bevNwLYPoB79jzEQtErioYQ8mpUa76xA6yu');
 const tokenProgram = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const fakeRpc = 'http://127.0.0.1:8899';
 const fee = 6400;
 
-function reserveFixture() {
+function reserveFixture(available: bigint) {
   const data = Buffer.alloc(8624);
   Buffer.from('2bf2ccca1af73b7f', 'hex').copy(data);
   const fields = [
@@ -29,7 +29,7 @@ function reserveFixture() {
     [408, tokenProgram],
   ] as const;
   for (const [offset, key] of fields) data.set(getAddressEncoder().encode(address(key)), offset);
-  data.writeBigUInt64LE(10_000_000_000n, 224);
+  data.writeBigUInt64LE(available, 224);
   data.writeBigUInt64LE(6n, 272);
   data.writeBigUInt64LE(11_529_215_046_068n, 4904);
   return data.toString('base64');
@@ -45,6 +45,7 @@ function lookupFixture() {
 
 test('Solana paper scanner composes unsigned atomic borrow and repay and gates observed net profit', async (t) => {
   let simulationCount = 0;
+  let availableUsdcUnits = 10_000_000_000n;
   let actualWalletGain = 210_000;
   let live = false;
   let reportedFee = fee;
@@ -129,7 +130,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     const atSlot = (value: unknown) => response({ context: { slot: 42 }, value });
     switch (request.method) {
       case 'getGenesisHash': return response(MAINNET_GENESIS);
-      case 'getAccountInfo': return atSlot({ data: [reserveFixture(), 'base64'], executable: false, owner: KAMINO, lamports: 7, rentEpoch: 0, space: 8624 });
+      case 'getAccountInfo': return atSlot({ data: [reserveFixture(availableUsdcUnits), 'base64'], executable: false, owner: KAMINO, lamports: 7, rentEpoch: 0, space: 8624 });
       case 'getBalance': return atSlot(10_000_000);
       case 'getMultipleAccounts': {
         if (live && (request.params[0] as string[])[0] === wallet) {
@@ -153,8 +154,9 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
         const sequence = compiled.instructions.map((instruction) => compiled.staticAccounts[instruction.programAddressIndex]);
         if (live) {
           assert.equal((request.params[1] as { replaceRecentBlockhash: boolean }).replaceRecentBlockhash, false);
-          assert.deepEqual(sequence.slice(2, 8), [LIGHTHOUSE, LIGHTHOUSE, KAMINO, JUPITER, JUPITER, KAMINO]);
-          assert.deepEqual(sequence.slice(8), [LIGHTHOUSE, LIGHTHOUSE, LIGHTHOUSE]);
+          const setup = usdcAccountExists ? [] : [address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL')];
+          assert.deepEqual(sequence.slice(2), [LIGHTHOUSE, ...setup, LIGHTHOUSE, KAMINO, JUPITER, JUPITER, KAMINO,
+            LIGHTHOUSE, LIGHTHOUSE, LIGHTHOUSE]);
         } else {
           assert.deepEqual(sequence.slice(4), [KAMINO, JUPITER, JUPITER, KAMINO]);
         }
@@ -171,7 +173,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
             assert.equal(compiled.staticAccounts[instruction.accountIndices![0]], expected.accounts![0].address);
           }
         }
-        assert.equal(compiled.instructions[7].data?.[16], 4);
+        assert.equal(compiled.instructions[sequence.lastIndexOf(KAMINO)].data?.[16], sequence.indexOf(KAMINO));
         const tokenBalance = (mint: string, ata: string, amount: number, decimals: number) => ({
           accountIndex: compiled.staticAccounts.findIndex((key) => key === ata), mint, owner: wallet, programId: tokenProgram,
           uiTokenAmount: { amount: String(amount), decimals, uiAmount: amount / 10 ** decimals, uiAmountString: String(amount / 10 ** decimals) },
@@ -208,6 +210,149 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   assert.ok(overBudget.routes.every((route) => route.status === 'simulated' && route.simulatedNetUsdc! > 0.2 && route.qualified === false));
 
   live = true;
+  await t.test('finite ordinary and manual requests retain their sizing and funding checks', async () => {
+    const startingRequests = jupiterRequests;
+    const noSubmit = async () => assert.fail('Unfundable or invalid principal was handed off');
+    for (const [configured, actual] of [
+      [10_000.0000009, 10_000.000001], [2_000_000.0000009, 2_000_000], [20_000_000, 20_000_000],
+    ]) {
+      const result = await scanSolanaCycle({ ...config, loanUsdc: configured }, noSubmit);
+      assert.equal(result.loanUsdc, actual);
+      assert.equal(result.status, 'loan-unavailable');
+      assert.ok(result.availableUsdc < actual);
+    }
+    const fixedManual = await scanSolanaCycle({ ...config, loanUsdc: 50_000, clampLoanToReserve: true }, noSubmit, 'manual-size');
+    assert.equal(fixedManual.status, 'loan-unavailable');
+    assert.equal(fixedManual.loanUsdc, 50_000);
+    for (const loanUsdc of [100_000.000001, Infinity]) {
+      await assert.rejects(scanSolanaCycle({ ...config, loanUsdc }, noSubmit, 'manual-size'), /Loan size/);
+    }
+    assert.equal(solanaScanConfig({ SOLANA_LOAN_USDC: '20000000' }).loanUsdc, 20_000_000);
+    assert.equal(solanaScanConfig({}).loanUsdc, 250);
+    for (const raw of ['invalid', 'Infinity', '+Infinity', '-Infinity', 'NaN', '1e309', '0.99', '0', '-1', String(Number.MAX_SAFE_INTEGER)]) {
+      assert.throws(() => solanaScanConfig({ SOLANA_LOAN_USDC: raw }), /Loan size/);
+    }
+    assert.equal(jupiterRequests, startingRequests);
+    const originalAvailable = availableUsdcUnits;
+    availableUsdcUnits = 2_000_000_000_000n;
+    try {
+      const funded = await scanSolanaCycle({ ...config, loanUsdc: 2_000_000 }, noSubmit);
+      assert.equal(funded.status, 'scanned');
+      assert.equal(funded.flashFeeUsdc, 20);
+      assert.ok(funded.routes.every(route => route.status === 'below-profit-floor'));
+      assert.equal(jupiterRequests - startingRequests, 4);
+    } finally { availableUsdcUnits = originalAvailable; }
+  });
+  await t.test('unlimited cold start and planned scans quote and encode only the currently fundable principal', async (t) => {
+    const unlimited = solanaScanConfig({ SOLANA_WALLET_ADDRESS: wallet, SOLANA_RPC_URL: fakeRpc, SOLANA_LOAN_USDC: 'unlimited' });
+    assert.equal(unlimited.loanUsdc, Infinity);
+    const originalAvailable = availableUsdcUnits;
+    t.after(() => { availableUsdcUnits = originalAvailable; });
+    const firstInputs: bigint[] = [];
+    const fetchFixture = globalThis.fetch;
+    t.mock.method(globalThis, 'fetch', (input: URL | RequestInfo, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.origin === 'https://api.jup.ag' && url.searchParams.get('inputMint') === USDC) {
+        firstInputs.push(BigInt(url.searchParams.get('amount')!));
+      }
+      return fetchFixture(input, init);
+    });
+    const planned = { ...unlimited, loanUsdc: 2_000_000, clampLoanToReserve: true };
+    for (const { scanConfig, available, expected, feeUsdc } of [
+      { scanConfig: unlimited, available: 40_000_000_000_000n, expected: 250_000_000n, feeUsdc: 0.0025 },
+      { scanConfig: planned, available: 239_123_456n, expected: 239_123_456n, feeUsdc: 0.002392 },
+      { scanConfig: unlimited, available: 241_234_567n, expected: 241_234_567n, feeUsdc: 0.002413 },
+    ]) {
+      availableUsdcUnits = available;
+      const startingRequests = jupiterRequests;
+      firstInputs.length = 0;
+      let handoffs = 0;
+      const result = await scanSolanaCycle(scanConfig, async candidate => {
+        handoffs++;
+        assert.equal(candidate.loan, expected);
+        const compiled = getCompiledTransactionMessageDecoder().decode(candidate.transaction.messageBytes);
+        if (compiled.version !== 0) assert.fail('Expected a v0 transaction');
+        const kamino = compiled.instructions.filter(ix => compiled.staticAccounts[ix.programAddressIndex] === KAMINO);
+        assert.deepEqual(kamino.map(ix => Buffer.from(ix.data!).readBigUInt64LE(8)), [expected, expected]);
+      });
+      assert.equal(result.status, 'scanned');
+      assert.equal(result.loanUsdc, Number(expected) / 1e6);
+      assert.equal(result.availableUsdc, Number(available) / 1e6);
+      assert.equal(result.flashFeeUsdc, feeUsdc);
+      assert.deepEqual(firstInputs, [expected, expected]);
+      assert.equal(jupiterRequests - startingRequests, 4);
+      assert.ok(result.routes.every(route => route.qualified), JSON.stringify(result.routes));
+      assert.equal(handoffs, 1);
+    }
+    const startingRequests = jupiterRequests;
+    for (const value of [0n, 999_999n]) {
+      availableUsdcUnits = value;
+      const result = await scanSolanaCycle(planned, async () => assert.fail('Sub-dollar loan was handed off'));
+      assert.equal(result.status, 'loan-unavailable');
+      assert.equal(result.loanUsdc, Number(value) / 1e6);
+      assert.equal(result.flashFeeUsdc, null);
+      assert.deepEqual(result.routes, []);
+    }
+    assert.equal(jupiterRequests, startingRequests);
+  });
+  await t.test('prices a missing ATA in parallel with the message fee and waits for both before simulation', async (t) => {
+    const fetchFixture = globalThis.fetch;
+    const rent = 1_488_440;
+    let releaseRent!: () => void, sawFee!: () => void, sawRent!: () => void;
+    const rentGate = new Promise<void>(resolve => { releaseRent = resolve; });
+    const feeRequested = new Promise<void>(resolve => { sawFee = resolve; });
+    const rentRequested = new Promise<void>(resolve => { sawRent = resolve; });
+    let rejectRent = false, rentRequests = 0;
+    t.mock.method(globalThis, 'fetch', async (input: URL | RequestInfo, init?: RequestInit) => {
+      if (new URL(String(input)).origin === fakeRpc) {
+        const request = JSON.parse(String(init?.body));
+        if (request.method === 'getFeeForMessage') sawFee();
+        if (request.method === 'getMinimumBalanceForRentExemption') {
+          rentRequests++;
+          sawRent();
+          await rentGate;
+          if (rejectRent) return Response.json({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'Rent unavailable' } });
+        }
+      }
+      return fetchFixture(input, init);
+    });
+    const previousUsdcBalance = usdcBalance;
+    usdcAccountExists = false;
+    usdcBalance = 0;
+    reportedNativeDebit = fee + rent;
+    t.after(() => { releaseRent(); usdcAccountExists = true; usdcBalance = previousUsdcBalance; reportedNativeDebit = fee; });
+    const before = simulationCount, startingRequests = jupiterRequests;
+    let submitted = 0;
+    const scan = scanSolanaCycle(config, async candidate => {
+      submitted++;
+      assert.equal(candidate.rentLamports, BigInt(rent));
+      assert.equal(candidate.maximumLamportDebit, BigInt(rent + fee));
+      assert.ok(candidate.net >= 50_000n);
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([Promise.all([feeRequested, rentRequested]), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Error('Message fee waited for the rent response')), 1000);
+      })]);
+      assert.equal(simulationCount, before);
+      assert.equal(submitted, 0);
+    } finally { clearTimeout(timer); releaseRent(); }
+    const checked = await scan;
+    assert.ok(checked.routes.every(route => route.qualified), JSON.stringify(checked.routes));
+    assert.equal(simulationCount, before + 2);
+    assert.equal(jupiterRequests - startingRequests, 4);
+    assert.equal(submitted, 1);
+
+    rejectRent = true;
+    const noSubmit = async () => assert.fail('Unavailable rent must not qualify a candidate');
+    assert.ok((await scanSolanaCycle(config, noSubmit)).routes.every(route => route.status === 'simulation-failed'));
+    assert.equal(simulationCount, before + 2);
+    const previousRentRequests = rentRequests;
+    usdcAccountExists = true;
+    reportedNativeDebit = fee;
+    assert.ok((await scanSolanaCycle(config, async () => {})).routes.every(route => route.qualified));
+    assert.equal(rentRequests, previousRentRequests, 'existing ATAs require no rent lookup');
+  });
   await t.test('submits a qualifying route before the opposite quote finishes', async () => {
     jupiterRequests = 0;
     let submissions = 0;

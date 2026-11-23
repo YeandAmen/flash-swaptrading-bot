@@ -1,5 +1,5 @@
 import { formatUnits, parseAbi, zeroAddress, type Address } from 'viem';
-import { loanLimitWei } from '../mev/cadence.js';
+import { loanLimitWei, MAX_FLASH_LOAN_WEI } from '../mev/cadence.js';
 import type { ArbitrumClient } from './market.js';
 
 const weth: Address = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
@@ -148,7 +148,7 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
   const refinement = { tried: 0, quoted: 0, bestPayoutUsd: null as number | null, baselineBestPayoutUsd: null as number | null };
   const result = { opportunities: [] as ArbPathQuote[], best: null as { route: string; payoutUsd: number; loanUsd: number } | null,
     pools: 0, paths: 0, quotedRoutes: 0, unavailableLegs: 0, refinement };
-  if (!Number.isFinite(maxLoanUsd) || maxLoanUsd <= 0) {
+  if (!(maxLoanUsd > 0)) {
     await ethUsd;
     return result;
   }
@@ -196,12 +196,23 @@ export async function scanArbitrumPaths(client: ArbitrumClient, block: bigint, e
     if (!available || !usd) continue;
     const decimals = i === 0 ? 18 : 6;
     const symbol = i === 0 ? 'WETH' : 'USDC';
+    const scale = 10n ** BigInt(18 - decimals);
+    const amountForUsd = (size: number) => (loanLimitWei(size, usd) ?? 0n) / scale;
+    const configured = maxLoanUsd === Infinity ? MAX_FLASH_LOAN_WEI : amountForUsd(maxLoanUsd);
+    const maximum = [configured, available, MAX_FLASH_LOAN_WEI].reduce((a, b) => a < b ? a : b);
+    if (maximum <= 0n) continue;
+    const regular = [50, 250, 1000, 2500].map(amountForUsd);
+    const rotation = Number(block % 4n);
+    let large: bigint;
+    if (rotation === 3) {
+      // Reuse the deepest slot for intermediate powers of two and the exact funded maximum.
+      const levels: bigint[] = [];
+      for (let depth = amountForUsd(1_000_000); depth > 0n && depth < maximum; depth *= 2n) levels.push(depth);
+      levels.push(maximum);
+      large = levels[Number((block / 4n) % BigInt(levels.length))];
+    } else large = amountForUsd([10_000, 50_000, 250_000][rotation]);
     const cycles = pathCandidates(asset, edges);
-    const sizes = [50, 250, 1000, 2500, [10_000, 50_000, 250_000, 1_000_000][Number(block % 4n)]];
-    const amounts = [...new Set(sizes.map((size) => {
-      const loan = (loanLimitWei(Math.min(size, maxLoanUsd), usd) ?? 0n) / 10n ** BigInt(18 - decimals);
-      return loan < available ? loan : available;
-    }))].filter((amount) => amount > 0n);
+    const amounts = [...new Set([...regular, large].map(loan => loan < maximum ? loan : maximum))].filter(loan => loan > 0n);
     const selectedPaths = new Set<Edge[]>();
     for (const amountIn of amounts) for (const { path } of shortlist(cycles, amountIn, block)) {
       selectedPaths.add(path);

@@ -1,6 +1,7 @@
 import { parseEther, type Address, type Hex } from 'viem';
 import { mevPoolClient } from '../chain.js';
 import { ADDR } from '../config.js';
+import { MAX_FLASH_LOAN_WEI } from './cadence.js';
 import {
   discoverPathPools, directQuoteCall, isPathV3, pathMarket, pathTokens, pinnedReads, type EthereumPathHop, type PathEdge,
   type PathPool, type PathReader, type PathToken,
@@ -103,7 +104,13 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
     destinations.set(edge.hop.tokenOut, out);
   }
   const loans = [...new Set(sizes.map(size => min(size, available)))].filter(a => a > 0n);
+  // Extend the local depth model geometrically to the funded limit. A large
+  // lender balance can be unprofitable in full while an intermediate size clears gas.
+  const largestFixedLoan = sizes[sizes.length - 1];
+  for (let size = largestFixedLoan * 4n; size < available; size *= 4n) loans.push(size);
+  if (available > largestFixedLoan) loans.push(available);
   const floor = scan.minNetWei + 21_000n * scan.gasPriceWei;
+  const score = (trial: Trial) => trial.amountOut - trial.amountIn - modeledGas(trial.edges.length) * scan.gasPriceWei;
   const trials: Trial[] = [];
   let cycles = 0;
   const audit = scan.blockNumber % 8n === 0n;
@@ -143,12 +150,12 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
         if (amountIn === referenceSize && first && first.amountOut > (references.get(path.length)?.amountOut ?? 0n)) {
           references.set(path.length, first);
         }
-        if (viable) trials.push(...variants.filter(v => v.upper >= amountIn + floor));
+        if (viable) trials.push(...variants.filter(v => v.upper >= amountIn + floor
+          && (amountIn <= largestFixedLoan || score(v) >= scan.minNetWei)));
       }
     }
   };
   visit([WETH], []);
-  const score = (trial: Trial) => trial.amountOut - trial.amountIn - modeledGas(trial.edges.length) * scan.gasPriceWei;
   trials.sort((a, b) => compare(score(a), score(b)));
   const chosen: Trial[] = [];
   const seen = new Set<string>();
@@ -207,7 +214,7 @@ function shortlist(edges: PathEdge[], available: bigint, scan: EthereumPathScan)
 export async function quoteEthereumPaths(scan: EthereumPathScan, client: PathReader, edges: PathEdge[], available: bigint,
   symbols: ReadonlyMap<Address, string>): Promise<Pick<EthereumPathResult, 'cycles' | 'exactQuotes' | 'bestQuote' | 'candidates' | 'status'>> {
   const expired = () => Date.now() >= scan.deadlineMs;
-  const { cycles, trials } = shortlist(edges, min(available, scan.maxLoanWei), scan);
+  const { cycles, trials } = shortlist(edges, min(available, min(scan.maxLoanWei, MAX_FLASH_LOAN_WEI)), scan);
   const amounts = trials.map(t => t.amountIn);
   let partial = false;
   for (let leg = 0; leg < 4 && !expired(); leg++) {
@@ -221,7 +228,7 @@ export async function quoteEthereumPaths(scan: EthereumPathScan, client: PathRea
         amounts[i] = cpOut(edge, amount);
         return -1;
       }
-      if (amount >= (1n << 128n)) {
+      if (amount >= (1n << 128n) || (edge.hop.kind === 5 && amount > MAX_FLASH_LOAN_WEI)) {
         amounts[i] = 0n;
         return -1;
       }

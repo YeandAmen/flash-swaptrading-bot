@@ -33,7 +33,7 @@ function loanInstructions(loan: bigint, borrowIndex: number) {
 }
 
 function testCandidate(wallet: Address, blockhash = '11111111111111111111111111111111',
-  flash?: ReturnType<typeof loanInstructions>): PreparedSolanaCycle {
+  flash: ReturnType<typeof loanInstructions> | null = loanInstructions(250_000_000n, 2)): PreparedSolanaCycle {
   assertIsBlockhash(blockhash);
   const sequence = [LIGHTHOUSE, LIGHTHOUSE, KAMINO, JUPITER, JUPITER, KAMINO, LIGHTHOUSE, LIGHTHOUSE];
   const instructions = sequence.map((programAddress, index) => ({
@@ -163,7 +163,59 @@ test('Solana journals before raw send and restores one pending signature across 
     }
   });
 
-  const makeWorker = () => new SolanaLiveWorker({ rpcUrl, wallet }, keyFile, dataDir, 5, async () => {});
+  const makeWorker = (loanUsdc?: number) => new SolanaLiveWorker({ rpcUrl, wallet, loanUsdc }, keyFile, dataDir, 5, async () => {});
+  await t.test('ordinary signer enforces its configured cap and the principal encoded in both Kamino instructions', async () => {
+    for (const cap of [0, NaN, -Infinity, Number.MAX_SAFE_INTEGER / 1e6]) assert.throws(() => makeWorker(cap), /loan cap/);
+    const worker = makeWorker(2_000_000);
+    await worker.initialize();
+    worker.arm();
+    try {
+      const loan = 2_000_000_000_000n;
+      const atCap = { ...testCandidate(wallet, undefined, loanInstructions(loan, 2)), loan,
+        firstMinimum: candidate.firstMinimum * 8_000n, simulationSlot: 70n };
+      for (const invalid of [0n, -1n, loan + 1n, Number.MAX_SAFE_INTEGER + 1 as unknown as bigint]) {
+        assert.equal(await worker.submit({ ...atCap, loan: invalid }), undefined);
+        assert.match(worker.summary.status, /loan size limit/);
+      }
+      for (const field of ['borrow', 'repay'] as const) {
+        const flash = loanInstructions(loan, 2);
+        flash[field].writeBigUInt64LE(loan + 1n, 8);
+        const { transaction } = testCandidate(wallet, undefined, flash);
+        assert.equal(await worker.submit({ ...atCap, transaction }), undefined);
+        assert.match(worker.summary.status, /missing complete swap/);
+      }
+      assert.equal((await worker.submit(atCap))?.status, 'route-declined');
+      assert.match(worker.summary.status, /stale before final simulation/);
+      const testId = 'manual-principal-limit';
+      worker.queueTest(testId);
+      assert.equal(await worker.submit({ ...atCap, testId }), undefined);
+      assert.match(worker.summary.status, /loan size limit/);
+      assert.equal(simulationCount, 0);
+      assert.equal(rawSendCount, 0);
+    } finally {
+      worker.disarm();
+      worker.stop();
+    }
+  });
+  await t.test('the unlimited signer accepts a finite multimillion loan and rejects an unsafe principal', async () => {
+    const worker = makeWorker(Infinity);
+    await worker.initialize();
+    worker.arm();
+    try {
+      const loan = 12_500_000_000_000n;
+      const ordinary = { ...testCandidate(wallet, undefined, loanInstructions(loan, 2)), loan,
+        firstMinimum: candidate.firstMinimum * 50_000n, simulationSlot: 70n };
+      assert.equal((await worker.submit(ordinary))?.status, 'route-declined');
+      assert.match(worker.summary.status, /stale before final simulation/);
+      await worker.submit({ ...ordinary, loan: BigInt(Number.MAX_SAFE_INTEGER) + 1n });
+      assert.match(worker.summary.status, /loan size limit/);
+      assert.equal(simulationCount, 0);
+      assert.equal(rawSendCount, 0);
+    } finally {
+      worker.disarm();
+      worker.stop();
+    }
+  });
   const original = makeWorker();
   await original.initialize();
   assert.equal(original.summary.ready, true);
@@ -177,7 +229,7 @@ test('Solana journals before raw send and restores one pending signature across 
   await original.submit({ ...candidate, simulationSlot: 70n });
   // This first-leg minimum values the network fee at exactly 5 USDC. Rent stays in its own guards.
   const feeBoundary = { ...candidate, firstMinimum: 320_000n };
-  assert.equal(await original.submit({ ...feeBoundary, loan: feeBoundary.loan + 1n }), undefined);
+  assert.equal(await original.submit({ ...feeBoundary, firstMinimum: feeBoundary.firstMinimum - 1n }), undefined);
   assert.match(original.summary.status, /network fee USD cap/);
   assert.equal(simulationCount, 0);
   assert.equal(rawSendCount, 0);
@@ -311,6 +363,12 @@ test('Solana journals before raw send and restores one pending signature across 
   await restarted.submit(candidate);
   assert.equal(rawSendCount, 2);
   assert.equal(restarted.queueTest(testId).status, 'queued');
+  const manualLoan = 100_000_000_000n;
+  const manualAtCap = { ...testCandidate(wallet, JUPITER, loanInstructions(manualLoan, 2)), testId,
+    loan: manualLoan, firstMinimum: candidate.firstMinimum * 400n, simulationSlot: 70n };
+  await restarted.submit(manualAtCap);
+  assert.match(restarted.summary.status, /stale before final simulation/,
+    'a requested manual loan can reach its own cap above the ordinary configured limit');
   restarted.recordTestScan(testId, 2);
   assert.equal(restarted.activeTest()?.checked, 2);
   simulationMeta.postTokenBalances = [token(USDC, '1291360', 6), token(WRAPPED_SOL, '90000000', 9)];
@@ -450,7 +508,7 @@ test('Solana journals before raw send and restores one pending signature across 
       const principal = BigInt(ordinaryPending.loan);
       const flash = loanInstructions(principal, 'wrongRepayIndex' in scenario ? 1 : 2);
       if ('wrongPrincipal' in scenario) flash.repay.writeBigUInt64LE(principal + 1n, 8);
-      candidate = testCandidate(wallet, ordinaryPending.blockhash, 'missingLoan' in scenario ? undefined : flash);
+      candidate = testCandidate(wallet, ordinaryPending.blockhash, 'missingLoan' in scenario ? null : flash);
       const tx = getBase58Decoder().decode(new Uint8Array(64).fill(50 + i));
       const state = readDisk();
       const manual = 'manual' in scenario;

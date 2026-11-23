@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { formatEther, formatUnits, isAddress, isAddressEqual, keccak256, parseAbiItem, parseEventLogs, type Address, type Hash, type Hex } from 'viem';
 import { CONFIG, DATA_DIR, MEV } from '../config.js';
+import { loanLimitWei, MAX_FLASH_LOAN_WEI } from '../mev/cadence.js';
 import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest, type FlashTestOptions } from '../network-test.js';
 import { NetworkActivity } from '../network-activity.js';
 import { writeJson } from '../persistence.js';
@@ -317,7 +318,7 @@ export class ArbitrumWorker {
       }
     }
     const regularScan = test ? undefined : this.regularScans++;
-    const extraSize = regularScan === undefined ? undefined : arbitrumProbeSize(regularScan, this.sizingLead, Date.now());
+    const extraSize = regularScan === undefined ? undefined : arbitrumProbeSize(regularScan, this.sizingLead, Date.now(), MEV.maxLoanUsd);
     // Audit a different slice each regular scan while always quoting possible or unknown-price routes.
     const screenRoundTrips = regularScan === undefined ? false : { auditScan: regularScan };
     const price = arbitrumEthUsd(this.client, block);
@@ -382,6 +383,14 @@ export class ArbitrumWorker {
     let reachedLiveChecks = false;
     for (const candidate of candidates) {
       if (!canContinue()) return false;
+      const path = 'legs' in candidate;
+      const principal = path ? candidate.amountIn : candidate.order.amountIn;
+      if (principal <= 0n || principal > MAX_FLASH_LOAN_WEI) continue;
+      if (Number.isFinite(MEV.maxLoanUsd)) {
+        const cap = loanLimitWei(MEV.maxLoanUsd, path ? candidate.assetUsd : ethUsd);
+        const scale = path ? 10n ** BigInt(18 - candidate.decimals) : 1n;
+        if (cap === null || principal > cap / scale) continue;
+      }
       this.summary.simulated += 1;
       const prepared = await prepareArbitrumOrder(this.client, this.contract, this.owner, candidate, ethUsd, Math.max(minNetUsd, test?.minimumNetUsd ?? 0), available,
         !!test && test.minimumNetUsd === undefined, release ?? undefined);

@@ -89,6 +89,9 @@ try {
   assert.equal(cadence(30 * minute, false).routeLimit, maxLimit);
   assert.equal(loanLimitWei(1_000_000, 2_000), 500n * oneEth);
   assert.equal(loanLimitWei(1_000_000, null), null);
+  assert.equal(loanLimitWei(Infinity, 2_000), 2n ** 127n - 1n);
+  for (const invalid of [0, null, NaN, Infinity, -1]) assert.equal(loanLimitWei(Infinity, invalid), null);
+  for (const invalid of [NaN, -Infinity, -1, Number.MAX_SAFE_INTEGER]) assert.equal(loanLimitWei(invalid, 2_000), null);
   const loanCap = loanLimitWei(1_000_000, 2_000);
   const cappedSizes = routeInputSizes(1_200, true, 510n * oneEth, loanCap, true);
   assert.ok(cappedSizes.includes(loanCap));
@@ -120,6 +123,32 @@ try {
       exec: { bundleNonce: async () => 7, reserveForBundle: () => true, releaseBundle() {} },
       log() {},
     });
+  }
+
+  {
+    const worker = newSearcher(() => assert.fail('sizing must not sign'));
+    const block = snapshot(now);
+    const t = block.tokens[0];
+    const candidate = { t, A: t.pools[0], B: t.pools[1], est: 1, gasUnits: 200_000 };
+    const cap = MEV.maxLoanUsd;
+    const simulated = [];
+    worker.simulate = async (_t, _a, _b, amount) => {
+      simulated.push(amount);
+      return { ok: false, reason: 'mock', reverted: false };
+    };
+    worker.save = () => {};
+    try {
+      assert.equal(worker.view().settings.loanLimitMode, 'usd-cap');
+      assert.equal(worker.view().settings.maxLoanUsd, cap);
+      MEV.maxLoanUsd = Infinity;
+      assert.equal(worker.view().settings.loanLimitMode, 'lender-liquidity');
+      assert.equal(worker.view().settings.maxLoanUsd, null);
+      await worker.evaluate({ ...candidate, dx: 1_500 }, block, 1n, {}, false);
+      assert.deepEqual(new Set(simulated), new Set([750n * oneEth, 1_500n * oneEth]));
+      simulated.length = 0;
+      for (const dx of [Infinity, 1e31]) await worker.evaluate({ ...candidate, dx }, block, 1n, {}, false);
+      assert.deepEqual(simulated, [], 'an oversized model must never quote the protocol sentinel');
+    } finally { MEV.maxLoanUsd = cap; }
   }
 
   // Drive the production head loop through one stale HTTP response and a same-height reorg.

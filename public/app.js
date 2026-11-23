@@ -301,7 +301,7 @@ function renderSolana(solana) {
   const principal = Number.isFinite(result?.loanUsdc) ? ` · ${networkGas(result.loanUsdc, 'USDC')} loan` : '';
   const probe = solana?.marketProbe;
   const sizeDetail = completed && probe && Number.isFinite(probe.maxLoanUsdc)
-    ? ` · ${probe.reason === 'refinement' ? 'Size refinement' : 'Depth scan'} · cap ${networkGas(probe.maxLoanUsdc, 'USDC')}` : '';
+    ? ` · ${probe.reason === 'refinement' ? 'Size refinement' : 'Depth scan'} · ${probe.limitMode === 'lender-liquidity' ? 'available to borrow' : 'cap'} ${networkGas(probe.maxLoanUsdc, 'USDC')}` : '';
   $('solanaStatus').textContent = (status || 'Solana state unavailable.') + principal + sizeDetail + networkAge(checkedAt);
   $('solanaSlot').textContent = result?.slot > 0 ? networkNumber(result.slot) : '–';
   $('solanaRoutes').textContent = routes ? networkNumber(routes.length) : '–';
@@ -554,7 +554,8 @@ function render() {
     const missingReads = lb?.failedChunks > 0 ? ` · ${lb.failedChunks} pool batches unavailable` : '';
     const P = X.settings?.activeProfitPolicy;
     const maxLoanUsd = X.settings?.maxLoanUsd;
-    const loanCap = Number.isFinite(maxLoanUsd) ? ` · Loan cap ${usd(maxLoanUsd, Number.isInteger(maxLoanUsd) ? 0 : 2)}` : '';
+    const loanCap = X.settings?.loanLimitMode === 'lender-liquidity' ? ' · Loan size follows lender liquidity'
+      : Number.isFinite(maxLoanUsd) ? ` · Loan cap ${usd(maxLoanUsd, Number.isInteger(maxLoanUsd) ? 0 : 2)}` : '';
     const padding = P?.gasPaddingPct == null ? '' : ` · ${Math.round(P.gasPaddingPct * 100)}% gas buffer`;
     const bidding = direct && Number.isFinite(P?.minNetUsd) ? ` · ${usd(P.minNetUsd)} minimum net per attempt${padding}`
       : P?.idle ? ` · idle bidding with a ${usd(P.minNetUsd)} net floor and up to ${Math.round(P.builderTipPct * 100)}% of after-gas profit bid${padding}` : '';

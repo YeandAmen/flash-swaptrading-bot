@@ -1,6 +1,7 @@
 const MINUTE = 60_000;
 const INTERVAL = 30 * MINUTE;
 const EXPAND_AFTER = 25 * MINUTE;
+export const MAX_FLASH_LOAN_WEI = (1n << 127n) - 1n;
 
 /** Anchor the target to scan startup or the most recent confirmed direct fill. */
 export function directCadence(now: number, anchor: number | null, baseRouteLimit: number, maxRouteLimit: number, active: boolean) {
@@ -10,12 +11,15 @@ export function directCadence(now: number, anchor: number | null, baseRouteLimit
   return { state, elapsedMs, intervalMs: INTERVAL, baseRouteLimit, routeLimit: expanded ? Math.max(baseRouteLimit, maxRouteLimit) : baseRouteLimit };
 }
 
-/** Convert the USD cap to wei, rounding the ETH price up and the allowance down. */
+/** Convert the USD limit to wei. Unlimited returns the maximum positive signed 128-bit swap amount. */
 export function loanLimitWei(maxUsd: number, ethUsd: number | null): bigint | null {
   if (ethUsd === null || !Number.isFinite(ethUsd) || ethUsd <= 0) return null;
-  const maximum = BigInt(Math.floor(maxUsd * 1_000_000));
   const price = Math.ceil(ethUsd * 1_000_000);
-  return Number.isSafeInteger(price) ? maximum * 10n ** 18n / BigInt(price) : null;
+  if (!Number.isSafeInteger(price)) return null;
+  if (maxUsd === Infinity) return MAX_FLASH_LOAN_WEI;
+  const maximum = Math.floor(maxUsd * 1_000_000);
+  if (!Number.isSafeInteger(maximum) || maximum < 0) return null;
+  return BigInt(maximum) * 10n ** 18n / BigInt(price);
 }
 
 /** Prefer new tokens for extra simulations. */

@@ -5,7 +5,7 @@ import { NetworkActivity } from './network-activity.js';
 import { LIGHTHOUSE } from './solana/guard.js';
 import { JUPITER, KAMINO } from './solana/protocol.js';
 import { ArbitrumWorker } from './arbitrum/worker.js';
-import { SolanaMarketPlanner, type SolanaMarketProbe } from './solana/market.js';
+import { isValidSolanaLoanLimit, MAX_SAFE_SOLANA_LOAN_USDC, SolanaMarketPlanner, type SolanaMarketProbe } from './solana/market.js';
 import type { SolanaScanResult } from './solana/scan.js';
 import type { SolanaLiveWorker } from './solana/worker.js';
 
@@ -26,7 +26,7 @@ const solanaBoundedLossTestSizes = [1, 5, 10] as const;
 const solanaProfitTestMultipliers = [1, 2, 3, 5, 10] as const;
 const solanaVenueRotation = [0, 1, 0, 2] as const;
 let solanaMarket: SolanaMarketPlanner | undefined;
-let solanaMarketProbe: SolanaMarketProbe | null = null;
+let solanaMarketProbe: (SolanaMarketProbe & { limitMode?: 'lender-liquidity' }) | null = null;
 let solanaTestScans = 0;
 let stopping = false;
 const schedule = new Set<ReturnType<typeof setTimeout>>();
@@ -72,6 +72,7 @@ export function startExpansion() {
     const worker = solanaLive;
     const execution = !liveError && worker?.summary.armed && worker.summary.ready && !worker.summary.pending ? worker : null;
     const test = execution?.activeTest();
+    const lenderLimited = config.loanUsdc === Infinity;
     let probe: SolanaMarketProbe | undefined;
     if (test) {
       const scan = solanaTestScans++;
@@ -80,12 +81,17 @@ export function startExpansion() {
       config.loanUsdc = test.minimumLoanUsd === undefined
         ? sizes[scan % sizes.length]
         : Math.min(100_000, test.minimumLoanUsd * solanaProfitTestMultipliers[scan % solanaProfitTestMultipliers.length]);
-    } else if (config.loanUsdc !== undefined && config.loanUsdc >= 1 && config.loanUsdc <= 100_000) {
+    } else if (config.loanUsdc !== undefined && isValidSolanaLoanLimit(config.loanUsdc)) {
       solanaMarket ??= new SolanaMarketPlanner(solanaDiscoveryPairs.length);
-      probe = solanaMarket.plan(config.loanUsdc, Date.now());
+      const now = Date.now();
+      const lastReserveAge = solanaResult ? now - Date.parse(solanaResult.checkedAt) : Infinity;
+      const recentReserve = lastReserveAge >= 0 && lastReserveAge <= 60_000 ? solanaResult?.availableUsdc : undefined;
+      probe = solanaMarket.plan(config.loanUsdc, now, recentReserve);
       config.venuePair = solanaDiscoveryPairs[probe.venue];
       config.compareReturnVenues = true;
-      config.loanUsdc = probe.loanUsdc;
+      config.clampLoanToReserve = true;
+      // On the full-reserve rung use this scan's exact Kamino balance, even if it grew since the last read.
+      config.loanUsdc = probe.fullReserve ? MAX_SAFE_SOLANA_LOAN_USDC : probe.loanUsdc;
     }
     solanaResult = await scanSolanaCycle(config, execution?.scanHandoff(), test ?? undefined);
     if (test) execution?.recordTestScan(test.id, solanaResult.routes.length);
@@ -94,13 +100,15 @@ export function startExpansion() {
     solanaStatus = liveError ?? quoteFailure ?? (execution ? 'Guarded live scan completed' : 'Unsigned scan completed');
     solanaUpdatedAt = Date.now();
     if (probe) {
+      probe.loanUsdc = solanaResult.loanUsdc;
+      if (lenderLimited) probe.maxLoanUsdc = Math.min(solanaResult.availableUsdc, MAX_SAFE_SOLANA_LOAN_USDC);
       const { routes, checkedAt } = solanaResult;
       const quotes = routes.flatMap(({ status, quotedNetBeforeNetworkUsdc }) =>
         (status === 'below-profit-floor' || status === 'simulated') && quotedNetBeforeNetworkUsdc !== undefined
           && Number.isFinite(quotedNetBeforeNetworkUsdc) ? [quotedNetBeforeNetworkUsdc] : []);
       solanaMarket?.record(probe, quotes.length > 0 ? Math.max(...quotes) : undefined, Date.parse(checkedAt));
     }
-    solanaMarketProbe = probe ?? null;
+    solanaMarketProbe = probe && lenderLimited ? { ...probe, limitMode: 'lender-liquidity' } : probe ?? null;
     solanaActivity.recordScan(solanaResult.routes.filter((route) => route.quotedNetBeforeNetworkUsdc !== undefined).length, solanaUpdatedAt);
     const status = worker?.summary;
     if (status?.ready && !verifiedGuardLogged) {

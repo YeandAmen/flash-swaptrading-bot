@@ -1,6 +1,13 @@
+export const DEFAULT_SOLANA_LOAN_USDC = 250;
 const usdcUnits = 1_000_000;
+// MAX_SAFE_INTEGER / 1e6 itself rounds back to an unsafe integer on multiplication.
+export const MAX_SAFE_SOLANA_LOAN_USDC = (Number.MAX_SAFE_INTEGER - 1) / usdcUnits;
 const quoteMaxAgeMs = 60_000;
 const minRefineEdgeBps = -25;
+
+export function isValidSolanaLoanLimit(value: number): boolean {
+  return value === Infinity || (value >= 1 && value <= MAX_SAFE_SOLANA_LOAN_USDC);
+}
 
 interface SolanaMarketSample {
   venue: number;
@@ -15,6 +22,7 @@ export interface SolanaMarketProbe {
   loanUsdc: number;
   maxLoanUsdc: number;
   reason: 'discovery' | 'refinement';
+  fullReserve?: true;
   lead?: SolanaMarketSample;
 }
 
@@ -30,8 +38,15 @@ export class SolanaMarketPlanner {
 
   constructor(private readonly venueCount: number) {}
 
-  plan(limitUsdc: number, now: number): SolanaMarketProbe {
-    const maxLoanUnits = Math.floor(limitUsdc * usdcUnits);
+  plan(limitUsdc: number, now: number, availableUsdc?: number): SolanaMarketProbe {
+    if (!isValidSolanaLoanLimit(limitUsdc)) {
+      throw new RangeError('Solana discovery loan cap is outside the supported range');
+    }
+    const ceiling = limitUsdc === Infinity
+      ? (availableUsdc !== undefined && Number.isFinite(availableUsdc)
+        ? Math.max(1, Math.min(availableUsdc, MAX_SAFE_SOLANA_LOAN_USDC)) : DEFAULT_SOLANA_LOAN_USDC)
+      : limitUsdc;
+    const maxLoanUnits = Math.floor(ceiling * usdcUnits);
     const maxLoanUsdc = maxLoanUnits / usdcUnits;
     this.samples = this.samples.filter((sample) => sample.at >= now - quoteMaxAgeMs
       && sample.at <= now && sample.loanUsdc <= maxLoanUsdc);
@@ -43,12 +58,17 @@ export class SolanaMarketPlanner {
     }
 
     // Sweep every venue at each depth before repeating. Geometric spacing keeps the low probe useful with a high cap.
-    const sizes = [...new Set([smallestDiscovery,
-      boundedLoan(Math.sqrt(Math.max(1, small) * maxLoanUsdc), maxLoanUnits), maxLoanUsdc])];
+    const grid: number[] = [];
+    if (maxLoanUsdc > 100_000) {
+      for (let amount = 25; amount < maxLoanUsdc; amount *= 10) grid.push(amount);
+    } else grid.push(smallestDiscovery, boundedLoan(Math.sqrt(Math.max(1, small) * maxLoanUsdc), maxLoanUnits));
+    const sizes = [...new Set([...grid, maxLoanUsdc])];
     const discovery = this.discoveries++;
     const venue = discovery % this.venueCount;
     const loanUsdc = sizes[Math.floor(discovery / this.venueCount) % sizes.length];
-    return { venue, loanUsdc, maxLoanUsdc, reason: 'discovery' };
+    const fullReserve = limitUsdc === Infinity && availableUsdc !== undefined && Number.isFinite(availableUsdc)
+      && availableUsdc >= 1 && loanUsdc === maxLoanUsdc;
+    return { venue, loanUsdc, maxLoanUsdc, reason: 'discovery', ...(fullReserve ? { fullReserve: true } : {}) };
   }
 
   record(probe: SolanaMarketProbe, quotedNetUsdc: number | undefined, at: number): void {

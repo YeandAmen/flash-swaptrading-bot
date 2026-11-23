@@ -1328,9 +1328,15 @@ export class MevSearcher {
     if (limit === null || (test?.minimumLoanUsd !== undefined && !validPrice(price))) return null;
     const sample = this.routeQuotes.get(key);
     const previous = !test && sample && comparableRouteQuote(c.est, c.dx, sample, Date.now()) ? sample : undefined;
-    let sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previous?.amount, limit, broadenSizes);
+    // In liquidity-only mode an oversized pool estimate must not turn the
+    // contract's integer limit into a proposed trade size.
+    const usdCapped = Number.isFinite(MEV.maxLoanUsd);
+    let sizes = routeInputSizes(c.dx, !c.A.v2 || !c.B.v2, previous?.amount, usdCapped ? limit : undefined, broadenSizes)
+      .filter(amount => amount <= limit);
     if (test?.minimumLoanUsd !== undefined && validPrice(price)) {
-      const floor = BigInt(Math.ceil(test.minimumLoanUsd / price * 1e18));
+      const raw = Math.ceil(test.minimumLoanUsd / price * 1e18);
+      if (!Number.isFinite(raw)) return null;
+      const floor = BigInt(raw);
       sizes = sizes.filter((amount) => amount >= floor);
       if (!sizes.length && floor <= limit) sizes = [floor];
     }
@@ -2549,7 +2555,8 @@ export class MevSearcher {
       recent: retainRecent(f.recent, DASHBOARD_RECENT_LIMIT, DASHBOARD_BUNDLE_LIMIT),
       settings: {
         submission: MEV.submission,
-        maxLoanUsd: MEV.maxLoanUsd,
+        maxLoanUsd: Number.isFinite(MEV.maxLoanUsd) ? MEV.maxLoanUsd : null,
+        loanLimitMode: Number.isFinite(MEV.maxLoanUsd) ? 'usd-cap' : 'lender-liquidity',
         direct: { maxGasUsd: Math.min(CONFIG.maxSwapNetworkFeeUsd, MEV.directMaxGasUsd), dailyGasUsd: MEV.directDailyGasUsd, protected: MEV.directProtected,
           premiumMaxGasUsd: Math.min(CONFIG.maxSwapNetworkFeeUsd, MEV.directPremiumMaxGasUsd), premiumDailyGasUsd: MEV.directPremiumMaxGasUsd, premiumMinNetUsd: PREMIUM_MIN_NET_USD,
           broadcastRpcCount: 1 + MEV.directBroadcastRpcUrls.length, spentGasUsd: this.directGasSpent(now), enabled: directBudgetConfigured() },

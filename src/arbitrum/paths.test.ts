@@ -20,7 +20,8 @@ const wethLiquidity = parseEther('0.03');
 interface Request { address: Address; functionName: string; args?: readonly unknown[] }
 
 type Market = { pool: string; from: Address; to: Address; kind: number; tier: number; n: bigint; d: bigint; shallow?: boolean };
-function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | 'partial' | 'shallow', pinned = block, extra: Market[] = []) {
+function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | 'partial' | 'shallow', pinned = block, extra: Market[] = [],
+  cash = { usdc: usdcLiquidity, weth: wethLiquidity }) {
   const inventory: Market[] = [...markets, ...extra];
   if (mode === 'shallow') {
     for (const [i, [kind, tier]] of [[2, 100], [2, 500], [2, 3000], [6, 1], [6, 10], [6, 50]].entries()) {
@@ -34,7 +35,7 @@ function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | '
       const success = (result: unknown) => ({ status: 'success', result });
       if (functionName === 'balanceOf') {
         assert.equal(args[0], '0x6c247b1f6182318877311737bac0844baa518f5e');
-        return success(address === usdc ? usdcLiquidity : wethLiquidity);
+        return success(address === usdc ? cash.usdc : cash.weth);
       }
       const time = 1_700_000_000n; // Deliberately old to catch use of wall time in a pinned oracle read.
       if (functionName === 'getCurrentBlockTimestamp') return success(time);
@@ -70,6 +71,64 @@ function fixture(mode?: 'stale' | 'skipped-round' | 'future' | 'unavailable' | '
     });
   } } as unknown as ArbitrumClient;
 }
+
+test('the large path probe rotates through the configured ceiling within the existing quote budget', async () => {
+  const cash = { usdc: 3_000_000n * 10n ** 6n, weth: parseEther('2000') };
+  const rotation = [10_000, 50_000, 250_000, 1_000_000, 10_000, 50_000, 250_000, 2_000_000];
+  for (const [i, large] of rotation.entries()) {
+    const pinned = 800n + BigInt(i);
+    for (const cap of [1_000_000, 2_000_000]) {
+      const result = await scanArbitrumPaths(fixture(undefined, pinned, [], cash), pinned, 2000, cap);
+      const sizesUsd = [50, 250, 1000, 2500, Math.min(large, cap)];
+      for (const base of [usdc, weth]) {
+        const expected = sizesUsd.map(dollars => base === usdc ? BigInt(dollars) * 10n ** 6n : BigInt(dollars) * 10n ** 18n / 2000n);
+        assert.deepEqual(new Set(result.opportunities.filter(r => r.asset === base).map(r => r.amountIn)), new Set(expected));
+      }
+      assert.equal(result.quotedRoutes, 10, 'five sizes per asset for the one profitable cycle in this market');
+      assert.equal(result.refinement.tried, 0);
+    }
+  }
+});
+
+test('the configured-ceiling probe respects each pinned lender balance and deduplicates small caps', async () => {
+  const pinned = 807n;
+  const cash = { weth: parseEther('241.465247653196025614'), usdc: 445_473_159_923n };
+  const client = fixture(undefined, pinned, [], cash);
+  const funded = await scanArbitrumPaths(client, pinned, 2000, 2_000_000);
+  for (const [asset, available] of [[weth, cash.weth], [usdc, cash.usdc]] as const) {
+    const loans = funded.opportunities.filter(r => r.asset === asset).map(r => r.amountIn);
+    assert.ok(loans.includes(available));
+    assert.ok(loans.every(n => n <= available));
+  }
+  const capped = await scanArbitrumPaths(client, pinned, 2000, 249);
+  assert.deepEqual(new Set(capped.opportunities.map(r => r.loanUsd)), new Set([50, 249]));
+  assert.equal(capped.quotedRoutes, 4);
+});
+
+test('uncapped path discovery rotates deep intermediate amounts and exact asset-specific Morpho balances', async () => {
+  const cash = { weth: parseEther('1350.000000000000000001'), usdc: 9_345_678_123_456n };
+  const observed = { WETH: new Set<bigint>(), USDC: new Set<bigint>() };
+  for (let phase = 0n; phase < 5n; phase++) {
+    const pinned = 4n * phase + 3n;
+    const result = await scanArbitrumPaths(fixture(undefined, pinned, [], cash), pinned, 2000, Infinity);
+    assert.equal(result.quotedRoutes, 10);
+    for (const route of result.opportunities) {
+      assert.ok(Number.isFinite(route.loanUsd) && Number.isFinite(route.payoutUsd));
+      if (route.loanUsd > 2500) observed[route.symbol].add(route.amountIn);
+    }
+  }
+  assert.deepEqual(observed.WETH, new Set([parseEther('500'), parseEther('1000'), cash.weth]));
+  assert.deepEqual(observed.USDC, new Set([1_000_000n, 2_000_000n, 4_000_000n, 8_000_000n].map(n => n * 1_000_000n).concat(cash.usdc)));
+
+  // The executor's int128 limit is denominated in raw base-asset units, including six-decimal USDC.
+  const maxInput = (1n << 127n) - 1n;
+  let phases = 0n;
+  for (let depth = 1_000_000_000_000n; depth < maxInput; depth *= 2n) phases++;
+  const pinned = 4n * phases + 3n;
+  const result = await scanArbitrumPaths(fixture(undefined, pinned, [], { weth: 0n, usdc: maxInput + 1n }), pinned, 2000, Infinity);
+  assert.ok(result.opportunities.some(route => route.amountIn === maxInput));
+  assert.ok(result.opportunities.every(route => route.amountIn <= maxInput));
+});
 
 test('Arbitrum quotes the canonical four distinct pool cycle using the precise previous output', async () => {
   const result = await scanArbitrumPaths(fixture(), block, 2000, 75);

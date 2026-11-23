@@ -41,6 +41,10 @@ test('Arbitrum uses one extra quote size every other scan and keeps large probes
   assert.equal(arbitrumProbeSize(1, { ...lead, amount: parseEther('64') }, now), parseEther('0.01'));
   assert.equal(arbitrumProbeSize(23, lead, now), parseEther('32'));
   assert.equal(arbitrumProbeSize(27, lead, now), parseEther('64'));
+  assert.equal(arbitrumProbeSize(27, lead, now, 2_000_000), parseEther('64'));
+  assert.deepEqual(arbitrumProbeSize(55, lead, now, 2_000_000), { fundedDepth: 0 });
+  assert.deepEqual(arbitrumProbeSize(111, lead, now, Infinity), { fundedDepth: 1 });
+  assert.equal(arbitrumProbeSize(55, lead, now), parseEther('64'));
   for (let scan = 0; scan < 30; scan++) {
     assert.equal(arbitrumProbeSize(scan, lead, now) === undefined, scan % 2 === 0);
   }
@@ -67,6 +71,7 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
     ],
   }];
   const requestedSizes: bigint[][] = [];
+  let availableWeth = parseEther('500');
   let incompletePrices: boolean | 'error' = false;
   let gasLimited = false;
   const rpcError = (functionName: string, details: string) => ({ status: 'failure',
@@ -77,7 +82,7 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
       switch (functionName) {
         case 'FLASHLOAN_PREMIUM_TOTAL': return 5n;
         case 'getConfiguration': return (1n << 56n) | (1n << 63n);
-        case 'balanceOf': return parseEther('500');
+        case 'balanceOf': return availableWeth;
         case 'latestRoundData': return [0n, 200_000_000_000n, 0n, BigInt(Math.floor(Date.now() / 1000)), 0n];
         default: throw new Error('Unexpected read');
       }
@@ -121,6 +126,22 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
   assert.equal(result.largestQuote?.loanUsd, 500);
   assert.equal(result.largestQuote?.payoutUsd.toFixed(4), '-0.0500');
   assert.equal(result.sizingAmount, parseEther('0.25'));
+
+  requestedSizes.length = 0;
+  const limitedByAave = await scanArbitrum(client, 100n, markets, false, { fundedDepth: 0 }, 2_000_000);
+  assert.equal(limitedByAave.largestQuote?.loanUsd, 1_000_000);
+  availableWeth = parseEther('3000');
+  requestedSizes.length = 0;
+  const limitedByUsd = await scanArbitrum(client, 100n, markets, false, { fundedDepth: 0 }, 2_000_000);
+  assert.equal(limitedByUsd.largestQuote?.loanUsd, 2_000_000);
+  assert.equal(limitedByUsd.quotedRoutes, 12);
+  for (const [phase, weth] of [3000, 256, 1024, 3000].entries()) {
+    requestedSizes.length = 0;
+    const unrestricted = await scanArbitrum(client, 100n, markets, false, { fundedDepth: phase }, Infinity);
+    assert.equal(unrestricted.largestQuote?.loanUsd, weth * 2000);
+    assert.equal(unrestricted.quotedRoutes, 12);
+  }
+  availableWeth = parseEther('500');
 
   requestedSizes.length = 0;
   const screened = await scanArbitrum(client, 100n, markets, false, parseEther('64'), 500, true);

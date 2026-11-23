@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SolanaMarketPlanner } from './market.js';
+import { MAX_SAFE_SOLANA_LOAN_USDC, SolanaMarketPlanner } from './market.js';
 
 test('Solana discovers all venue and depth combinations even with a persistent positive lead', () => {
   const planner = new SolanaMarketPlanner(3);
@@ -40,6 +40,60 @@ test('a larger Solana cap keeps a shallow and mid-sized market probe', () => {
   const planner = new SolanaMarketPlanner(3);
   const sizes = new Set(Array.from({ length: 9 }, (_, scan) => planner.plan(2500, scan * 12_000).loanUsdc));
   assert.deepEqual(sizes, new Set([25, 250, 2500]));
+});
+
+test('ordinary Solana discovery visits each bounded size once per venue through the configured cap', () => {
+  for (const [cap, expected] of [
+    [100_000, [25, 1581.13883, 100_000]],
+    [120_000, [25, 250, 2_500, 25_000, 120_000]],
+    [250_000, [25, 250, 2_500, 25_000, 250_000]],
+    [2_000_000, [25, 250, 2_500, 25_000, 250_000, 2_000_000]],
+    [5_000_000, [25, 250, 2_500, 25_000, 250_000, 2_500_000, 5_000_000]],
+    [75_000_000, [25, 250, 2_500, 25_000, 250_000, 2_500_000, 25_000_000, 75_000_000]],
+  ] as const) {
+    const planner = new SolanaMarketPlanner(3);
+    for (let pass = 0; pass < 2; pass++) {
+      for (const size of expected) {
+        for (let venue = 0; venue < 3; venue++) {
+          const probe = planner.plan(cap, 0);
+          assert.deepEqual(probe, { venue, loanUsdc: size, maxLoanUsdc: cap, reason: 'discovery' });
+        }
+      }
+    }
+  }
+  const planner = new SolanaMarketPlanner(3);
+  for (const cap of [-1, NaN, -Infinity, Number.MAX_SAFE_INTEGER / 1e6]) assert.throws(() => planner.plan(cap, 0), /loan cap/);
+});
+
+test('unlimited planning uses a finite startup probe, then sweeps to the lender reserve at each venue', () => {
+  const initial = new SolanaMarketPlanner(2).plan(Infinity, 0);
+  assert.equal(initial.maxLoanUsdc, 250);
+  assert.equal(initial.loanUsdc, 12.5);
+  const planner = new SolanaMarketPlanner(2);
+  const reserve = 8_345_678.123456;
+  for (const expected of [25, 250, 2_500, 25_000, 250_000, 2_500_000, reserve]) {
+    for (let venue = 0; venue < 2; venue++) {
+      const probe = planner.plan(Infinity, 0, reserve);
+      assert.deepEqual(probe, { venue, loanUsdc: expected, maxLoanUsdc: reserve, reason: 'discovery',
+        ...(expected === reserve ? { fullReserve: true } : {}) });
+    }
+  }
+  assert.equal(planner.plan(Infinity, 0, 0).loanUsdc, 1);
+  assert.equal(planner.plan(Infinity, 0, 1e14).maxLoanUsdc, MAX_SAFE_SOLANA_LOAN_USDC);
+});
+
+test('multimillion discovery keeps a shallow positive refinement in its existing fourth poll', () => {
+  const planner = new SolanaMarketPlanner(3);
+  for (let venue = 0; venue < 3; venue++) {
+    const probe = planner.plan(2_000_000, venue * 12_000);
+    assert.equal(probe.loanUsdc, 25);
+    planner.record(probe, venue === 1 ? 0.06 : -1, venue * 12_000);
+  }
+  const next = planner.plan(2_000_000, 36_000);
+  assert.equal(next.reason, 'refinement');
+  assert.equal(next.venue, 1);
+  assert.equal(next.loanUsdc, 40);
+  assert.equal(planner.plan(2_000_000, 48_000).loanUsdc, 250);
 });
 
 test('Solana sweeps instead of refining stale, deeply negative, or unmarketable sizes', () => {
