@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
-import { address, getAddressEncoder, getCompiledTransactionMessageDecoder, getTransactionDecoder, type ReadonlyUint8Array } from '@solana/kit';
+import { address, getAddressEncoder, getCompiledTransactionMessageDecoder, getPublicKeyFromAddress, getSignatureFromTransaction,
+  getTransactionDecoder, type Address, type ReadonlyUint8Array } from '@solana/kit';
 import {
   createWalletAta, JUPITER, KAMINO, KAMINO_MARKET, KAMINO_MARKET_LOOKUP, KAMINO_USDC_RESERVE, LOOKUP_PROGRAM, MAINNET_GENESIS,
   USDC, WRAPPED_SOL,
 } from './protocol.js';
 import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount } from './guard.js';
+import { SolanaLiveWorker } from './worker.js';
 import { queueFlashTest, validSolanaSwapLossUsdc } from '../network-test.js';
 import { scanSolanaCycle, solanaDiscoveryPairs, solanaVenuePairs } from './scan.js';
 
@@ -94,6 +99,8 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       bytes.writeBigUInt64LE(BigInt(params.get('amount')!), 8);
       bytes.writeBigUInt64LE(BigInt(outAmount), 16);
       bytes.writeUInt16LE(issue === 'instruction-slippage' ? 5 : slippageBps, 24);
+      // Distinguish the two fixture routes even when the quoted amounts match.
+      bytes[33] = venue === 'Whirlpool' ? 1 : 2;
       if (issue === 'layout') bytes[0] = 0;
       const destination = params.get('destinationTokenAccount');
       const metas = [
@@ -237,6 +244,94 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     assert.equal(jupiterRequests, 4, 'query two legs in each direction for the selected venue pair');
     for (const route of guarded.routes) assert.equal(route.status, 'simulated', route.detail);
     assert.equal(submissions, 1, 'submit only the first qualifying guarded route');
+  });
+  await t.test('a verified Jupiter slippage failure permits one ordinary alternate through the worker handoff', async (t) => {
+    const dataDir = mkdtempSync(path.join(tmpdir(), 'solana-slippage-test-'));
+    t.after(() => rmSync(dataDir, { recursive: true, force: true }));
+    const workerRpc = 'http://127.0.0.1:8898';
+    const worker = new SolanaLiveWorker({ wallet, rpcUrl: workerRpc }, '', dataDir, 5);
+    // Public key and mock signature bytes only. Exercise the ordinary handoff, journal and RPC acknowledgment.
+    Object.assign(worker, { signer: { keyPair: { publicKey: await getPublicKeyFromAddress(wallet) } }, lease: 'unit-test',
+      journal: { version: 1, wallet, armed: true, pending: null, lastOutcome: null, fees: [] } });
+    const signer = t.mock.method(crypto.subtle, 'sign', async () => new Uint8Array(64).fill(71).buffer);
+    const scannerFetch = globalThis.fetch;
+    const finalWires: string[] = [];
+    const sentMessages: Buffer[] = [];
+    let failEveryRoute = true;
+    const slippage: { program: Address; code: number; childFailed: boolean } = { program: JUPITER, code: 6001, childFailed: false };
+    let failure = slippage;
+    t.mock.method(globalThis, 'fetch', async (input: URL | RequestInfo, init?: RequestInit) => {
+      if (new URL(String(input)).origin !== workerRpc) return scannerFetch(input, init);
+      const { id, method, params } = JSON.parse(String(init?.body));
+      const reply = (result: unknown) => Response.json({ id, jsonrpc: '2.0', result });
+      const atSlot = (value: unknown) => reply({ context: { slot: 42 }, value });
+      if (method === 'getEpochInfo') return reply({ absoluteSlot: 42, blockHeight: 32, epoch: 1, slotIndex: 1, slotsInEpoch: 100 });
+      if (method === 'getBalance') return atSlot(50_000_000);
+      if (method === 'isBlockhashValid') return atSlot(true);
+      const tx = getTransactionDecoder().decode(Buffer.from(params[0], 'base64'));
+      if (method === 'sendTransaction') {
+        sentMessages.push(Buffer.from(tx.messageBytes));
+        return reply(getSignatureFromTransaction(tx));
+      }
+      assert.equal(method, 'simulateTransaction');
+      assert.ok(Object.values(tx.signatures).every((sig) => sig === null));
+      finalWires.push(params[0]);
+      if (failEveryRoute || finalWires.length === 1) {
+        const compiled = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
+        assert(compiled.version === 0);
+        const index = compiled.instructions.findIndex((ix) => compiled.staticAccounts[ix.programAddressIndex] === failure.program);
+        assert.ok(index >= 0);
+        const failed = `failed: custom program error: 0x${failure.code.toString(16)}`;
+        return atSlot({ err: { InstructionError: [index, { Custom: failure.code }] },
+          logs: [`Program ${failure.program} invoke [1]`, `Program ${tokenProgram} invoke [2]`,
+            `Program ${tokenProgram} ${failure.childFailed ? failed : 'success'}`,
+            `Program ${failure.program} consumed 80000 of 1200000 compute units`, `Program ${failure.program} ${failed}`] });
+      }
+      const balances = (gain: number) => [USDC, WRAPPED_SOL].map((mint, index) => ({
+        accountIndex: index + 1, mint, owner: wallet, uiTokenAmount: { amount: String(index === 0 ? gain : 0) },
+      }));
+      return atSlot({ err: null, fee, preBalances: [50_000_000], postBalances: [50_000_000 - fee],
+        preTokenBalances: balances(0), postTokenBalances: balances(210_000) });
+    });
+
+    worker.queueTest('manual-slippage');
+    await scanSolanaCycle(config, worker.scanHandoff(), 'manual-slippage');
+    assert.equal(finalWires.length, 1);
+    assert.equal(signer.mock.callCount(), 0);
+    worker.disarm();
+    worker.arm();
+
+    for (const other of [{ ...slippage, childFailed: true }, { ...slippage, code: 6002 },
+      { ...slippage, program: KAMINO }, { ...slippage, program: LIGHTHOUSE }]) {
+      failure = other;
+      finalWires.length = 0;
+      await scanSolanaCycle(config, worker.scanHandoff());
+      assert.equal(finalWires.length, 1, 'an unverified or non-Jupiter failure must hold the alternate');
+      assert.equal(signer.mock.callCount(), 0);
+    }
+    failure = slippage;
+
+    finalWires.length = 0;
+    await scanSolanaCycle(config, worker.scanHandoff());
+    assert.equal(finalWires.length, 2, 'if both decline, the scan exhausts its one alternate');
+    assert.equal(signer.mock.callCount(), 0);
+    assert.equal(worker.summary.pending, null);
+
+    failEveryRoute = false;
+    finalWires.length = 0;
+    const scanned = await scanSolanaCycle(config, worker.scanHandoff());
+    assert.ok(scanned.routes.every((route) => route.qualified));
+    assert.equal(finalWires.length, 2);
+    assert.notEqual(finalWires[0], finalWires[1]);
+    assert.equal(sentMessages.length, 1);
+    assert.deepEqual(sentMessages[0], Buffer.from(getTransactionDecoder().decode(Buffer.from(finalWires[1], 'base64')).messageBytes));
+    assert.equal(signer.mock.callCount(), 1);
+    assert.ok(worker.summary.pending);
+
+    await scanSolanaCycle(config, worker.scanHandoff());
+    assert.equal(finalWires.length, 2, 'a pending intent precludes another final simulation');
+    assert.equal(signer.mock.callCount(), 1);
+    assert.equal(sentMessages.length, 1);
   });
   await t.test('tries the alternate only after an explicit route decline', async () => {
     let submissions = 0;

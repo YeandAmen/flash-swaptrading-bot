@@ -171,7 +171,9 @@ try {
       calls = [];
       const head = { number: BigInt(++height), timestamp: BigInt(Math.floor(now / 1000)), hash: hash(height),
         baseFeePerGas: 1_000_000_000n, gasUsed: 15_000_000n, gasLimit: 30_000_000n };
+      const readStarted = performance.now();
       const row = await searcher.read(head);
+      assert.ok(row.snapshotReadyAt >= readStarted && row.snapshotReadyAt <= performance.now());
       await searcher.onBlock(row);
       assert.deepEqual(calls, checked);
       assert.equal(searcher.lastBlock.inventoryPruned, pruned);
@@ -343,7 +345,7 @@ try {
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,
     submission = 'direct', maximumDirectGasUsd = MEV.directMaxGasUsd, nearingNextBlock = false, estimatedGas = 150_000n,
     protectedDirect = false, beforeSimulate, atSign, pendingForToken, pathRelease, pathAmount = oneEth, pendingBaseFee, privateTransport,
-    pathHistory, pathCandidates, pendingForPath, startup }) {
+    pathHistory, pathCandidates, pendingForPath, startup, snapshotTiming, atJournal }) {
     const simulated = new Set();
     const signed = [];
     const submitted = [];
@@ -351,6 +353,7 @@ try {
     const seenAtSign = [];
     const finalStates = new Map();
     const block = snapshot(nearingNextBlock ? Math.floor(now / 1_000) * 1_000 - 11_000 : now);
+    Object.assign(block, snapshotTiming);
     const searcher = newSearcher(async (tx) => {
       signed.push(tx);
       seenAtSign.push(...simulated, ...liveQuoteTokens);
@@ -370,7 +373,12 @@ try {
       searcher.file.proxyRelease = proxyReleaseHash;
     }
     searcher.reconcileWallet = async () => {};
-    searcher.writeState = () => { if (searcher.file.pending) journaled.push(searcher.file.pending); };
+    searcher.writeState = () => {
+      if (searcher.file.pending) {
+        journaled.push(searcher.file.pending);
+        atJournal?.(searcher.file.pending);
+      }
+    };
     searcher.head = async () => {
       const number = staleHead || (headChangesDuringSigning && signed.length) ? 101n : 100n;
       return { number, hash: hash(number), timestamp: BigInt(block.timestamp) };
@@ -391,9 +399,9 @@ try {
       };
     }
     const submitDirect = searcher.submitSignedDirect.bind(searcher);
-    searcher.submitSignedDirect = async (pending, bytes, canSend) => {
+    searcher.submitSignedDirect = async (pending, bytes, canSend, journalStarted) => {
       submitted.push(pending);
-      if (privateTransport) await submitDirect(pending, bytes, canSend, privateTransport);
+      if (privateTransport) await submitDirect(pending, bytes, canSend, journalStarted, privateTransport);
     };
     searcher.submitSignedBundle = async (pending) => { submitted.push(pending); };
     if (!startup) searcher.simulate = async (token, _buy, _sell, amount, _maxBlock, blockNumber) => {
@@ -620,6 +628,29 @@ try {
   const journaledFees = protectedTrade.journaled[0].opp.submission;
   assert.equal(journaledFees.gasLimit, protectedTx.gas.toString());
   assert.equal(journaledFees.maxFeePerGasWei, protectedTx.maxFeePerGas.toString());
+  assert.equal(journaledFees.directTiming.quoteAndPrepareMs, undefined, 'an unmeasured snapshot completion is not reconstructed');
+  assert.equal(journaledFees.directTiming.headAgeMs, undefined);
+  assert.equal(journaledFees.directTiming.journalToAckMs, undefined, 'a pending journal does not imply an ACK');
+  {
+    const originalClock = performance.now;
+    let clock = 1_000, beforeAck;
+    performance.now = () => clock;
+    try {
+      const measured = await scan({ ...protectedInput, snapshotTiming: { headAgeMs: 400, readMs: 17, snapshotReadyAt: clock },
+        beforeSimulate: () => { clock = 1_100; },
+        pendingForToken: () => { clock = 1_145; return protectedInput.finalProfit; },
+        atSign: () => { clock = 1_170; },
+        atJournal: pending => {
+          if (!beforeAck) { beforeAck = structuredClone(pending.opp.submission.directTiming); clock = 1_178; }
+        },
+        privateTransport: async () => { clock = 1_208; return hash(99); } });
+      assert.deepEqual(beforeAck, { headAgeMs: 400, snapshotReadMs: 17, quoteAndPrepareMs: 100,
+        finalValidationMs: 45, signAndHeadCheckMs: 25 });
+      const recorded = measured.submitted[0].opp.submission;
+      assert.deepEqual(recorded.directTiming, { ...beforeAck, journalToAckMs: 38 });
+      assert.equal(recorded.rpcAckMs, 30, 'existing RPC ACK duration excludes the preceding journal write');
+    } finally { performance.now = originalClock; }
+  }
   const protectedOrder = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: protectedTx.data }).args[0];
   assert.equal(protectedOrder.maxBlock, 103n);
   assert.equal(protectedTx.maxFeePerGas, 1_066_666_666n);
@@ -911,6 +942,7 @@ try {
   assert.equal(bundle.submitted[0].kind, undefined);
   assert.equal(bundle.submitted[0].target, '101');
   assert.equal(bundle.submitted[0].opp.submission.directSimulation, undefined);
+  assert.equal(bundle.submitted[0].opp.submission.directTiming, undefined);
   assert.deepEqual([...bundle.finalStates.keys()], ['pinned'], 'bundle submission does not depend on public pending state');
 
   const paper = await scan({ age: 31 * minute, profit: coversGas, paper: true });

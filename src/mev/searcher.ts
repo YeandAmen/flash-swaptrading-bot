@@ -145,6 +145,8 @@ interface BundleSubmission {
   relayAfterExpiry?: PrivateRelayStatus & { checkedAt: number };
   pathQuote?: { routeId: Hex; grossProfitWei: string };
   directSimulation?: { preparedNetUsd: number; blockNetUsd: number; pendingNetUsd: number };
+  directTiming?: { headAgeMs?: number; snapshotReadMs: number; quoteAndPrepareMs?: number; finalValidationMs: number;
+    signAndHeadCheckMs: number; journalToAckMs?: number };
   gasEth: number;
   tipEth: number;
   netUsd: number;
@@ -266,6 +268,7 @@ interface BlockRead {
   v4Inventory?: Map<ArbPool, bigint>;
   v3Inventory?: { buy: ArbPool; chunk: number; balance: bigint };
   readMs: number;
+  snapshotReadyAt?: number; // Process-local monotonic time, used only to measure selection and preparation.
   headAgeMs?: number;
   failedChunks: number;
 }
@@ -775,9 +778,10 @@ export class MevSearcher {
       throw new Error('pool snapshot did not match the block header');
     }
     const results = [...stamped.slice(0, 2), ...valid.flatMap((chunk, i) => chunk?.slice(2) ?? chunks[i].map((): McResult => ({ status: 'failure' })))];
+    const snapshotReadyAt = performance.now();
     return {
       blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash,
-      tokens, at: reads.at, results, v4Inventory, v3Inventory, readMs: Math.round(performance.now() - start), headAgeMs,
+      tokens, at: reads.at, results, v4Inventory, v3Inventory, readMs: Math.round(snapshotReadyAt - start), snapshotReadyAt, headAgeMs,
       failedChunks: valid.filter((chunk) => chunk === null).length,
     };
   }
@@ -1574,6 +1578,7 @@ export class MevSearcher {
     if (this.walletPending() || !this.reserveBundle()) return skip('wallet is busy or MEV was disarmed');
     try {
       this.file.stats.rpcCalls += direct ? 2 : 1;
+      const validationStarted = performance.now();
       const [result, nonce, balance, observedHead, pendingCheck] = await Promise.all([
         mevReadClient.call({ account, to: contract, data, gas, blockNumber: r.blockNumber }),
         exec.bundleNonce(),
@@ -1625,12 +1630,14 @@ export class MevSearcher {
       const signingGasUsd = eth(gasBudget) * (currentEthUsd ?? ethUsd);
       if (direct && !this.withinDirectGasBudget(signingGasUsd, Date.now(), premium, test)) return skip('direct gas limit reached at signing');
       if (test && signingGasUsd > test.maximumGasUsd) return skip('gas-only test would exceed its gas cap at signing');
+      const signingStarted = performance.now();
       const signed = await account.signTransaction({
         chainId: publicClient.chain.id, type: 'eip1559', to: contract, data, nonce, gas,
         ...fees, value: 0n,
       });
       if (direct && (await this.head()).hash !== r.hash) return skip('block changed after signing before broadcast');
       if (!canSend()) return skip('target slot passed or MEV was disarmed before broadcast');
+      const signingFinished = performance.now();
       const hash = keccak256(signed);
       const startedAt = Date.now();
       const kind = direct ? 'direct' as const : undefined;
@@ -1656,6 +1663,12 @@ export class MevSearcher {
         priorityGwei: direct ? Number(fees.maxPriorityFeePerGas) / 1e9 : undefined,
         gasLimit: direct ? gas.toString() : undefined,
         maxFeePerGasWei: direct ? fees.maxFeePerGas.toString() : undefined,
+        directTiming: direct ? {
+          headAgeMs: r.headAgeMs, snapshotReadMs: r.readMs,
+          quoteAndPrepareMs: r.snapshotReadyAt === undefined ? undefined : Math.round(validationStarted - r.snapshotReadyAt),
+          finalValidationMs: Math.round(signingStarted - validationStarted),
+          signAndHeadCheckMs: Math.round(signingFinished - signingStarted),
+        } : undefined,
         pathQuote: privateSubmission && offer.path && !test
           ? { routeId: pathRouteId(offer.path, offer.release), grossProfitWei: offer.path.grossProfit.toString() } : undefined,
         gasEth: eth(gasBudget), tipEth: eth(tip), netUsd: eth(reportedNet) * ethUsd, directSimulation, builders: [],
@@ -1681,6 +1694,7 @@ export class MevSearcher {
       this.file.pending = pending;
       if (direct) this.file.stats.directAttempts = (attempts ?? 0) + 1;
       this.record(opp, false);
+      const journalStarted = performance.now();
       try {
         this.writeState();
       } catch (error) {
@@ -1693,7 +1707,7 @@ export class MevSearcher {
       // A signed test is consumed on the durable nonce journal, even if the RPC times out.
       if (matched) this.queuedTest = null;
       const canSubmit = () => stillLive() && (!test || Date.now() < test.expiresAt) && this.pending === pending;
-      const flight = direct ? this.submitSignedDirect(pending, signed, canSubmit)
+      const flight = direct ? this.submitSignedDirect(pending, signed, canSubmit, journalStarted)
         : this.submitSignedBundle(pending, submission, signed, canSubmit);
       // The journal continues to reserve the nonce while replies arrive. The scanner can follow the next head.
       if (CONFIG.forkMode) await flight;
@@ -1707,7 +1721,8 @@ export class MevSearcher {
     }
   }
 
-  private async submitSignedDirect(pending: PendingBundle, signed: Hex, canSubmit: () => boolean, sendPrivate = submitPrivateDirect) {
+  private async submitSignedDirect(pending: PendingBundle, signed: Hex, canSubmit: () => boolean,
+    journalStarted: number, sendPrivate = submitPrivateDirect) {
     if (!canSubmit()) {
       if (this.pending === pending) this.finishBundle({
         ...pending.opp, status: 'skipped', note: 'direct send canceled before contacting the RPC', gasEth: 0, tipEth: 0, netEth: 0, netUsd: 0,
@@ -1718,11 +1733,13 @@ export class MevSearcher {
     try {
       if (pending.privateSubmission) await sendPrivate(signed, BigInt(pending.target), canSubmit);
       else await submitDirect(signed);
-      const rpcAckMs = Math.round(performance.now() - startedAt);
+      const acknowledgedAt = performance.now();
+      const rpcAckMs = Math.round(acknowledgedAt - startedAt);
       if (this.pending === pending) {
         pending.opp.note = pending.privateSubmission ? 'private relay accepted; awaiting receipt' : 'direct Ethereum RPC accepted; awaiting receipt';
         if (pending.opp.submission) {
           pending.opp.submission.rpcAckMs = rpcAckMs;
+          if (pending.opp.submission.directTiming) pending.opp.submission.directTiming.journalToAckMs = Math.round(acknowledgedAt - journalStarted);
           if (pending.privateSubmission && !CONFIG.forkMode) this.schedulePrivateStatusAfterAck(pending);
         }
       }

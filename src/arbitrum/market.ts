@@ -253,8 +253,24 @@ export function emptyArbitrumQuoteRecovery() {
 
 type QuotePin = { blockNumber: bigint } | { blockHash: Hash; requireCanonical: true };
 
+function selectRetryLegs(eligible: number[], blockNumber: bigint, canRepay?: (index: number) => boolean) {
+  if (eligible.length <= maxRetryQuoteLegs) return eligible;
+  const rotating = (indices: number[], limit: number) => {
+    if (indices.length <= limit) return indices;
+    const start = Number(blockNumber % BigInt(indices.length));
+    return Array.from({ length: limit }, (_, i) => indices[(start + i) % indices.length]);
+  };
+  if (!canRepay) return rotating(eligible, maxRetryQuoteLegs);
+  const plausible: number[] = [], belowRepayment: number[] = [];
+  for (const i of eligible) (canRepay(i) ? plausible : belowRepayment).push(i);
+  // Keep one rotating audit even when potentially repayable or unknown-price sells fill the budget.
+  const preferred = rotating(plausible, maxRetryQuoteLegs - (belowRepayment.length ? 1 : 0));
+  return [...preferred, ...rotating(belowRepayment, maxRetryQuoteLegs - preferred.length)];
+}
+
 async function quoteArbitrumPools(client: ArbitrumClient, blockNumber: bigint, contracts: ReturnType<typeof quote>[],
-  pin: QuotePin, counts: ReturnType<typeof emptyArbitrumQuoteRecovery>, alternateForBlock: () => Promise<QuoteReader | undefined>) {
+  pin: QuotePin, counts: ReturnType<typeof emptyArbitrumQuoteRecovery>, alternateForBlock: () => Promise<QuoteReader | undefined>,
+  canRepay?: (index: number) => boolean) {
   if (!contracts.length) return [];
   const rows = await client.multicall({ ...pin, batchSize: 6000, contracts });
   const missing: number[] = [], gasLimited: number[] = [];
@@ -274,9 +290,7 @@ async function quoteArbitrumPools(client: ArbitrumClient, blockNumber: bigint, c
   const eligible = alternate ? missing : gasLimited;
   if (!eligible.length) return rows;
   // Each failed leg gets at most one smaller retry, on a single reader.
-  const start = eligible.length > maxRetryQuoteLegs ? Number(blockNumber % BigInt(eligible.length)) : 0;
-  const selected = Array.from({ length: Math.min(eligible.length, maxRetryQuoteLegs) },
-    (_, i) => eligible[(start + i) % eligible.length]);
+  const selected = selectRetryLegs(eligible, blockNumber, canRepay);
   if (alternate) counts.alternateAttempted += selected.length;
   const retry = await (alternate ?? client).multicall({ ...pin, batchSize: 1400, contracts: selected.map(i => contracts[i]) })
     .catch(() => []);
@@ -364,21 +378,26 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
         prunedAfterBuy++;
         return [];
       }
-      return [{ market, buy: pool, sell, size, amount }];
+      return [{ market, buy: pool, sell, size, amount, repayment }];
     });
   });
   const sold = await quoteArbitrumPools(client, blockNumber,
-    sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)), pin, quoteRecovery, alternateForBlock);
+    sells.map(({ market, sell, amount }) => quote(market.token, sell, false, amount)), pin, quoteRecovery, alternateForBlock,
+    spotRates?.size ? (i) => {
+      const { amount, sell, repayment } = sells[i];
+      const rate = spotRates.get(sell);
+      return !rate || maxSellOutput(amount, rate) >= repayment;
+    } : undefined);
   const opportunities: ArbQuote[] = [];
   let bestQuote: SampledQuote | null = null;
   let largestQuote: SampledQuote | null = null;
   let sizingLead: SizingLead | null = null;
   let quotedRoutes = 0;
-  for (const [i, { market, buy, sell, size }] of sells.entries()) {
+  for (const [i, { market, buy, sell, size, repayment }] of sells.entries()) {
     const received = sold[i].result?.[0] ?? 0n;
     if (received <= 0n) continue;
     quotedRoutes += 1;
-    const payout = received - size - flashPremium(size, premiumBps);
+    const payout = received - repayment;
     if (!bestQuote || payout > bestQuote.payout) bestQuote = { symbol: market.symbol, amount: size, payout };
     if (!largestQuote || size > largestQuote.amount || (size === largestQuote.amount && payout > largestQuote.payout)) {
       largestQuote = { symbol: market.symbol, amount: size, payout };

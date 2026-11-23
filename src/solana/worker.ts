@@ -211,6 +211,38 @@ function meetsOutcomeFloor(outcome: NonNullable<ReturnType<typeof accountOutcome
     && outcome.net >= minimum - outcome.feeUsdc;
 }
 
+// A top-level Jupiter instruction can propagate a CPI's custom code. Accept 6001 only
+// when its own runtime frame failed and every nested invocation returned successfully.
+export function isJupiterSlippageFailure(error: unknown, logs: readonly string[] | null | undefined, programs: readonly Address[]): boolean {
+  if (!error || typeof error !== 'object' || !('InstructionError' in error) || Object.keys(error).length !== 1) return false;
+  const tuple = error.InstructionError;
+  if (!Array.isArray(tuple) || tuple.length !== 2) return false;
+  const [index, cause] = tuple;
+  if ((typeof index !== 'number' && typeof index !== 'bigint') || !Number.isSafeInteger(Number(index))
+    || programs[Number(index)] !== JUPITER
+    || !cause || typeof cause !== 'object' || Object.keys(cause).length !== 1
+    || (cause.Custom !== 6001 && cause.Custom !== 6001n)
+    || !Array.isArray(logs) || logs.some((line) => typeof line !== 'string' || line === 'Log truncated')
+    || logs.at(-1) !== `Program ${JUPITER} failed: custom program error: 0x1771`) return false;
+
+  // A failed CPI can propagate its custom code through Jupiter. Require all invoked children to have succeeded.
+  const start = logs.lastIndexOf(`Program ${JUPITER} invoke [1]`);
+  if (start < 0) return false;
+  const nested: string[] = [];
+  for (const line of logs.slice(start + 1, -1)) {
+    if (/^Program (?:log:|data:|return:)/.test(line)
+      || /^Program [1-9A-HJ-NP-Za-km-z]{32,44} consumed [0-9]+ of [0-9]+ compute units$/.test(line)) continue;
+    const invocation = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[(\d+)\]$/.exec(line);
+    if (invocation && Number(invocation[2]) === nested.length + 2) {
+      nested.push(invocation[1]);
+      continue;
+    }
+    if (!nested.length || line !== `Program ${nested.at(-1)} success`) return false;
+    nested.pop();
+  }
+  return nested.length === 0;
+}
+
 function matchesKaminoLoan(accounts: readonly Address[], instructions: readonly {
   programAddressIndex: number;
   data?: ReadonlyUint8Array | string;
@@ -527,6 +559,11 @@ export class SolanaLiveWorker {
         minContextSlot: head.absoluteSlot, commitment: LIVE_COMMITMENT,
       }).send(rpcDeadline());
       if (!canSend()) return;
+      if (!test && context.slot >= head.absoluteSlot && context.slot - candidate.simulationSlot <= MAX_CANDIDATE_AGE_SLOTS
+        && isJupiterSlippageFailure(simulation.err, simulation.logs, programs)) {
+        this.status = 'Jupiter slippage limit exceeded in final Solana simulation';
+        return decline();
+      }
       const measured = simulation.err ? null : accountOutcome(simulation, this.wallet, candidate.loan, candidate.firstMinimum);
       if (context.slot < head.absoluteSlot || !measured || measured.net === null || !measured.wsolPreserved
         || measured.fee !== candidate.feeLamports || measured.cost > candidate.maximumLamportDebit
