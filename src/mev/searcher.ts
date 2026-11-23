@@ -303,6 +303,7 @@ interface BlockRead {
   timestamp: number;
   nextBaseFee: bigint;
   hash: Hex;
+  parentHash?: Hex;
   tokens: ArbToken[];
   at: number[][];
   results: McResult[];
@@ -313,6 +314,12 @@ interface BlockRead {
   headAgeMs?: number;
   headDiscovery?: HeadDiscovery;
   failedChunks: number;
+}
+
+interface CachedRouteQuote extends RouteQuoteSample {
+  amount: bigint;
+  funding: RouteFunding;
+  gasEstimate?: { context: string; token: Address; hash: Hex; block: bigint; units?: number };
 }
 
 interface Candidate {
@@ -331,6 +338,7 @@ type Offer = ({ candidate: Candidate; path?: undefined } | { path: EthereumPathC
   funding: RouteFunding;
   score: bigint;
   opp: MevOpp;
+  sourceQuote?: CachedRouteQuote;
 }
 
 interface SimulatedSize {
@@ -439,7 +447,7 @@ export class MevSearcher {
   private startupHint: { block: BlockRead; nextMaxBase: bigint; proxy: Address; release: Hex; offers: Offer[] } | null = null;
   private wakeAfterVerification?: () => void;
   private cooldown = new Map<string, RouteCooldown>();
-  private routeQuotes = new Map<string, RouteQuoteSample & { amount: bigint; funding: RouteFunding }>();
+  private routeQuotes = new Map<string, CachedRouteQuote>();
   private stopping = false;
   private queuedTest: GasOnlyTest | null = null;
   private readonly startedAt = Date.now();
@@ -480,6 +488,12 @@ export class MevSearcher {
     return this.isV3 ? FLASH_ARB_V3_RUNTIME : FLASH_ARB_V2_RUNTIME;
   }
   private get selectedContract() { return this.file.proxyContract ?? this.v3Address ?? this.file.v2Contract ?? null; }
+  private routeGasContext(): string | undefined {
+    const contract = this.selectedContract;
+    if (!contract || !this.contractReady || !this.liveArmed(this.armGeneration) || this.activeGasOnlyTest()
+      || this.deploying || CONFIG.forkMode || MEV.submission !== 'direct') return;
+    return [contract, this.file.proxyRelease, MEV.funding, this.armGeneration].join('/');
+  }
   private get configuredContract() { return this.file.proxyContract ? null : this.isV3 ? MEV.v3ContractAddress : MEV.v2ContractAddress; }
   private proxyActionAvailable(action: ProxyAction) {
     if (!MEV.enabled || !this.persist || this.stopping || this.stateReadError) return false;
@@ -729,6 +743,10 @@ export class MevSearcher {
           wake = await this.waitForHead(ageMs < SLOT_MS + 3000 ? HEAD_RETRY_MS : 1000);
           continue;
         }
+        if (last && (head.number !== last.number + 1n || head.parentHash !== last.hash)) {
+          // A reorg or head gap breaks the observed ancestry of cached gas estimates.
+          for (const sample of this.routeQuotes.values()) sample.gasEstimate = undefined;
+        }
         if (MEV.submission === 'direct') void directPriorityFee(directPriorityCap()).catch(() => {});
         let headDiscovery: HeadDiscovery | undefined;
         if (timing && lastHttp) {
@@ -861,7 +879,7 @@ export class MevSearcher {
     const results = [...stamped.slice(0, 2), ...valid.flatMap((chunk, i) => chunk?.slice(2) ?? chunks[i].map((): McResult => ({ status: 'failure' })))];
     const snapshotReadyAt = performance.now();
     return {
-      blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash,
+      blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash, parentHash: head.parentHash,
       tokens, at: reads.at, results, v4Inventory, v3Inventory, readMs: Math.round(snapshotReadyAt - start), snapshotReadyAt, headAgeMs,
       failedChunks: valid.filter((chunk) => chunk === null).length,
     };
@@ -902,6 +920,7 @@ export class MevSearcher {
     const pathScan = !historical && !test && validPrice(ethUsd)
       ? this.scanPaths(r, ethUsd, minimumNet, screeningFee) : undefined;
     const nextInventory = new Map<string, number>();
+    const gasContext = historical ? undefined : this.routeGasContext();
     let inventoryPruned = 0;
     let v3InventoryPruned = 0;
     const v3Inventory = !historical && !test && this.contractReady && this.liveArmed(generation) && this.beforeNextSlot(r)
@@ -945,8 +964,11 @@ export class MevSearcher {
           v3InventoryPruned++;
           continue;
         }
-        const rank = rankRouteNet(cycle.profit, cycle.dx, gasUnits, gasPriceEth,
-          historical ? undefined : this.routeQuotes.get(key), now);
+        const sample = historical ? undefined : this.routeQuotes.get(key);
+        const measured = sample?.gasEstimate;
+        const rawGas = measured && measured.context === gasContext && measured.token === t.token.address && measured.block < r.blockNumber
+          && (r.blockNumber !== measured.block + 1n || r.parentHash === measured.hash) ? measured.units : undefined;
+        const rank = rankRouteNet(cycle.profit, cycle.dx, gasUnits, gasPriceEth, sample, now, rawGas);
         cands.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet: rank, gasUnits });
       }
     }
@@ -1361,6 +1383,7 @@ export class MevSearcher {
     const trials = fundingTrials(MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark, previous)
       .filter(({ funding }) => funding !== 0 || (!lenderOnlyTest && c.A.kind !== NextVenueKind.CurveTricrypto));
     if (!trials.length) return null;
+    const gasContext = !test ? this.routeGasContext() : undefined;
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));
     st.rpcCalls += sims.length;
     st.simulated++;
@@ -1408,10 +1431,13 @@ export class MevSearcher {
       return null;
     }
     const b = best;
+    let sourceQuote: CachedRouteQuote | undefined;
     if (!test) {
       this.routeQuotes.delete(key);
-      this.routeQuotes.set(key, { amount: b.amount, funding: b.funding, at: Date.now(),
-        modelProfitEth: c.est, modelAmountEth: c.dx, proceedsEth: eth(b.profit), gasUnits: b.gasUnits });
+      sourceQuote = { amount: b.amount, funding: b.funding, at: Date.now(),
+        modelProfitEth: c.est, modelAmountEth: c.dx, proceedsEth: eth(b.profit), gasUnits: b.gasUnits,
+        gasEstimate: gasContext ? { context: gasContext, token: c.t.token.address, hash: r.hash, block: r.blockNumber } : undefined };
+      this.routeQuotes.set(key, sourceQuote);
       if (this.routeQuotes.size > 512) {
         const oldest = this.routeQuotes.keys().next().value;
         if (oldest !== undefined) this.routeQuotes.delete(oldest);
@@ -1435,6 +1461,7 @@ export class MevSearcher {
       };
     };
     const primary = makeOffer(b);
+    if (sourceQuote?.gasEstimate) primary.sourceQuote = sourceQuote;
     if (test) {
       const alternate = test.privateSubmission || test.publicFunctional ? alternatives[0] : undefined;
       return { primary, fallback: alternate ? makeOffer(alternate) : undefined };
@@ -1587,6 +1614,11 @@ export class MevSearcher {
       this.file.stats.rpcCalls++;
       const priorityCap = test?.publicFunctional ? PUBLIC_FUNCTIONAL_PRIORITY_WEI : profitTest ? PREMIUM_QUOTE_CAP_WEI : directPriorityCap();
       const premiumAvailable = direct && !test && MEV.directPremiumMaxGasUsd > 0;
+      const sample = offer.sourceQuote;
+      const measurement = sample?.gasEstimate;
+      const measureGas = !test && c && measurement && measurement.context === this.routeGasContext()
+        && measurement.token === c.t.token.address && measurement.hash === r.hash && measurement.block === r.blockNumber
+        && sample.amount === offer.amount && sample.funding === offer.funding;
       const earlier = test?.publicFunctional && r.blockNumber >= 2n ? [r.blockNumber - 1n, r.blockNumber - 2n] : [];
       this.file.stats.rpcCalls += earlier.length;
       const [estimate, preferredTip, previousQuotes] = await Promise.all([
@@ -1594,6 +1626,11 @@ export class MevSearcher {
         direct ? directPriorityFee(premiumAvailable ? PREMIUM_QUOTE_CAP_WEI : priorityCap, true) : 0n,
         c ? Promise.all(earlier.map((height) => this.simulate(c.t, c.A, c.B, offer.amount, targetBlock(), height, offer.funding))) : [],
       ]);
+      // Estimate includes this lender and runs before gas padding. A newer sample owns its own estimate.
+      if (measureGas && measurement.context === this.routeGasContext() && estimate > 0n && estimate <= BigInt(Number.MAX_SAFE_INTEGER)
+        && this.routeQuotes.get(`${poolIdentity(c.A)}|${poolIdentity(c.B)}`) === sample) {
+        measurement.units = Number(estimate);
+      }
       if (test?.publicFunctional && (previousQuotes.length !== 2
         || previousQuotes.some((quote) => !quote.ok || quote.profit * 2n < offer.profit))) {
         return this.skipOpportunity(opp, 'public functional test route was unstable in the previous two blocks');

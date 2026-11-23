@@ -20,13 +20,13 @@ export function comparableRouteQuote(modelProfitEth: number, modelAmountEth: num
 }
 
 export function rankRouteNet(modelProfitEth: number, modelAmountEth: number, gasUnits: number,
-  gasPriceEth: number, sample: RouteQuoteSample | undefined, now: number): number {
+  gasPriceEth: number, sample: RouteQuoteSample | undefined, now: number, measuredGasUnits?: number): number {
   if (!sample || !comparableRouteQuote(modelProfitEth, modelAmountEth, sample, now)) {
     return modelProfitEth - gasUnits * gasPriceEth;
   }
   const observedRatio = Math.max(0, Math.min(2, sample.proceedsEth / sample.modelProfitEth));
   const rankedProceeds = modelProfitEth * (0.25 + 0.75 * observedRatio);
-  return rankedProceeds - sample.gasUnits * gasPriceEth;
+  return rankedProceeds - (measuredGasUnits ?? sample.gasUnits) * gasPriceEth;
 }
 
 /** V2 reserves give an exact constant-product starting point. Virtual V3 reserves only describe the current tick. */

@@ -103,6 +103,10 @@ try {
   assert.ok(net(10, now + 12_000) < net(10, now, { ...sample, proceedsEth: 0.004 }));
   assert.equal(net(10, now + 100_000), net(20, now + 12_000),
     'stale samples and materially changed pool estimates both return to uncalibrated ranking');
+  for (const [profit, amount, at] of [[0.008, 10, now], [0.004, 20, now], [0.004, 10, now + 91_000]]) {
+    assert.equal(rankRouteNet(profit, amount, 230_000, 1e-9, sample, at, 281_183),
+      rankRouteNet(profit, amount, 230_000, 1e-9, undefined, at), 'a stale or materially changed quote ignores measured gas');
+  }
   const prior = { amount: 7n * oneEth, funding: 2 };
   const sizes = routeInputSizes(10, true, prior.amount, loanCap);
   const adaptiveTrials = fundingTrials('auto', sizes, true, true, prior);
@@ -219,6 +223,119 @@ try {
       CONFIG.forkMode = original.fork;
       Date.now = original.now;
       performance.now = original.monotonic;
+    }
+  }
+
+  // Both V3 routes have the same model and static gas. The higher gross route costs more in its real estimate.
+  {
+    const worker = newSearcher(() => assert.fail('ranking cannot sign'));
+    worker.file.armed = worker.contractReady = true;
+    worker.file.proxyContract = address(2);
+    worker.file.proxyRelease = proxyReleaseHash;
+    worker.save = () => {};
+    worker.reconcileWallet = async () => {};
+    worker.scanPaths = () => undefined;
+    const head = snapshot(now);
+    head.tokens = head.tokens.slice(0, 2);
+    head.results = [];
+    head.at = head.tokens.map(t => t.pools.map((pool, j) => {
+      t.pools[j] = { ...pool, kind: 2, v2: false, venue: 'Uniswap v3', fee: j ? 0.0005 : 0.0001 };
+      const offset = head.results.length;
+      const sqrt = (1n << 96n) * (j ? 100n : 103n) / 100n;
+      head.results.push({ status: 'success', result: [sqrt, 0] }, { status: 'success', result: 100n * oneEth });
+      return offset;
+    }));
+    const [expensive, cheaper] = head.tokens;
+    let shortlisted;
+    worker.scanShortlist = async candidates => { shortlisted = candidates; return true; };
+    worker.scanGasOnlyTest = async () => {};
+    worker.simulate = async (t, _buy, _sell, amount) => ({ ok: true,
+      profit: 4_000_000_000_000_000n + (t === expensive ? 20_000_000_000_000n : 0n) + amount / oneEth });
+    const original = { allowLiveTrading: CONFIG.allowLiveTrading, forkMode: CONFIG.forkMode };
+    const prevFees = mevReadClient.getFeeHistory, prevEstimate = mevReadClient.estimateGas, prevFunding = MEV.funding;
+    const prevNow = Date.now;
+    const policy = worker.profitPolicy(now);
+    const follow = { ...head, blockNumber: 101n, hash: hash(101), parentHash: head.hash };
+    const ordered = async (block = follow) => {
+      await worker.onBlock(block);
+      const candidates = shortlisted;
+      assert.equal(candidates.length, 2, 'both routes still clear the model screening gate');
+      assert.ok(candidates.every(c => c.gasUnits === 230_000), 'measured gas cannot replace the hard-screen model');
+      return candidates;
+    };
+    const key = (c) => c.A.address.toLowerCase() + '|' + c.B.address.toLowerCase();
+    const evaluate = (c, block) => worker.evaluate(c, block, block.nextBaseFee, policy, true);
+    try {
+      Object.assign(CONFIG, { allowLiveTrading: true, forkMode: false });
+      MEV.funding = 'auto';
+      Date.now = () => now;
+      mevReadClient.getFeeHistory = async () => ({ reward: [[100_000_000n, 300_000_000n]] });
+      const [a, b] = await ordered(head);
+      assert.equal(a.t, expensive);
+      const offers = await evaluate(a, head);
+      const rival = await evaluate(b, head);
+      mevReadClient.estimateGas = async () => 230_000n;
+      await worker.prepareLive(rival.primary, head, policy);
+      assert.equal(worker.routeQuotes.get(key(b)).gasEstimate.units, 230_000);
+      const prior = worker.routeQuotes.get(key(a));
+      assert.equal((await ordered())[0].t, expensive, 'the gross advantage wins before measurement');
+      mevReadClient.estimateGas = async ({ blockNumber }) => { assert.equal(blockNumber, head.blockNumber); return 281_183n; };
+      assert.ok(offers.fallback && offers.fallback.funding !== offers.primary.funding);
+      for (const other of [offers.fallback, { ...offers.primary, amount: offers.primary.amount + 1n },
+        { ...offers.primary, funding: 2 }]) {
+        await worker.prepareLive(other, head, policy);
+        assert.equal(prior.gasEstimate?.units, undefined, 'another loan size or lender cannot calibrate the winning quote');
+      }
+      const prepared = await worker.prepareLive(offers.primary, head, policy);
+      assert.ok(prepared && prepared.gas > 281_183n, 'the actual send still pads fresh gas');
+      assert.equal(prior.gasEstimate.units, 281_183, 'ranking uses the raw unpadded estimate');
+      assert.equal((await ordered())[0].t, cheaper, 'updating only the measured route reverses the shortlist');
+      assert.equal((await ordered(head))[0].t, expensive, 'the source head cannot use its own later gas observation');
+      assert.equal((await ordered({ ...follow, parentHash: hash(999) }))[0].t, expensive, 'orphaned measurements are ignored');
+      assert.equal((await ordered({ ...follow, parentHash: undefined }))[0].t, expensive, 'a missing parent cannot validate a measurement');
+      MEV.funding = 'morpho';
+      assert.equal((await ordered())[0].t, expensive, 'a funding-context change invalidates both measurements');
+      MEV.funding = 'auto';
+      worker.file.armed = false;
+      assert.equal((await ordered())[0].t, expensive, 'paper scans use the normal gas model');
+      worker.file.armed = true;
+      worker.queueGasOnlyTest('gas-ranking-test', 2);
+      assert.equal((await ordered())[0].t, expensive, 'manual scans use the normal gas model');
+      worker.queuedTest.expiresAt = now;
+      assert.equal((await ordered())[0].t, cheaper, 'an expired manual request leaves ordinary calibration active');
+      worker.queuedTest = null;
+      CONFIG.forkMode = true;
+      assert.equal((await ordered())[0].t, expensive, 'fork scans use the normal gas model');
+      CONFIG.forkMode = false;
+      Date.now = () => now + 91_000;
+      assert.equal((await ordered())[0].t, expensive, 'expired samples leave the shortlist at its uncalibrated order');
+      Date.now = () => now;
+      mevReadClient.estimateGas = async () => 4_000_000n;
+      assert.equal(await worker.prepareLive(offers.primary, head, policy), null,
+        'a prior viable estimate cannot override the current hard gas budget');
+      for (const replacement of [follow, { ...head, hash: hash(900) }]) {
+        const older = await evaluate(a, head);
+        let release, reached;
+        const started = new Promise(resolve => { reached = resolve; });
+        mevReadClient.estimateGas = () => new Promise(resolve => { release = resolve; reached(); });
+        const settling = worker.prepareLive(older.primary, head, policy);
+        await started;
+        try {
+          const newer = await evaluate(a, replacement);
+          mevReadClient.estimateGas = async () => 192_077n;
+          await worker.prepareLive(newer.primary, replacement, policy);
+        } finally { release(310_000n); await settling; }
+        const measurement = worker.routeQuotes.get(key(a)).gasEstimate;
+        assert.equal(measurement.units, 192_077);
+        assert.equal(measurement.block, replacement.blockNumber);
+        assert.equal(measurement.hash, replacement.hash);
+      }
+    } finally {
+      Date.now = prevNow;
+      Object.assign(CONFIG, original);
+      MEV.funding = prevFunding;
+      mevReadClient.getFeeHistory = prevFees;
+      mevReadClient.estimateGas = prevEstimate;
     }
   }
 
