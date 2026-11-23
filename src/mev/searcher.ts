@@ -115,6 +115,12 @@ export interface MevOpp {
   gasOnlyTestId?: string;
 }
 
+type ScanQuote = Pick<MevOpp, 'block' | 'symbol' | 'buy' | 'sell' | 'sizeEth' | 'funding' | 'netUsd' | 'note'> & {
+  blockHash: Hex;
+  amountInWei: string;
+  status: 'preliminary' | Exclude<OppStatus, 'would send'>;
+};
+
 /** Preserve submission details through busy stretches of simulation results. */
 function retainRecent(rows: MevOpp[], limit: number, bundleLimit: number): MevOpp[] {
   let bundlesLeft = Math.min(bundleLimit, rows.filter((row) => row.submission).length);
@@ -437,7 +443,8 @@ export class MevSearcher {
   private stopping = false;
   private queuedTest: GasOnlyTest | null = null;
   private readonly startedAt = Date.now();
-  private scanWindow: { at: number; candidates: number; simulated: number; bestNetUsd: number | null }[] = [];
+  private scanWindow: { at: number; candidates: number; simulated: number; bestQuote?: ScanQuote }[] = [];
+  private readonly observedQuotes = new WeakMap<MevOpp, ScanQuote>();
   private readonly backfill = new HeadBackfill();
   private readonly pathPlanner = new EthereumPathPlanner();
   private pathReadInFlight = false;
@@ -944,7 +951,7 @@ export class MevSearcher {
       }
     }
     if (historical) {
-      this.recordScan(r.timestamp * 1000, cands.length, 0, null);
+      this.recordScan(r.timestamp * 1000, cands.length, 0);
       return;
     }
     this.inventoryExits = new Set([...nextInventory].sort((a, b) => b[1] - a[1])
@@ -966,18 +973,27 @@ export class MevSearcher {
     const additions = extraRoutes(cands, selected, (cadence?.routeLimit ?? selected.length) - MEV.maxSimsPerBlock,
       (candidate) => candidate.t.token.address.toLowerCase());
     const simulatedBefore = this.file.stats.simulated;
-    const shortlistNet: number[] = [];
-    const observedNet = (netUsd: number) => shortlistNet.push(netUsd);
+    let bestQuote: ScanQuote | undefined;
+    let bestSource: MevOpp | undefined;
+    const observe = (offer: Offer) => {
+      const { block, symbol, buy, sell, sizeEth, funding, netUsd } = offer.opp;
+      if (bestQuote && netUsd <= bestQuote.netUsd) return;
+      if (bestSource) this.observedQuotes.delete(bestSource);
+      bestQuote = { block, blockHash: r.hash, symbol, buy, sell, sizeEth, amountInWei: offer.amount.toString(),
+        funding, netUsd, status: 'preliminary' };
+      bestSource = offer.opp;
+      this.observedQuotes.set(bestSource, bestQuote);
+    };
     const canTest = () => !this.pending && this.activeGasOnlyTest() === test && this.canMeetSendDeadline(r);
     const prioritizeTest = test?.publicFunctional || test?.privateSubmission;
     if (test && prioritizeTest && canTest()) {
       await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
     }
-    const signed = await this.scanShortlist(selected, r, nextMaxBase, policy, generation, observedNet,
+    const signed = await this.scanShortlist(selected, r, nextMaxBase, policy, generation, observe,
       broadenSizes && additions.length === 0);
     const enoughTime = CONFIG.forkMode || r.timestamp * 1000 + SLOT_MS - Date.now() >= FALLBACK_LEAD_MS;
     if (!signed && !this.stopping && !this.pending && additions.length && enoughTime) {
-      await this.scanShortlist(additions, r, nextMaxBase, policy, generation, observedNet, true);
+      await this.scanShortlist(additions, r, nextMaxBase, policy, generation, observe, true);
     }
     if (test && !prioritizeTest && enoughTime && canTest()) {
       await this.scanGasOnlyTest(test, testCandidates, r, nextMaxBase, policy, generation);
@@ -991,7 +1007,7 @@ export class MevSearcher {
       if (paths?.blockNumber === r.blockNumber) await this.tryPaths(paths.candidates, r, policy, generation);
     }
     block.decisionMs = Math.round(performance.now() - started);
-    this.recordScan(now, cands.length, this.file.stats.simulated - simulatedBefore, shortlistNet.length ? Math.max(...shortlistNet) : null);
+    this.recordScan(now, cands.length, this.file.stats.simulated - simulatedBefore, bestQuote);
     if (this.file.stats.blocks % 20 === 0) this.save();
   }
 
@@ -1095,7 +1111,7 @@ export class MevSearcher {
   }
 
   private async scanShortlist(selected: Candidate[], r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy,
-    generation: number, observedNet: (usd: number) => void, broadenSizes: boolean, startup?: ReadonlyMap<Candidate, Offer>): Promise<boolean> {
+    generation: number, observe: (offer: Offer) => void, broadenSizes: boolean, startup?: ReadonlyMap<Candidate, Offer>): Promise<boolean> {
     // If verification finishes during this batch, its earlier simulations still used paper overrides.
     const startedInPaper = this.startupCapture && !this.contractReady;
     const verifiedContract = this.selectedContract;
@@ -1147,7 +1163,7 @@ export class MevSearcher {
       try {
         const hint = startup?.get(candidate);
         const route = hint ? await this.recheckStartupOffer(candidate, hint, r, nextMaxBase)
-          : await this.evaluate(candidate, r, nextMaxBase, policy, allowFallback, observedNet, broadenSizes);
+          : await this.evaluate(candidate, r, nextMaxBase, policy, allowFallback, observe, broadenSizes);
         if (route?.primary && pipeline && canTryLive()) await preparePrimary(route.primary, index);
         return route;
       } catch (error) {
@@ -1212,7 +1228,7 @@ export class MevSearcher {
       const held = heldByPrior() && (waitedForSettlement || this.canMeetSendDeadline(r)) ? prior : null;
       for (const offer of offers.reverse()) {
         this.record(held ? { ...offer.opp, status: 'skipped',
-          note: `Block-pinned estimate held while the prior private order (target block ${held.target}) awaits receipt and nonce reconciliation.` } : offer.opp);
+          note: `Block-pinned estimate held while the prior private order (target block ${held.target}) awaits receipt and nonce reconciliation.` } : offer.opp, true, offer.opp);
       }
     }
     return Boolean(fallback?.opp.hash || offers.some((offer) => offer.opp.hash));
@@ -1269,9 +1285,9 @@ export class MevSearcher {
     }
   }
 
-  private recordScan(at: number, candidates: number, simulated: number, bestNetUsd: number | null) {
+  private recordScan(at: number, candidates: number, simulated: number, bestQuote?: ScanQuote) {
     this.scanWindow = this.scanWindow.filter((row) => row.at >= Date.now() - WINDOW_MS);
-    this.scanWindow.push({ at, candidates, simulated, bestNetUsd });
+    this.scanWindow.push({ at, candidates, simulated, bestQuote });
   }
 
   /** This hour's record of how close we got (created on first use; the last 72 hours are kept). */
@@ -1319,7 +1335,7 @@ export class MevSearcher {
     }
   }
 
-  private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy, allowFallback: boolean, observedNet?: (usd: number) => void, broadenSizes = false, test?: GasOnlyTest): Promise<EvaluatedRoute | null> {
+  private async evaluate(c: Candidate, r: BlockRead, nextMaxBase: bigint, policy: ProfitPolicy, allowFallback: boolean, observe?: (offer: Offer) => void, broadenSizes = false, test?: GasOnlyTest): Promise<EvaluatedRoute | null> {
     const st = this.file.stats;
     st.candidates++;
     const key = `${poolIdentity(c.A)}|${poolIdentity(c.B)}`;
@@ -1423,7 +1439,7 @@ export class MevSearcher {
       const alternate = test.privateSubmission || test.publicFunctional ? alternatives[0] : undefined;
       return { primary, fallback: alternate ? makeOffer(alternate) : undefined };
     }
-    if (validPrice(ethUsd)) observedNet?.(primary.opp.netUsd);
+    if (validPrice(ethUsd)) observe?.(primary);
     const screeningFee = minimumScreeningFee(r.nextBaseFee, nextMaxBase);
     const canCheckExactGas = (trial: SimulatedSize) => {
       const screeningGas = BigInt(trial.gasUnits) * screeningFee;
@@ -1439,7 +1455,7 @@ export class MevSearcher {
           cadenceAt: !illusion && b.profit * 4n >= screeningGas * 3n ? Date.now() + CADENCE_RECHECK_MS : undefined },
       });
       if (b.profit * 4n >= gasWei) { // only list near misses (gross at least a quarter of the gas), not dust
-        this.record({ ...primary.opp, status: 'below gas', note: 'below configured net profit floor' });
+        this.record({ ...primary.opp, status: 'below gas', note: 'below configured net profit floor' }, true, primary.opp);
       }
       // Permit one exact check using the lowest permitted priority when ordinary gas estimates look too high.
       if (!allowFallback || !validPrice(ethUsd)) return null;
@@ -1821,6 +1837,7 @@ export class MevSearcher {
         this.file.lastGasOnlyTest = lastTest;
         throw error;
       }
+      this.updateScanQuote(opp);
       // A signed test is consumed on the durable nonce journal, even if the RPC times out.
       if (matched) this.queuedTest = null;
       const canSubmit = () => stillLive() && (!test || Date.now() < test.expiresAt) && this.pending === pending;
@@ -1865,6 +1882,7 @@ export class MevSearcher {
       if (this.pending === pending) pending.opp.note = 'direct send outcome unknown; waiting for confirmed nonce settlement';
       this.host.log(`[mev] Direct send ${pending.hash} awaiting reconciliation: ${errMsg(e)}`, 'warn');
     }
+    if (this.pending === pending) this.updateScanQuote(pending.opp);
     this.save();
   }
 
@@ -1881,7 +1899,10 @@ export class MevSearcher {
       this.file.stats.bundles++;
       submission.builders = responses;
       const acknowledgements = responses.filter((response) => response.ok).length;
-      if (this.pending === pending) pending.opp.note = `${acknowledgements}/${responses.length} acknowledged; awaiting on-chain settlement`;
+      if (this.pending === pending) {
+        pending.opp.note = `${acknowledgements}/${responses.length} acknowledged; awaiting on-chain settlement`;
+        this.updateScanQuote(pending.opp);
+      }
       this.save();
       const details = responses.map(({ builder, detail, elapsedMs }) => `${builder} ${detail} (${elapsedMs} ms)`).join(', ');
       this.host.log(`[mev] Bundle submitted for block ${pending.target}: ${acknowledgements}/${responses.length} acknowledged, start ${submission.leadMs} ms before expected slot. ${details}`);
@@ -2063,6 +2084,7 @@ export class MevSearcher {
       Object.assign(f, previous);
       throw e;
     }
+    if (previous.pending && outcome.hash === previous.pending.hash) this.updateScanQuote(previous.pending.opp, outcome);
     this.releaseBundle();
     if (outcome.status === 'not included') this.traceMissedBundle(outcome);
   }
@@ -2171,8 +2193,18 @@ export class MevSearcher {
     return scheduled;
   }
 
+  private updateScanQuote(source: MevOpp, outcome = source) {
+    // Object identity distinguishes siblings with the same venues, including different sizes or lenders.
+    const observed = this.observedQuotes.get(source);
+    if (observed && !outcome.gasOnlyTestId && outcome.status !== 'would send') {
+      observed.status = outcome.status;
+      observed.note = outcome.note;
+    }
+  }
+
   /** Keeps a bounded journal. Repeated simulations of the same route and outcome are merged. */
-  private record(o: MevOpp, merge = true) {
+  private record(o: MevOpp, merge = true, source: MevOpp = o) {
+    if (o.status !== 'sent') this.updateScanQuote(source, o);
     const rec = this.file.recent;
     if (merge && !o.submission) {
       const i = rec.findIndex((x) => !x.submission && x.symbol === o.symbol && x.buy === o.buy && x.sell === o.sell && x.status === o.status && o.t - x.t < 10 * 60_000);
@@ -2503,7 +2535,10 @@ export class MevSearcher {
     const now = Date.now();
     const hour = Math.floor(now / HOUR) * HOUR;
     const window = this.scanWindow.filter((row) => row.at >= now - WINDOW_MS);
-    const nets = window.flatMap((row) => row.bestNetUsd === null ? [] : [row.bestNetUsd]);
+    let bestQuote: ScanQuote | undefined;
+    for (const row of window) {
+      if (row.bestQuote && (!bestQuote || row.bestQuote.netUsd >= bestQuote.netUsd)) bestQuote = row.bestQuote;
+    }
     return {
       enabled: MEV.enabled,
       mode: !MEV.enabled ? 'off' : this.deploying ? 'deploying' : f.armed ? (this.contractReady ? 'live' : 'arming') : 'paper',
@@ -2534,7 +2569,7 @@ export class MevSearcher {
         blocks: window.length,
         candidates: window.reduce((sum, row) => sum + row.candidates, 0),
         simulations: window.reduce((sum, row) => sum + row.simulated, 0),
-        bestNetUsd: nets.length ? Math.max(...nets) : null,
+        bestNetUsd: bestQuote?.netUsd ?? null, bestQuote,
         caughtUp: this.backfill.caughtUp, missedSnapshots: this.backfill.missed, queuedSnapshots: this.backfill.pending,
       },
       bestThisHour: (() => {

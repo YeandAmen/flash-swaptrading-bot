@@ -509,7 +509,7 @@ try {
       assert.ok(amount <= 500n * oneEth, 'every simulated amount stays under the $1m WETH cap');
       await beforeSimulate?.(token.token.symbol);
       simulated.add(token.token.symbol);
-      return { ok: true, profit: typeof profit === 'function' ? profit(token.token.symbol) : profit };
+      return { ok: true, profit: typeof profit === 'function' ? profit(token.token.symbol, amount) : profit };
     };
     mevReadClient.getFeeHistory = async ({ rewardPercentiles }) => {
       assert.deepEqual(rewardPercentiles, [50, 90]);
@@ -545,7 +545,7 @@ try {
         }
         const inner = searcher.file.proxyRelease ? decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data }).args[1] : data;
         const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: inner }).args[0];
-        return { data: hash(pendingForToken ? pendingForToken(order.token) : pendingProfit) };
+        return { data: hash(pendingForToken ? pendingForToken(order.token, order.amountIn) : pendingProfit) };
       }
       assert.equal(blockNumber, 100n);
       finalStates.set('pinned', call);
@@ -746,6 +746,9 @@ try {
       }
       assert.equal(row.submission, undefined);
     }
+    const heldQuote = held.searcher.view().scanWindow.bestQuote;
+    assert.equal(heldQuote.status, 'skipped');
+    assert.match(heldQuote.note, /receipt and nonce reconciliation/);
   }
   for (const change of ['disarm', 'manual', 'deploy', 'spot', 'contract', 'replacement']) {
     const changed = await scanWhileReserved({ change });
@@ -778,6 +781,7 @@ try {
     assert.equal(skipped.signed.length, 0, startup);
   }
   const lostWarm = await scan({ ...warm, startup: 'lost' });
+  assert.equal(lostWarm.searcher.view().scanWindow.bestQuote.status, 'preliminary', 'a startup replay has its own offer identity');
   assert.ok(lostWarm.liveQuoteTokens.size > 0);
   assert.equal(lostWarm.signed.length, 0, 'an expired paper edge cannot authorize the actual proxy');
   const lostWarmPending = await scan({ ...warm, startup: 'restore', pendingProfit: underGas });
@@ -843,6 +847,57 @@ try {
   } finally {
     clearTimeout(watchdog);
     slow.resolve();
+  }
+
+  {
+    const amounts = [];
+    const { searcher, submitted } = await scan({
+      age: 24 * minute,
+      profit: (symbol, amount) => symbol === 'TEST0' ? coversGas + amount / 100_000n : underGas,
+      pendingForToken: (token, amount) => {
+        assert.equal(token.toLowerCase(), address(100));
+        amounts.push(amount);
+        return amounts.length === 1 ? underGas : coversGas;
+      },
+    });
+    assert.equal(amounts.length, 2);
+    assert.ok(amounts[0] > amounts[1], 'the same venues and lender retry at a smaller loan');
+    assert.equal(submitted.length, 1);
+    const window = searcher.view().scanWindow;
+    const quote = structuredClone(window.bestQuote);
+    assert.equal(quote.block, 100);
+    assert.equal(quote.blockHash, hash(100));
+    assert.equal(quote.amountInWei, amounts[0].toString());
+    assert.equal(quote.sizeEth, Number(amounts[0]) / 1e18);
+    assert.equal(quote.symbol, submitted[0].opp.symbol);
+    assert.equal(quote.funding, submitted[0].opp.funding);
+    assert.equal(quote.status, 'skipped');
+    assert.match(quote.note, /^pending-state simulation: insufficient profit/);
+    assert.equal(window.bestNetUsd, quote.netUsd);
+    assert.notEqual(quote.netUsd, submitted[0].opp.netUsd);
+    assert.ok(!('submission' in quote) && !('data' in quote));
+
+    const matched = searcher.file.recent.find(row => row.status === quote.status && row.sizeEth === quote.sizeEth);
+    assert.equal(matched.netUsd, quote.netUsd);
+    searcher.record({ ...matched, sizeEth: 1, note: 'another size' });
+    for (let i = 0; i < 65; i++) searcher.record({ ...matched, symbol: 'churn-' + i, note: 'another quote' });
+    assert.ok(!searcher.file.recent.some(row => row.note === quote.note));
+    assert.deepEqual(searcher.view().scanWindow.bestQuote, quote, 'merged and evicted journal rows cannot replace the decision');
+
+    const originalNow = Date.now;
+    try {
+      Date.now = () => now + 10 * minute;
+      const later = { ...quote, block: 150, blockHash: hash(150), netUsd: quote.netUsd - 1, status: 'preliminary', note: undefined };
+      searcher.recordScan(Date.now(), 1, 1, later);
+      assert.equal(searcher.view().scanWindow.bestQuote.block, 100);
+      Date.now = () => now + 31 * minute;
+      assert.deepEqual(searcher.view().scanWindow.bestQuote, later);
+      Date.now = () => now + 41 * minute;
+      assert.equal(searcher.view().scanWindow.bestNetUsd, null);
+      assert.equal(searcher.view().scanWindow.bestQuote, undefined);
+      searcher.recordScan(Date.now(), 0, 0);
+      assert.equal(searcher.scanWindow.length, 1, 'the next head prunes expired observations');
+    } finally { Date.now = originalNow; }
   }
 
   // The round trip pays 170e12 wei. The former 170k-gas model at 1.1 gwei, even with a
@@ -1106,7 +1161,8 @@ try {
   // Both final states cover the signed floor. Report their lower executable net
   // and preserve the original estimate and each state for comparison.
   for (const [blockProfit, pendingProfit] of [[coversGas / 2n, coversGas / 4n], [coversGas / 4n, coversGas / 2n]]) {
-    const checked = await scan({ age: 24 * minute, profit: coversGas, finalProfit: blockProfit, pendingProfit, protectedDirect: true });
+    const checked = await scan({ age: 24 * minute, profit: symbol => symbol === 'TEST0' ? coversGas : underGas,
+      finalProfit: blockProfit, pendingProfit, protectedDirect: true });
     assert.equal(checked.signed.length, 1);
     const signed = checked.signed[0];
     const gasBudget = signed.gas * signed.maxFeePerGas;
@@ -1123,6 +1179,10 @@ try {
     assert.equal(opp.netEth, Number(reportedGross - gasBudget) / 1e18);
     assert.equal(opp.netUsd, usd(reportedGross - gasBudget));
     assert.equal(opp.submission.netUsd, opp.netUsd);
+    const observed = checked.searcher.view().scanWindow.bestQuote;
+    const originalNet = observed.netUsd;
+    assert.equal(observed.status, 'sent');
+    assert.ok(originalNet > opp.netUsd, 'the window keeps the pre-gas-estimate valuation at signing');
     if (pendingProfit < blockProfit) {
       const chargedGas = 60_000n;
       const actualFee = 1_100_000_000n;
@@ -1136,6 +1196,10 @@ try {
       assert.equal(actual.status, 'failed');
       assert.equal(actual.netUsd, usd(-chargedGas * actualFee));
       assert.equal(actual.submission.directSimulation.pendingNetUsd, usd(pendingProfit - gasBudget));
+      const settled = checked.searcher.view().scanWindow.bestQuote;
+      assert.equal(settled.status, 'failed');
+      assert.equal(settled.note, actual.note);
+      assert.equal(settled.netUsd, originalNet, 'confirmed paid gas does not overwrite the original estimate');
     }
   }
 

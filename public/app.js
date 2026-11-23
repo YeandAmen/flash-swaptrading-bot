@@ -110,11 +110,12 @@ function networkGas(value, unit) {
   return `${Number(value).toLocaleString('en-US', { maximumFractionDigits: 9 })} ${unit}`;
 }
 
-function networkUsdc(rawUnits, fallback) {
-  if (typeof rawUnits !== 'string' || !/^\d{1,20}$/.test(rawUnits)) return networkGas(fallback, 'USDC');
-  const units = BigInt(rawUnits);
-  const fraction = (units % 1_000_000n).toString().padStart(6, '0').replace(/0+$/, '');
-  return `${(units / 1_000_000n).toLocaleString('en-US')}${fraction ? '.' + fraction : ''} USDC`;
+function networkTokenAmount(rawUnits, decimals, unit, fallback) {
+  if (typeof rawUnits !== 'string' || !/^\d{1,39}$/.test(rawUnits)) return networkGas(fallback, unit);
+  const digits = rawUnits.padStart(decimals + 1, '0');
+  const whole = BigInt(digits.slice(0, -decimals)).toLocaleString('en-US');
+  const fraction = digits.slice(-decimals).replace(/0+$/, '');
+  return `${whole}${fraction ? '.' + fraction : ''} ${unit}`;
 }
 
 function setNetworkMarkup(id, html) {
@@ -306,11 +307,11 @@ function renderSolana(solana) {
   const qualified = routes?.filter((route) => route.qualified).length;
   const status = completed && qualified !== undefined
     ? `${qualified} qualifying ${qualified === 1 ? 'route' : 'routes'}` : solana?.status;
-  const principal = Number.isFinite(result?.loanUsdc) ? ` · ${networkUsdc(result.loanUsdcUnits, result.loanUsdc)} loan` : '';
+  const principal = Number.isFinite(result?.loanUsdc) ? ` · ${networkTokenAmount(result.loanUsdcUnits, 6, 'USDC', result.loanUsdc)} loan` : '';
   const probe = solana?.marketProbe;
   const sizeDetail = completed && probe && Number.isFinite(probe.maxLoanUsdc)
     ? ` · ${probe.reason === 'refinement' ? 'Size refinement' : 'Depth scan'} · ${probe.limitMode === 'lender-liquidity'
-      ? 'available to borrow ' + networkUsdc(result?.availableUsdcUnits, probe.maxLoanUsdc) : 'cap ' + networkGas(probe.maxLoanUsdc, 'USDC')}` : '';
+      ? 'available to borrow ' + networkTokenAmount(result?.availableUsdcUnits, 6, 'USDC', probe.maxLoanUsdc) : 'cap ' + networkGas(probe.maxLoanUsdc, 'USDC')}` : '';
   $('solanaStatus').textContent = (status || 'Solana state unavailable.') + principal + sizeDetail + networkAge(checkedAt);
   $('solanaSlot').textContent = result?.slot > 0 ? networkNumber(result.slot) : '–';
   $('solanaRoutes').textContent = routes ? networkNumber(routes.length) : '–';
@@ -632,7 +633,18 @@ function renderMevWindow(scanWindow, gas) {
     const metrics = [
       `${blocks.toLocaleString()} blocks`, `${candidates.toLocaleString()} candidates`, `${simulations.toLocaleString()} simulations`,
     ];
-    if (Number.isFinite(bestNetUsd)) metrics.push(`best simulated net ${usd(bestNetUsd)}`);
+    if (Number.isFinite(bestNetUsd)) {
+      const quote = scanWindow.bestQuote;
+      metrics.push(`best preliminary two-swap net ${usd(bestNetUsd, Math.abs(bestNetUsd) < 1 ? 4 : 2)}`);
+      if (quote && Number.isSafeInteger(quote.block) && quote.netUsd === bestNetUsd) {
+        const principal = networkTokenAmount(quote.amountInWei, 18, 'WETH', quote.sizeEth);
+        const funding = quote.funding ? ` via ${quote.funding}` : '';
+        metrics.push(`block ${networkNumber(quote.block)} · ${quote.symbol} · ${quote.buy} → ${quote.sell} · ${principal}${funding}`);
+        const decision = quote.status === 'preliminary' ? 'Final decision unavailable'
+          : [quote.status, quote.note].filter(Boolean).join(' · ');
+        if (decision) metrics.push(decision);
+      }
+    }
     if (caughtUp > 0) metrics.push(`${caughtUp.toLocaleString()} recovered snapshot${caughtUp === 1 ? '' : 's'} since restart`);
     if (queuedSnapshots > 0) metrics.push(`${queuedSnapshots.toLocaleString()} queued snapshot${queuedSnapshots === 1 ? '' : 's'}`);
     if (missedSnapshots > 0) metrics.push(`${missedSnapshots.toLocaleString()} unrecovered gap${missedSnapshots === 1 ? '' : 's'} since restart`);
