@@ -202,13 +202,13 @@ function usdcUnits(raw: bigint): number {
   return Number(raw) / Number(USDC_UNITS);
 }
 
-function deadline() {
-  return { abortSignal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
+function deadline(signal?: AbortSignal) {
+  return { abortSignal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
 }
 
 export async function buildSwap(
   wallet: Address, input: Address, output: Address, destination: Address,
-  amount: bigint, venues: ReturnVenue | readonly ReturnVenue[], apiKey?: string, slippageBps = TEST_SLIPPAGE_BPS,
+  amount: bigint, venues: ReturnVenue | readonly ReturnVenue[], apiKey?: string, slippageBps = TEST_SLIPPAGE_BPS, signal?: AbortSignal,
 ): Promise<JupiterBuild | null> {
   const allowedVenues: readonly string[] = typeof venues === 'string' ? [venues] : venues;
   const url = new URL(JUPITER_BUILD);
@@ -219,7 +219,7 @@ export async function buildSwap(
   }).toString();
   const result = await fetch(url, {
     headers: apiKey ? { 'x-api-key': apiKey } : {},
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (result.status === 401 || result.status === 403) throw new Error('Jupiter rejected access. Set a valid JUPITER_API_KEY.');
   if (result.status === 429) throw new Error('Jupiter rate limited this scan.');
@@ -262,12 +262,12 @@ export function swapInstruction(swap: JupiterBuild): Instruction {
   };
 }
 
-export async function lookupTables(rpc: Rpc, swaps: JupiterBuild[]): Promise<AddressesByLookupTableAddress> {
+export async function lookupTables(rpc: Rpc, swaps: JupiterBuild[], signal?: AbortSignal): Promise<AddressesByLookupTableAddress> {
   const keys = [...new Set([
     KAMINO_MARKET_LOOKUP, ...swaps.flatMap((swap) => Object.keys(swap.addressesByLookupTableAddress ?? {})),
   ])].map(address);
   if (keys.length > 8) throw new Error('Jupiter returned too many lookup tables');
-  const { value } = await rpc.getMultipleAccounts(keys, { encoding: 'base64', commitment: COMMITMENT }).send(deadline());
+  const { value } = await rpc.getMultipleAccounts(keys, { encoding: 'base64', commitment: COMMITMENT }).send(deadline(signal));
   return Object.fromEntries(keys.map((key, i) => {
     const account = value[i];
     if (!account) throw new Error('An address lookup table is missing on-chain');
@@ -299,10 +299,10 @@ export function routeMinimum(swap: JupiterBuild, wallet: Address, source: Addres
   return bytes.readBigUInt64LE(16) * BigInt(10_000 - slippageBps) / 10_000n;
 }
 
-async function liveWalletState(rpc: Rpc, wallet: Address, usdAta: Address, solAta: Address, minContextSlot: bigint) {
+async function liveWalletState(rpc: Rpc, wallet: Address, usdAta: Address, solAta: Address, minContextSlot: bigint, signal?: AbortSignal) {
   const { value: [payer, usdc, wsol], context } = await rpc.getMultipleAccounts(
     [wallet, usdAta, solAta], { encoding: 'base64', commitment: COMMITMENT, minContextSlot },
-  ).send(deadline());
+  ).send(deadline(signal));
   if (!payer || payer.owner !== systemProgram || payer.executable || payer.data[0] !== '') {
     throw new Error('The live Solana payer must be a normal System Program account');
   }
@@ -317,7 +317,7 @@ async function liveWalletState(rpc: Rpc, wallet: Address, usdAta: Address, solAt
     return data.readBigUInt64LE(64);
   };
   const missing = Number(!usdc) + Number(!wsol);
-  const rent = missing ? await rpc.getMinimumBalanceForRentExemption(165n, { commitment: COMMITMENT }).send(deadline()) : 0n;
+  const rent = missing ? await rpc.getMinimumBalanceForRentExemption(165n, { commitment: COMMITMENT }).send(deadline(signal)) : 0n;
   return {
     lamports: payer.lamports, usdc: amount(usdc, USDC), wsol: amount(wsol, WRAPPED_SOL), slot: context.slot,
     createUsdc: !usdc, createWsol: !wsol, rent: BigInt(missing) * rent,
@@ -380,12 +380,20 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
 
   let submission: Promise<void | SolanaRouteDecline> | undefined;
   let alternate: PreparedSolanaCycle | undefined;
-  const scanRoute = async (buy: Venue, index: number, firstQuote?: JupiterBuild): Promise<SolanaRoute> => {
+  let deferredReturn: { index: number; first: JupiterBuild } | undefined;
+  const retryDeadline = performance.now() + REQUEST_TIMEOUT_MS;
+  const scanRoute = async (buy: Venue, index: number, firstQuote?: JupiterBuild, signal?: AbortSignal): Promise<SolanaRoute> => {
     const pairedVenue = venues[1 - index];
     const compareReturns = config.compareReturnVenues && !test && !firstQuote;
     let reusableFirst = firstQuote;
     let hasDifferentExit = false;
     let sell: string = compareReturns ? 'Jupiter direct return' : pairedVenue;
+    const tryPairedReturn = (first: JupiterBuild, unavailable: SolanaRoute) => {
+      if (!submission) return scanRoute(buy, index, first);
+      // Only the opposite entry can reach this point once the first candidate has been handed off.
+      deferredReturn = { index, first };
+      return unavailable;
+    };
     let quote: Pick<SolanaRoute, 'expectedNetBeforeNetworkUsdc' | 'quotedNetBeforeNetworkUsdc'> | undefined;
     try {
       const first = firstQuote ?? await buildSwap(wallet, USDC, WRAPPED_SOL, solAta.ata, loan, buy, config.jupiterApiKey, slippageBps);
@@ -394,10 +402,10 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       const firstMinimum = execute ? routeMinimum(first, wallet, usdcAta.ata, solAta.ata, slippageBps) : rawAmount(first.otherAmountThreshold);
       if (firstMinimum <= 0n) throw new Error('Jupiter did not guarantee any first-leg output');
       const exits = compareReturns ? returnVenues.filter((venue) => venue !== buy) : pairedVenue;
-      const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, exits, config.jupiterApiKey, slippageBps);
+      const second = await buildSwap(wallet, WRAPPED_SOL, USDC, usdcAta.ata, firstMinimum, exits, config.jupiterApiKey, slippageBps, signal);
       if (!second) {
-        if (compareReturns && !submission) return scanRoute(buy, index, first);
-        return { buy, sell, status: 'no-route', detail: 'No direct return route' };
+        const unavailable: SolanaRoute = { buy, sell, status: 'no-route', detail: 'No direct return route' };
+        return compareReturns ? tryPairedReturn(first, unavailable) : unavailable;
       }
       const labels = new Set(second.routePlan.map(({ swapInfo }) => swapInfo.label));
       sell = [...labels].join(' + ');
@@ -416,9 +424,9 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       if (balance < 5_000n) throw new Error('The public wallet has no SOL to cover a full transaction simulation');
 
       const [tables, blockhashResult, baseline] = await Promise.all([
-        lookupTables(rpc, [first, second]),
-        rpc.getLatestBlockhash({ commitment: COMMITMENT, minContextSlot: context.slot }).send(deadline()),
-        execute ? liveWalletState(rpc, wallet, usdcAta.ata, solAta.ata, context.slot) : null,
+        lookupTables(rpc, [first, second], signal),
+        rpc.getLatestBlockhash({ commitment: COMMITMENT, minContextSlot: context.slot }).send(deadline(signal)),
+        execute ? liveWalletState(rpc, wallet, usdcAta.ata, solAta.ata, context.slot, signal) : null,
       ]);
       let swapLossGuard: SolanaSwapLossGuard | undefined;
       if (lossCap !== undefined) {
@@ -452,7 +460,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       let exactFee: bigint | null = null;
       if (baseline) {
         const encoded = getBase64Decoder().decode(transaction.messageBytes) as TransactionMessageBytesBase64;
-        const feeQuote = await rpc.getFeeForMessage(encoded, { commitment: COMMITMENT, minContextSlot: requiredSlot }).send(deadline());
+        const feeQuote = await rpc.getFeeForMessage(encoded, { commitment: COMMITMENT, minContextSlot: requiredSlot }).send(deadline(signal));
         exactFee = feeQuote.value;
         if (exactFee === null || exactFee > maxFeeLamports) throw new Error('Solana fee quote exceeds its cap or is unavailable');
         maxDebit = exactFee + baseline.rent;
@@ -473,7 +481,7 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       const { value: simulation, context: execution } = await rpc.simulateTransaction(unsigned, {
         encoding: 'base64', sigVerify: false, replaceRecentBlockhash: !execute,
         minContextSlot: execute ? requiredSlot : context.slot, commitment: COMMITMENT,
-      }).send(deadline());
+      }).send(deadline(signal));
       if (simulation.err) {
         const programError = simulation.logs?.find((line) => line.startsWith('Program log: Error: '));
         const errorName = typeof simulation.err === 'string' ? simulation.err : Object.keys(simulation.err).join(', ');
@@ -523,15 +531,25 @@ export async function scanSolanaCycle(config: SolanaScanConfig,
       };
     } catch (error) {
       // A different, single-venue exit may fit when the router's best return cannot be composed.
-      if (error instanceof RouteCompositionError && compareReturns && hasDifferentExit && reusableFirst && !submission) {
-        return scanRoute(buy, index, reusableFirst);
-      }
-      return { buy, sell, status: quote === undefined ? 'quote-error' : 'simulation-failed', ...quote,
+      const unavailable: SolanaRoute = { buy, sell, status: quote === undefined ? 'quote-error' : 'simulation-failed', ...quote,
         detail: summarizeFailure(error, config.jupiterApiKey) };
+      if (error instanceof RouteCompositionError && compareReturns && hasDifferentExit && reusableFirst) {
+        return tryPairedReturn(reusableFirst, unavailable);
+      }
+      return unavailable;
     }
   };
   result.routes = await Promise.all(venues.map((buy, index) => scanRoute(buy, index)));
   const initial = await submission;
-  if (alternate && initial?.status === 'route-declined' && initial.canTryAlternate()) await execute?.(alternate);
+  if (initial?.status === 'route-declined') {
+    if (!alternate && deferredReturn) {
+      const remaining = Math.ceil(retryDeadline - performance.now());
+      if (remaining <= 0 || !initial.canTryAlternate()) return result;
+      const { first, index } = deferredReturn;
+      result.routes[index] = await scanRoute(venues[index], index, first, AbortSignal.timeout(remaining));
+      if (performance.now() >= retryDeadline) return result;
+    }
+    if (alternate && initial.canTryAlternate()) await execute?.(alternate);
+  }
   return result;
 }

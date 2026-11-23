@@ -57,7 +57,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
   let checkLossGuards = false;
   let jupiterRequests = 0;
   let groupedExit: string | undefined;
-  let groupedIssue: 'layout' | 'oversized' | 'accounts' | 'rate-limit' | 'instruction-slippage' | 'response-slippage' | undefined;
+  let groupedIssue: 'no-route' | 'layout' | 'oversized' | 'accounts' | 'rate-limit' | 'instruction-slippage' | 'response-slippage' | undefined;
   const requestedExits: string[][] = [];
   let slowQuote: Promise<void> | undefined;
   const [{ ata: usdcAta }, { ata: solAta }] = await Promise.all([createWalletAta(wallet, USDC), createWalletAta(wallet, WRAPPED_SOL)]);
@@ -83,6 +83,7 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
       const venue = requested.length === 1 ? requested[0] : groupedExit === 'paired' ? paired : groupedExit;
       const issue = requested.length > 1 ? groupedIssue : undefined;
       if (issue === 'rate-limit') return Response.json({}, { status: 429 });
+      if (issue === 'no-route') return Response.json({ errorCode: 'COULD_NOT_FIND_ANY_ROUTE' }, { status: 400 });
       if (requested.length > 1) requestedExits.push(requested);
       const first = inputMint === USDC;
       if (first && venue === 'Meteora DLMM') await slowQuote;
@@ -341,6 +342,96 @@ test('Solana paper scanner composes unsigned atomic borrow and repay and gates o
     });
     assert.ok(scanned.routes.every((route) => route.qualified));
     assert.equal(submissions, 2);
+  });
+  await t.test('a declined first route can release one paired return rebuild while the entry quote is fresh', async (t) => {
+    const settings = { ...config, venuePair: solanaVenuePairs[1], compareReturnVenues: true };
+    let clock = 1_000;
+    t.mock.method(performance, 'now', () => clock);
+    const fetchFixture = globalThis.fetch;
+    let groupedReply!: () => void;
+    let pairedRequest!: () => void;
+    const firstVenues: string[] = [];
+    t.mock.method(globalThis, 'fetch', async (input: URL | RequestInfo, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.origin !== 'https://api.jup.ag') return fetchFixture(input, init);
+      const dexes = url.searchParams.get('dexes')!;
+      const buy = url.searchParams.get('inputMint') === USDC;
+      if (buy) firstVenues.push(dexes);
+      if (!buy && dexes === 'Whirlpool') pairedRequest();
+      const response = await fetchFixture(input, init);
+      if (!buy && dexes.includes(',') && !dexes.includes('Meteora DLMM')) groupedReply();
+      return response;
+    });
+    t.after(() => { groupedIssue = undefined; groupedExit = undefined; slowQuote = undefined; requestedExits.length = 0; });
+
+    type Decision = 'decline' | 'early decline' | 'accepted' | 'unknown' | 'revoked' | 'expired' | 'revoked during rebuild' | 'expired during rebuild';
+    async function run(issue: NonNullable<typeof groupedIssue>, decision: Decision) {
+      jupiterRequests = 0;
+      firstVenues.length = 0;
+      groupedExit = 'Kipseli';
+      groupedIssue = undefined;
+      let permit = true;
+      let unblockEntry!: () => void;
+      let decide!: () => void;
+      let submissions = 0;
+      const gate = new Promise<void>(resolve => { decide = resolve; });
+      const grouped = new Promise<void>(resolve => { groupedReply = resolve; });
+      slowQuote = new Promise<void>(resolve => { unblockEntry = resolve; });
+      pairedRequest = () => {
+        if (decision === 'revoked during rebuild') permit = false;
+        if (decision === 'expired during rebuild') clock += 8001;
+      };
+      const scan = scanSolanaCycle(settings, async candidate => {
+        assert.ok(candidate.net >= 50_000n);
+        if (++submissions === 1) {
+          groupedIssue = issue;
+          if (decision === 'early decline') setImmediate(unblockEntry);
+          else { unblockEntry(); await gate; }
+          if (decision === 'accepted') return;
+          if (decision === 'unknown') throw Error('First submission outcome unknown');
+          if (decision === 'revoked') permit = false;
+          if (decision === 'expired') clock += 8001;
+        }
+        return { status: 'route-declined', canTryAlternate: () => permit };
+      });
+      await grouped;
+      if (decision !== 'early decline') {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(jupiterRequests, 4, 'an outstanding first handoff cannot spend the return request');
+        assert.equal(submissions, 1);
+      }
+      decide();
+      const result = decision === 'unknown' ? await assert.rejects(scan, /First submission outcome unknown/) : await scan;
+      assert.deepEqual(firstVenues.sort(), ['Meteora DLMM', 'Whirlpool'], 'reuse the original guaranteed entry');
+      return { submissions, requests: jupiterRequests, route: result?.routes[1] };
+    }
+
+    for (const issue of ['no-route', 'layout', 'oversized'] as const) {
+      const recovered = await run(issue, 'decline');
+      assert.equal(recovered.requests, 5, issue);
+      assert.equal(recovered.submissions, 2, issue);
+      assert.equal(recovered.route?.sell, 'Whirlpool');
+      assert.equal(recovered.route?.qualified, true);
+    }
+    const early = await run('layout', 'early decline');
+    assert.equal(early.requests, 5);
+    assert.equal(early.submissions, 2);
+    assert.equal(early.route?.qualified, true);
+    for (const decision of ['accepted', 'unknown', 'revoked', 'expired'] as const) {
+      const skipped = await run('layout', decision);
+      assert.equal(skipped.requests, 4, decision);
+      assert.equal(skipped.submissions, 1, decision);
+    }
+    for (const issue of ['accounts', 'rate-limit', 'instruction-slippage', 'response-slippage'] as const) {
+      const invalid = await run(issue, 'decline');
+      assert.equal(invalid.requests, 4, issue);
+      assert.equal(invalid.submissions, 1, issue);
+    }
+    for (const decision of ['revoked during rebuild', 'expired during rebuild'] as const) {
+      const late = await run('layout', decision);
+      assert.equal(late.requests, 5, decision);
+      assert.equal(late.submissions, 1, decision);
+    }
   });
   await t.test('does not retry if a route decline is invalidated before the other quote arrives', async () => {
     let submissions = 0;
