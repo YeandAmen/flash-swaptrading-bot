@@ -16,14 +16,14 @@ import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, f
 import { sendBundle, submitPrivateDirect, type BuilderResult } from './bundles.js';
 import { affordableDirectFees, directExecutionReserve, directFees, directPriorityFee, findNonceConsumer } from './direct.js';
 import { submitDirect } from './direct-broadcast.js';
-import { directCadence, extraRoutes, loanLimitWei } from './cadence.js';
+import { directCadence, extraRoutes, loanLimitWei, MAX_FLASH_LOAN_WEI } from './cadence.js';
 import { EthereumPathPlanner, type EthereumPathCandidate, type EthereumPathResult } from './multihop.js';
 import { HeadBackfill } from './head-backfill.js';
 import { createHeadWake, type HeadHint, type HeadWakeResult } from './head-wake.js';
 import { encodePathArbitrage, releaseSupportsPath, pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
 import { comparableRouteQuote, rankRouteNet, routeInputSizes, type RouteQuoteSample } from './sizing.js';
 import { NextVenueKind, UNISWAP_V4_MANAGER } from './next-pools.js';
-import { arbGas, bestCycle, buildStateReads, inventoryCanCoverExitFloor, inventoryCanCoverV2Floor, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
+import { arbGas, bestCycle, buildStateReads, curveBuyRefinement, inventoryCanCoverExitFloor, inventoryCanCoverV2Floor, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
 import { MevUniverse } from './universe.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'mev.json');
@@ -329,6 +329,7 @@ interface Candidate {
   est: number;
   estimatedNet: number;
   gasUnits: number;
+  curveTrialWei?: bigint;
 }
 
 type Offer = ({ candidate: Candidate; path?: undefined } | { path: EthereumPathCandidate; candidate?: undefined; release: Hex }) & {
@@ -971,7 +972,12 @@ export class MevSearcher {
         const rawGas = measured && measured.context === gasContext && measured.token === t.token.address && measured.block < r.blockNumber
           && (r.blockNumber !== measured.block + 1n || r.parentHash === measured.hash) ? measured.units : undefined;
         const rank = rankRouteNet(cycle.profit, cycle.dx, gasUnits, gasPriceEth, sample, now, rawGas);
-        cands.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet: rank, gasUnits });
+        const candidate: Candidate = { t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet: rank, gasUnits };
+        if (!historical && !test && MEV.funding === 'auto' && A.kind === NextVenueKind.CurveTricrypto) {
+          const quotes = res[cycle.buy]?.curve?.buy, exit = res[cycle.sell];
+          if (quotes && exit) candidate.curveTrialWei = curveBuyRefinement(quotes, exit, B.fee, cycle.profit);
+        }
+        cands.push(candidate);
       }
     }
     if (historical) {
@@ -1384,6 +1390,12 @@ export class MevSearcher {
     const lenderOnlyTest = test?.requireGasCoverage === false && !test.privateSubmission && !test.publicFunctional;
     const trials = fundingTrials(MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark, previous)
       .filter(({ funding }) => funding !== 0 || (!lenderOnlyTest && c.A.kind !== NextVenueKind.CurveTricrypto));
+    const refined = c.curveTrialWei;
+    if (!test && MEV.funding === 'auto' && c.A.kind === NextVenueKind.CurveTricrypto
+      && refined !== undefined && refined > 0n && refined <= limit && refined <= MAX_FLASH_LOAN_WEI
+      && !trials.some(({ funding, amount }) => funding === 2 && amount === refined)) {
+      trials.push({ funding: 2, amount: refined });
+    }
     if (!trials.length) return null;
     const gasContext = !test ? this.routeGasContext() : undefined;
     const sims = await Promise.all(trials.map(({ amount, funding }) => this.simulate(c.t, c.A, c.B, amount, r.blockNumber + 1n, r.blockNumber, funding)));

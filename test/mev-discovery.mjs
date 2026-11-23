@@ -16,7 +16,7 @@ Object.assign(process.env, { FORK_MODE: '1', RPC_URL: rpc.href, SEND_RPC_URL: rp
 try {
   const { ADDR, CORE_TOKENS } = await import('../dist/config.js');
   const { publicClient } = await import('../dist/chain.js');
-  const { bestCycle, buildStateReads, discoverArbPools, MEV_EXTRA_TOKENS, poolVenue, reservesOf, toNextVenue } =
+  const { bestCycle, buildStateReads, curveBuyRefinement, discoverArbPools, MEV_EXTRA_TOKENS, poolVenue, reservesOf, toNextVenue } =
     await import('../dist/mev/pools.js');
   const { selectActiveTokens } = await import('../dist/mev/universe.js');
 
@@ -43,6 +43,30 @@ try {
   assert.ok(path?.profit > 0 && path.dx <= 3, 'score a Curve leg using only the quotes within the measured range');
   const missing = bestCycle([curve, first], [{ curve: { ...quotes.curve, buy: [] } }, { w: 100, t: 10000 }]);
   assert.ok(missing.cycles.every((cycle) => cycle.buy !== 0), 'a missing quote cannot become an executable candidate');
+
+  // Ethereum 26481007: the Curve WETH-to-WBTC knots and the WBTC/WETH 500 ppm exit are from one source block.
+  const measuredBuy = [139900, 1398396, 5585904, 27835097].map((raw, i) => ({
+    input: [0.05, 0.5, 2, 10][i], output: raw / 1e8,
+  }));
+  const exit = { ...first, fee: 0.0005 };
+  const exitReserves = reservesOf({ token, wethIs0: false }, exit, [
+    { status: 'success', result: [47441275561872219123115375842033664n] },
+    { status: 'success', result: 126323962247006146n },
+  ], 0);
+  const curveReserves = { curve: { buy: measuredBuy, sell: [] } };
+  const baseline = bestCycle([curve, exit], [curveReserves, exitReserves]).cycle;
+  assert.equal(baseline.dx, 2, 'the ordinary screening and ranking model keeps its measured knot');
+  const trial = curveBuyRefinement(measuredBuy, exitReserves, exit.fee, baseline.profit);
+  assert.equal(trial, 1_480_595_136_236_223_488n, 'historically verified by the pinned Morpho proxy at this size');
+  assert.equal(curveBuyRefinement(measuredBuy.slice(0, 3), exitReserves, exit.fee, baseline.profit), undefined,
+    'an incomplete rising range cannot establish a peak');
+  assert.equal(curveBuyRefinement(measuredBuy, exitReserves, exit.fee, 1), undefined,
+    'a fit cannot add a trial without beating the existing route estimate');
+  assert.equal(curveBuyRefinement(measuredBuy, curveReserves, 0, baseline.profit), undefined);
+  for (const last of [{ input: 10, output: NaN }, { input: 2, output: 1 }, { input: 10, output: 0.01 }, { input: 10, output: 1 }]) {
+    assert.equal(curveBuyRefinement([...measuredBuy.slice(0, 3), last], exitReserves, exit.fee, baseline.profit), undefined,
+      'malformed or nonconcave quotes cannot nominate a principal');
+  }
 
   if (forkRpc) {
     const block = 26455000n;

@@ -361,6 +361,46 @@ function interpolate(points: readonly QuotePoint[], amount: number, reverse = fa
   return 0;
 }
 
+function sellForWeth(exit: Reserves, keep: number, tokens: number): number {
+  return exit.curve ? interpolate(exit.curve.sell, tokens) : exit.w * keep * tokens / (exit.t + keep * tokens);
+}
+
+/** Use measured Curve inputs to propose one interior principal for an exact proxy simulation. */
+export function curveBuyRefinement(buy: readonly QuotePoint[], exit: Reserves, exitFee: number, baselineProfit: number): bigint | undefined {
+  if (buy.length < 3 || exit.curve || !(exit.w > 0 && exit.t > 0) || !(baselineProfit > 0)) return;
+  const keep = 1 - (exit.sellFee ?? exitFee);
+  if (!(keep > 0 && keep <= 1)) return;
+  let previousSize = 0, previousTokens = 0, previousProfit = 0, previousSlope = Infinity;
+  let bestSize = 0, bestProfit = baselineProfit;
+  for (const { input, output } of buy) {
+    if (!(input > previousSize && output > previousTokens)) return;
+    const profit = sellForWeth(exit, keep, output) - input;
+    const slope = (profit - previousProfit) / (input - previousSize);
+    if (!Number.isFinite(slope) || slope > previousSlope) return;
+    if (previousSize > 0) {
+      // Fit profit(x) = linear*x - curvature*x² through zero and adjacent measured knot payouts.
+      const leftRate = previousProfit / previousSize;
+      const curvature = (leftRate - profit / input) / (input - previousSize);
+      if (curvature > 0) {
+        const linear = leftRate + curvature * previousSize;
+        const peak = linear / (2 * curvature);
+        const payout = peak * linear / 2;
+        if (peak > previousSize && peak < input && Number.isFinite(payout) && payout > bestProfit) {
+          bestSize = peak;
+          bestProfit = payout;
+        }
+      }
+    }
+    previousSize = input;
+    previousTokens = output;
+    previousProfit = profit;
+    previousSlope = slope;
+  }
+  // Require the measured payout to have turned down; a rising edge alone cannot bracket a maximum.
+  const wei = Math.floor(bestSize * 1e18);
+  return previousSlope < 0 && Number.isFinite(wei) && wei > 0 ? BigInt(wei) : undefined;
+}
+
 function getMeasuredCycle(pools: ArbPool[], a: Reserves, b: Reserves, buy: number, sell: number): { gapBest: number; cycle: Cycle | null } {
   const ga = 1 - (a.buyFee ?? pools[buy].fee);
   const gb = 1 - (b.sellFee ?? pools[sell].fee);
@@ -376,7 +416,7 @@ function getMeasuredCycle(pools: ArbPool[], a: Reserves, b: Reserves, buy: numbe
   function quote(dx: number) {
     const tokens = a.curve ? interpolate(a.curve.buy, dx) : a.t * ga * dx / (a.w + ga * dx);
     if (!(tokens > 0)) return;
-    const weth = b.curve ? interpolate(b.curve.sell, tokens) : b.w * gb * tokens / (b.t + gb * tokens);
+    const weth = sellForWeth(b, gb, tokens);
     if (!(weth > 0)) return;
     const profit = weth - dx;
     const gap = profit / dx;

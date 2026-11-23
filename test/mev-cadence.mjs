@@ -177,6 +177,89 @@ try {
     } finally { MEV.maxLoanUsd = cap; }
   }
 
+  // Evaluate the Curve source-26481007 fit beside the normal lender trials.
+  {
+    const block = { ...snapshot(now), blockNumber: 26_481_007n };
+    const t = block.tokens[0];
+    const entry = { address: address(801), kind: 7, venue: 'Curve Tricrypto-NG', v2: false, fee: 0 };
+    const exit = { address: address(802), kind: 2, venue: 'Uniswap v3', v2: false, fee: 0.0005 };
+    const baseline = 2n * oneEth;
+    const fit = 1_480_595_136_236_223_488n;
+    const baselinePayout = 1_789_082_939_148_110n;
+    const fittedPayout = 2_001_343_666_045_099n;
+    const config = { funding: MEV.funding, maxLoanUsd: MEV.maxLoanUsd };
+
+    async function evaluate({ refined, buy = entry, manual, fitReverts = false } = {}) {
+      const worker = newSearcher(() => assert.fail('sizing must not sign'));
+      worker.save = () => {};
+      const calls = [];
+      const candidate = { t, A: buy, B: exit, dx: 2, est: 0.00179, gasUnits: 250_000, curveTrialWei: refined };
+      let release;
+      const gate = new Promise(resolve => { release = resolve; });
+      worker.simulate = async (_token, actualBuy, actualSell, amount, deadline, source, funding) => {
+        assert.equal(actualBuy, buy);
+        assert.equal(actualSell, exit);
+        assert.equal(source, block.blockNumber);
+        assert.equal(deadline, source + 1n);
+        calls.push([funding, amount]);
+        await gate;
+        if (funding === 2 && amount === fit && !fitReverts) return { ok: true, profit: fittedPayout };
+        if (funding === 2 && amount === baseline) return { ok: true, profit: baselinePayout };
+        return { ok: false, reason: 'mock revert', reverted: true };
+      };
+      const result = worker.evaluate(candidate, block, 1n, worker.profitPolicy(now), false, undefined, false, manual);
+      const beforeRelease = calls.slice();
+      release();
+      const offers = await result;
+      assert.deepEqual(calls, beforeRelease, 'all simulations must start before any result is released');
+      return { calls, offers };
+    }
+    try {
+      MEV.funding = 'auto';
+      const probe = newSearcher(() => assert.fail('snapshot selection cannot sign'));
+      probe.reconcileWallet = async () => {};
+      probe.scanPaths = () => undefined;
+      probe.save = () => {};
+      let selected;
+      probe.scanShortlist = async routes => { selected = routes; return true; };
+      const buy = { ...entry, curve: { sellProbes: [200_000n] } };
+      const wbtc = { ...t, token: { ...t.token, decimals: 8 }, wethIs0: false, pools: [buy, exit] };
+      const rows = [139900n, 1398396n, 5585904n, 27835097n, 1n, [47441275561872219123115375842033664n], 126323962247006146n];
+      const submission = MEV.submission;
+      try {
+        MEV.submission = 'bundle'; // Exercise snapshot selection without consulting the fee RPC.
+        await probe.onBlock({ ...block, tokens: [wbtc], at: [[0, 5]], results: rows.map(result => ({ status: 'success', result })) });
+      } finally { MEV.submission = submission; }
+      const selectedCurve = selected.find(route => route.A === buy && route.B === exit);
+      assert.equal(selectedCurve.dx, 2);
+      assert.equal(selectedCurve.curveTrialWei, fit);
+      const ordinary = await evaluate();
+      assert.equal(ordinary.offers.primary.amount, baseline);
+      assert.ok(ordinary.calls.every(([funding]) => funding !== 0));
+      const refined = await evaluate({ refined: selectedCurve.curveTrialWei });
+      assert.deepEqual(refined.calls, [...ordinary.calls, [2, fit]]);
+      assert.equal(refined.offers.primary.amount, fit);
+      assert.equal(refined.offers.primary.funding, 2);
+      assert.equal(refined.offers.primary.profit, fittedPayout);
+      const reverted = await evaluate({ refined: fit, fitReverts: true });
+      assert.deepEqual(reverted.calls, refined.calls);
+      assert.equal(reverted.offers.primary.amount, baseline);
+      assert.equal(reverted.offers.primary.profit, baselinePayout);
+      for (const repeatedOrInvalid of [baseline, 0n, -1n, 2n ** 127n]) {
+        assert.deepEqual((await evaluate({ refined: repeatedOrInvalid })).calls, ordinary.calls);
+      }
+      MEV.maxLoanUsd = 4_000; // 2 WETH at the fixture's $2,000 price.
+      assert.deepEqual((await evaluate({ refined: baseline + 1n })).calls, (await evaluate()).calls);
+      for (const options of [{ manual: { requireGasCoverage: true } }, { buy: t.pools[0] }]) {
+        assert.deepEqual((await evaluate({ ...options, refined: fit })).calls, (await evaluate(options)).calls);
+      }
+      for (const mode of ['morpho', 'aave', 'balancer', 'spark', 'pool']) {
+        MEV.funding = mode;
+        assert.deepEqual((await evaluate({ refined: fit })).calls, (await evaluate()).calls);
+      }
+    } finally { Object.assign(MEV, config); }
+  }
+
   // Drive the production head loop through one stale HTTP response and a same-height reorg.
   {
     const worker = newSearcher(() => assert.fail('head discovery cannot sign'));
