@@ -266,6 +266,33 @@ export function inventoryCanCoverV2Floor(balance: bigint | undefined, reserves: 
   return balance * weth >= floor * token;
 }
 
+/** A fee-free sale of the entire entry inventory at the exit's starting price bounds every trade size. */
+export function inventoryCanCoverExitFloor(balance: bigint | undefined, exit: ArbPool, state: McResult | undefined,
+  wethIs0: boolean, floor: bigint): boolean {
+  if (balance === undefined || balance < 0n || floor <= 0n || exit.curve || state?.status !== 'success'
+    || !Array.isArray(state.result)) return true;
+  if (exit.v2) {
+    if (exit.kind !== NextVenueKind.UniswapV2 && exit.kind !== NextVenueKind.SushiV2 && exit.kind !== NextVenueKind.PancakeV2) return true;
+    return inventoryCanCoverV2Floor(balance, state, wethIs0, floor);
+  }
+  let quoteIs0 = wethIs0;
+  if (exit.kind === NextVenueKind.UniswapV4) {
+    // Discovery constructs these descriptors from static-fee, zero-hook keys.
+    if (!exit.v4 || exit.address.toLowerCase() !== UNISWAP_V4_MANAGER.toLowerCase() || state.result[3] !== exit.v4.fee) return true;
+    quoteIs0 = exit.v4.quoteIs0;
+  } else {
+    if (exit.v4 || state.result[6] !== true || (exit.kind !== NextVenueKind.UniswapV3
+      && exit.kind !== NextVenueKind.SushiV3 && exit.kind !== NextVenueKind.PancakeV3)) return true;
+  }
+  const sqrtPriceX96 = state.result[0];
+  // TickMath permits prices from MIN_SQRT_RATIO inclusive to MAX_SQRT_RATIO exclusive.
+  if (typeof sqrtPriceX96 !== 'bigint' || sqrtPriceX96 < 4295128739n
+    || sqrtPriceX96 >= 1461446703485210103287273052203988822378723970342n) return true;
+  const square = sqrtPriceX96 * sqrtPriceX96;
+  const q192 = 1n << 192n;
+  return quoteIs0 ? balance * q192 >= floor * square : balance * square >= floor * q192;
+}
+
 function measuredQuotes(probes: readonly bigint[], reads: McResult[], offset: number, inputScale: number, outputScale: number) {
   const points: QuotePoint[] = [];
   for (const [index, amount] of probes.entries()) {

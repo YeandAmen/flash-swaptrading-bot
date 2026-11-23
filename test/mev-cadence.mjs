@@ -196,6 +196,148 @@ try {
     }
   }
 
+  // Three AMPL routes can share an underfunded V3 entry. A transfer error nominates
+  // a balance check only after a different physical exit corroborates it.
+  {
+    const { buildStateReads } = await import('../dist/mev/pools.js');
+    const { mevPoolClient } = await import('../dist/chain.js');
+    const { UNISWAP_V4_MANAGER } = await import('../dist/mev/next-pools.js');
+    const searcher = newSearcher(() => assert.fail('inventory screening cannot sign'));
+    const [subject, other] = snapshot(now).tokens;
+    subject.token.decimals = 9;
+    const entry = { address: address(502), kind: 2, venue: 'Uniswap v3 0.3%', fee: 0.003, v2: false };
+    const [firstExit, secondExit] = subject.pools;
+    const v4Exit = { kind: 5, v2: false, address: UNISWAP_V4_MANAGER, venue: 'Uniswap v4 ETH', fee: 0.0001,
+      v4: { id: hash(901), fee: 100, tickSpacing: 1, nativeEth: true, quoteIs0: true } };
+    subject.pools = [entry, firstExit, secondExit, v4Exit];
+    searcher.tokens = [subject, other];
+    searcher.reads = buildStateReads(searcher.tokens);
+    searcher.file.armed = searcher.contractReady = true;
+    searcher.save = () => {};
+    searcher.reconcileWallet = async () => {};
+    searcher.scanPaths = () => undefined;
+    const evaluated = [];
+    searcher.scanShortlist = async routes => { evaluated.push(...routes); return false; };
+    const originalMulticall = mevPoolClient.multicall, originalFees = mevReadClient.getFeeHistory, originalNow = Date.now;
+    let clock = now, height = 100, balance = 1n, error;
+    let probes = 0, calls = 0;
+    const head = () => ({ number: BigInt(height), hash: hash(height), timestamp: BigInt(Math.floor(clock / 1000)),
+      baseFeePerGas: 1_000_000_000n, gasUsed: 15_000_000n, gasLimit: 30_000_000n });
+    Date.now = () => clock;
+    mevReadClient.getFeeHistory = async () => ({ reward: [[100_000_000n, 300_000_000n]] });
+    mevPoolClient.multicall = async ({ contracts, blockNumber }) => {
+      calls++;
+      const extra = contracts.filter(c => c.functionName === 'balanceOf');
+      const v3Reads = extra.filter(c => c.args[0] === entry.address);
+      assert.ok(v3Reads.length <= 1);
+      probes += v3Reads.length;
+      const rows = contracts.map(c => {
+        let result;
+        switch (c.functionName) {
+          case 'getBlockNumber': result = extra.length && error === 'stamp' ? blockNumber - 1n : blockNumber; break;
+          case 'getCurrentBlockTimestamp': result = head().timestamp; break;
+          case 'slot0': result = [156531923594998502484407556n, -124543, 0, 1, 1, 102, true]; break;
+          case 'liquidity': result = 31615222226526542n; break;
+          case 'getSlot0': result = [(2n ** 96n) * 158114n / 100000000n, 0, 0, 100]; break;
+          case 'getLiquidity': result = 30000000000000000n; break;
+          case 'getReserves':
+            result = other.pools.some(p => p.address === c.address)
+              ? [100n * oneEth, (c.address === other.pools[0].address ? 120n : 100n) * oneEth, 0]
+              : [200n * oneEth, 500000n * 10n ** 9n, 0];
+            break;
+          case 'balanceOf':
+            assert.equal(c.address, subject.token.address);
+            if (c.args[0] === UNISWAP_V4_MANAGER) return { status: 'success', result: 77n };
+            assert.deepEqual(c.args, [entry.address]);
+            if (error === 'balance') return { status: 'failure' };
+            result = balance;
+            break;
+          default: assert.fail('Unexpected pool read');
+        }
+        return { status: 'success', result };
+      });
+      return extra.length && error === 'missing' ? rows.slice(0, -1) : rows;
+    };
+    const fail = async (exit, reverted = true) => {
+      searcher.simulate = async () => ({ ok: false, reason: 'TF', reverted });
+      await searcher.evaluate({ t: subject, A: entry, B: exit, dx: 2, est: 1, gasUnits: 200000 },
+        { blockNumber: head().number }, 1n, {}, false);
+    };
+    const check = async (expectedProbes, expectedPruned) => {
+      height++;
+      probes = 0;
+      calls = 0;
+      evaluated.length = 0;
+      const row = await searcher.read(head());
+      await searcher.onBlock(row);
+      assert.equal(probes, expectedProbes);
+      assert.equal(searcher.lastBlock.v3InventoryPruned, expectedPruned);
+      assert.equal(searcher.lastBlock.inventoryPruned, 0);
+      assert.ok(evaluated.some(c => c.t === other), 'a normal route from an unrelated token is evaluated');
+      return row;
+    };
+    try {
+      await fail(firstExit);
+      await fail(firstExit);
+      await fail(secondExit, false);
+      await check(0, 0);
+      await fail(secondExit);
+      await fail(v4Exit);
+      clock += 125_000; // Existing per-route cooldowns elapsed. Inventory evidence is still recent.
+      await check(1, 3);
+      assert.equal(evaluated.filter(c => c.A === entry).length, 0);
+      await searcher.read(head());
+      assert.equal(probes, 1, 'a repeated read of the same head cannot probe the pool twice');
+      for (error of ['balance', 'missing', 'stamp']) {
+        await check(1, 0);
+        assert.equal(calls, error === 'stamp' ? 2 : 1, 'only a wrong stamp needs the original request retried');
+        assert.ok(evaluated.some(c => c.A === entry), 'missing current evidence allows the route to be evaluated');
+      }
+      // A missing trailing V3 result does not discard a stamped V4 balance in the same call.
+      searcher.inventoryExits.add(firstExit.address.toLowerCase());
+      error = 'missing';
+      height++;
+      calls = 0;
+      const mixed = await searcher.read(head());
+      assert.equal(calls, 1);
+      assert.equal(mixed.v4Inventory.get(firstExit), 77n);
+      assert.equal(mixed.v3Inventory, undefined);
+      searcher.inventoryExits.clear();
+      error = undefined;
+      balance = 10000n * 10n ** 9n;
+      await check(1, 0);
+      assert.ok(evaluated.some(c => c.A === entry));
+      balance = 1n;
+      // Move one exit to a different multicall. Its price cannot be combined with this probe.
+      const poolReads = searcher.reads.contracts;
+      const exitRead = poolReads[searcher.reads.at[0][1]];
+      while (poolReads.length < 162) poolReads.push(exitRead);
+      searcher.reads.at[0][1] = poolReads.length;
+      poolReads.push(exitRead);
+      await check(1, 2);
+      assert.ok(evaluated.some(c => c.A === entry && c.B === firstExit));
+      searcher.beforeNextSlot = () => false;
+      await check(0, 0);
+      delete searcher.beforeNextSlot;
+      const manual = { id: 'manual-inventory-test', privateSubmission: true, minimumNetUsd: 0.01 };
+      searcher.activeGasOnlyTest = () => manual;
+      let manualRoutes;
+      searcher.scanGasOnlyTest = async (_test, routes) => { manualRoutes = routes; };
+      await check(0, 0);
+      assert.equal(manualRoutes.filter(c => c.A === entry).length, 3);
+      delete searcher.activeGasOnlyTest;
+      searcher.file.armed = false;
+      await check(0, 0);
+      searcher.file.armed = true;
+      clock += 5 * minute;
+      await check(0, 0);
+    } finally {
+      mevPoolClient.multicall = originalMulticall;
+      mevReadClient.getFeeHistory = originalFees;
+      Date.now = originalNow;
+    }
+  }
+
   const testId = 'cadence-gas-test';
   async function scan({ age, profit, finalProfit = coversGas, pendingProfit = finalProfit, pendingError = false,
     paper = false, staleHead = false, headChangesDuringSigning = false, historical = false, maximumTestGasUsd,

@@ -99,6 +99,8 @@ Live MEV can use a different bid after 30 minutes without a confirmed landing. S
 
 `MEV_IDLE_GAS_PADDING_PCT` controls the extra gas above the estimate while idle. It defaults to 25%. A smaller buffer can free room for the builder bid and can also leave less margin for changes in gas usage. The bot simulates using the exact gas limit before sending and budgets the full limit in the profit floor.
 
+When two-swap routes through the same Ethereum v3 buy pool repeatedly fail to transfer the output token, the scanner checks the pool's token balance on a new block. It can skip a route if selling that entire balance at the exit's spot price, even with no fees or price impact, would return less WETH than the configured profit floor before repaying the loan or paying gas.
+
 The bot's receipts record realized outcomes. A pool count or a profitable paper simulation alone does not establish realized returns. Inclusion depends on pool movement, gas, competing bids, RPC latency, and builder coverage. See [SushiSwap V3 core](https://github.com/sushiswap/v3-core), [PancakeSwap V3 addresses](https://developer.pancakeswap.finance/contracts/v3/addresses), [Uniswap v4 settlement](https://developers.uniswap.org/docs/protocols/v4/concepts/flash-accounting), [Aave V3 flash loans](https://aave.com/docs/aave-v3/smart-contracts/pool#flashloansimple), [Morpho Blue flash loans](https://docs.morpho.org/learn/concepts/flashloans/), and [Flashbots bundle troubleshooting](https://docs.flashbots.net/flashbots-auction/advanced/troubleshooting).
 
 ### Direct Ethereum transactions

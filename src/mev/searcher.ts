@@ -23,7 +23,7 @@ import { createHeadWake } from './head-wake.js';
 import { encodePathArbitrage, releaseSupportsPath, pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
 import { comparableRouteQuote, rankRouteNet, routeInputSizes, type RouteQuoteSample } from './sizing.js';
 import { NextVenueKind, UNISWAP_V4_MANAGER } from './next-pools.js';
-import { arbGas, bestCycle, buildStateReads, inventoryCanCoverV2Floor, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
+import { arbGas, bestCycle, buildStateReads, inventoryCanCoverExitFloor, inventoryCanCoverV2Floor, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
 import { MevUniverse } from './universe.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'mev.json');
@@ -42,6 +42,8 @@ const TEST_ID = /^[A-Za-z0-9_-]{8,80}$/;
 const HEAD_RETRY_MS = 400;
 const POOL_READS_PER_CHUNK = 160;
 const MAX_INVENTORY_PROBES = 3;
+const V3_TRANSFER_FAILURE_MS = 5 * 60_000;
+const MAX_V3_TRANSFER_FAILURES = 16;
 const RECEIPT_CONFIRMATIONS = 2n;
 const RECENT_LIMIT = 60;
 const RECENT_BUNDLE_LIMIT = 10;
@@ -240,6 +242,7 @@ interface BlockRead {
   at: number[][];
   results: McResult[];
   v4Inventory?: Map<ArbPool, bigint>;
+  v3Inventory?: { buy: ArbPool; chunk: number; balance: bigint };
   readMs: number;
   headAgeMs?: number;
   failedChunks: number;
@@ -348,10 +351,12 @@ export class MevSearcher {
   tokens: ArbToken[] = [];
   status = 'starting';
   lastError: string | null = null;
-  lastBlock: { number: number; at: number; candidates: number; readMs: number; headAgeMs?: number; decisionMs: number | null; failedChunks: number; inventoryPruned?: number } | null = null;
+  lastBlock: { number: number; at: number; candidates: number; readMs: number; headAgeMs?: number; decisionMs: number | null; failedChunks: number; inventoryPruned?: number; v3InventoryPruned?: number } | null = null;
   private deploying = false;
   private reads: ReturnType<typeof buildStateReads> | null = null;
   private inventoryExits = new Set<string>();
+  private v3TransferFailures: { token: Address; buy: string; sell: string; at: number }[] = [];
+  private lastV3ProbeHead?: Hex;
   private poolsAt = 0;
   private universe: MevUniverse;
   private refreshingPools: Promise<void> | null = null;
@@ -672,6 +677,23 @@ export class MevSearcher {
     return head;
   }
 
+  private v3BalanceProbe(tokens: ArbToken[], at: number[][], hash: Hex) {
+    if (this.lastV3ProbeHead === hash || !this.contractReady || !this.liveArmed(this.armGeneration) || this.activeGasOnlyTest()) return;
+    const cutoff = Date.now() - V3_TRANSFER_FAILURE_MS;
+    this.v3TransferFailures = this.v3TransferFailures.filter(failure => failure.at > cutoff);
+    for (const { token, buy, sell } of this.v3TransferFailures) {
+      if (!this.v3TransferFailures.some(failure => failure.token === token && failure.buy === buy && failure.sell !== sell)) continue;
+      const ti = tokens.findIndex(t => t.token.address === token);
+      if (ti < 0) continue;
+      const entry = tokens[ti].pools.find(p => poolIdentity(p) === buy);
+      const exit = tokens[ti].pools.findIndex(p => poolIdentity(p) === sell);
+      if (!entry || exit < 0) continue;
+      this.lastV3ProbeHead = hash;
+      return { token, buy: entry, chunk: Math.floor((at[ti][exit] - 2) / POOL_READS_PER_CHUNK) };
+    }
+    return undefined;
+  }
+
   private async read(head: Awaited<ReturnType<MevSearcher['head']>>, historical = false): Promise<BlockRead> {
     const reads = this.reads;
     const tokens = this.tokens;
@@ -699,18 +721,29 @@ export class MevSearcher {
         blockNumber: head.number, batchSize: 0 }) as Promise<McResult[]>;
     };
     const v4Inventory = new Map<ArbPool, bigint>();
+    const v3Probe = !historical && this.beforeNextSlot({ timestamp: Number(head.timestamp) })
+      ? this.v3BalanceProbe(tokens, reads.at, head.hash) : undefined;
+    let v3Inventory: BlockRead['v3Inventory'];
     const checks = await Promise.allSettled(chunks.map(async (chunk, i) => {
       const extra = probes[i];
-      if (!extra.length) return readChunk(chunk);
+      const v3 = v3Probe?.chunk === i ? v3Probe : undefined;
+      if (!extra.length && !v3) return readChunk(chunk);
       // Keep the balance and its exit reserves in the very same EVM call. All probes share existing request slots.
       const balances = extra.map(({ token }) => ({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [UNISWAP_V4_MANAGER] }));
+      if (v3) balances.push({ address: v3.token, abi: erc20Abi, functionName: 'balanceOf', args: [v3.buy.address] });
       const rows = await readChunk([...chunk, ...balances]).catch(() => []);
-      if (rows.length !== 2 + chunk.length + extra.length || !stampedAtHead(rows)) return readChunk(chunk);
+      const coreLength = 2 + chunk.length;
+      const missingV3Tail = v3 && rows.length === coreLength + extra.length;
+      if ((!missingV3Tail && rows.length !== coreLength + balances.length) || !stampedAtHead(rows)) return readChunk(chunk);
       for (const [j, probe] of extra.entries()) {
         const balance = rows[2 + chunk.length + j];
         if (balance.status === 'success' && typeof balance.result === 'bigint') v4Inventory.set(probe.sell, balance.result);
       }
-      return rows.slice(0, 2 + chunk.length);
+      const balance = rows[coreLength + extra.length];
+      if (v3 && balance?.status === 'success' && typeof balance.result === 'bigint') {
+        v3Inventory = { buy: v3.buy, balance: balance.result, chunk: i };
+      }
+      return rows.slice(0, coreLength);
     }));
     const valid = checks.map((check, index) => check.status === 'fulfilled' && check.value.length === 2 + chunks[index].length
       && stampedAtHead(check.value) ? check.value : null);
@@ -721,7 +754,7 @@ export class MevSearcher {
     const results = [...stamped.slice(0, 2), ...valid.flatMap((chunk, i) => chunk?.slice(2) ?? chunks[i].map((): McResult => ({ status: 'failure' })))];
     return {
       blockNumber: head.number, timestamp: Number(head.timestamp), nextBaseFee: nextBaseFee(head), hash: head.hash,
-      tokens, at: reads.at, results, v4Inventory, readMs: Math.round(performance.now() - start), headAgeMs,
+      tokens, at: reads.at, results, v4Inventory, v3Inventory, readMs: Math.round(performance.now() - start), headAgeMs,
       failedChunks: valid.filter((chunk) => chunk === null).length,
     };
   }
@@ -762,6 +795,9 @@ export class MevSearcher {
       ? this.scanPaths(r, ethUsd, minimumNet, screeningFee) : undefined;
     const nextInventory = new Map<string, number>();
     let inventoryPruned = 0;
+    let v3InventoryPruned = 0;
+    const v3Inventory = !historical && !test && this.contractReady && this.liveArmed(generation) && this.beforeNextSlot(r)
+      && validPrice(ethUsd) ? r.v3Inventory : undefined;
     let est: { net: number; gross: number; gas: number; symbol: string } | null = null;
     for (const [ti, t] of r.tokens.entries()) {
       const res = t.pools.map((p, pi) => reservesOf(t, p, r.results, r.at[ti][pi]));
@@ -775,16 +811,19 @@ export class MevSearcher {
           testCandidates.push({ t, A, B, dx: cycle.dx, est: cycle.profit, estimatedNet, gasUnits });
         }
         const aboveScreen = cycle.profit > gasUnits * screeningGasPriceEth * (broadenSizes ? 0.65 : 0.8);
+        const exitIndex = r.at[ti][cycle.sell];
+        const v3InventoryTooLow = aboveScreen && v3Inventory?.buy === A
+          && Math.floor((exitIndex - 2) / POOL_READS_PER_CHUNK) === v3Inventory.chunk
+          && !inventoryCanCoverExitFloor(v3Inventory.balance, B, r.results[exitIndex], t.wethIs0, minimumNet);
         if (!historical && aboveScreen && A.v4 && B.v2 && validPrice(ethUsd)) {
-          const reserveIndex = r.at[ti][cycle.sell];
           const exit = B.address.toLowerCase();
           nextInventory.set(exit, Math.max(estimatedNet, nextInventory.get(exit) ?? -Infinity));
-          if (!inventoryCanCoverV2Floor(r.v4Inventory?.get(B), r.results[reserveIndex], t.wethIs0, minimumNet)) {
+          if (!inventoryCanCoverV2Floor(r.v4Inventory?.get(B), r.results[exitIndex], t.wethIs0, minimumNet)) {
             inventoryPruned++;
             continue;
           }
         }
-        if (!est || estimatedNet > est.net) est = { net: estimatedNet, gross: cycle.profit, gas: gasEth, symbol: t.token.symbol };
+        if (!v3InventoryTooLow && (!est || estimatedNet > est.net)) est = { net: estimatedNet, gross: cycle.profit, gas: gasEth, symbol: t.token.symbol };
         if (!aboveScreen) continue;
         const key = `${poolIdentity(A)}|${poolIdentity(B)}`;
         const cd = this.cooldown.get(key);
@@ -793,6 +832,10 @@ export class MevSearcher {
           const cadenceRetry = broadenSizes && retry?.cadenceAt !== undefined && now >= retry.cadenceAt;
           if (!cadenceRetry && (!retry || (retry.pricedAt !== undefined && screeningFee >= retry.pricedAt)
             || retry.profit - BigInt(retry.gasUnits) * screeningFee < minimumNet)) continue;
+        }
+        if (v3InventoryTooLow) {
+          v3InventoryPruned++;
+          continue;
         }
         const rank = rankRouteNet(cycle.profit, cycle.dx, gasUnits, gasPriceEth,
           historical ? undefined : this.routeQuotes.get(key), now);
@@ -805,7 +848,7 @@ export class MevSearcher {
     }
     this.inventoryExits = new Set([...nextInventory].sort((a, b) => b[1] - a[1])
       .slice(0, MAX_INVENTORY_PROBES).map(([address]) => address));
-    const block = { number: Number(r.blockNumber), at: now, inventoryPruned, candidates: cands.length, readMs: r.readMs, headAgeMs: r.headAgeMs, decisionMs: null as number | null, failedChunks: r.failedChunks };
+    const block = { number: Number(r.blockNumber), at: now, inventoryPruned, v3InventoryPruned, candidates: cands.length, readMs: r.readMs, headAgeMs: r.headAgeMs, decisionMs: null as number | null, failedChunks: r.failedChunks };
     this.lastBlock = block;
     if (est) {
       const hb = this.hourBest();
@@ -1177,6 +1220,14 @@ export class MevSearcher {
     if (!best) {
       if (test) return null;
       const allReverted = sims.every((s) => !s.ok && s.reverted);
+      // A TF can originate at either venue. It only guides a future read of the entry.
+      if (this.contractReady && this.liveArmed(this.armGeneration) && !this.activeGasOnlyTest()
+        && (c.A.kind === NextVenueKind.UniswapV3 || c.A.kind === NextVenueKind.SushiV3 || c.A.kind === NextVenueKind.PancakeV3)
+        && sims.some(s => !s.ok && s.reverted && s.reason === 'TF')) {
+        const buy = poolIdentity(c.A), sell = poolIdentity(c.B);
+        this.v3TransferFailures = [{ token: c.t.token.address, buy, sell, at: Date.now() },
+          ...this.v3TransferFailures.filter(f => f.buy !== buy || f.sell !== sell)].slice(0, MAX_V3_TRANSFER_FAILURES);
+      }
       const structuralFailure = allReverted && sims.every((s) => !s.ok && STRUCTURAL_REVERTS.has(s.reason));
       const previousFailure = this.cooldown.get(key);
       const previousStreak = previousFailure && !estimateChanged(c.est, previousFailure) ? previousFailure.revertStreak ?? 0 : 0;
