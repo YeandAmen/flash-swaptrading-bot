@@ -434,3 +434,167 @@ test('paper worker simulates a path that arrives between polls and a later empty
   assert.deepEqual(f.preparations, ['path', 'path']);
   assert.equal(f.worker.summary.pending, null);
 });
+
+// Hold only the factory reads. Empty discovered markets keep these tests focused on the poll handoff.
+function holdPoolRefresh(f: ReturnType<typeof fixture>, failOracle = false) {
+  const discovery = deferred(), oracleBlocks: bigint[] = [];
+  let factoryReads = 0;
+  const readContract = f.client.readContract;
+  Object.assign(f.client, {
+    readContract: async (request: { functionName: string; blockNumber: bigint }) => {
+      if (request.functionName === 'latestRoundData') {
+        oracleBlocks.push(request.blockNumber);
+        if (failOracle) throw new Error('Oracle unavailable in fixture');
+      }
+      return readContract(request);
+    },
+    multicall: async ({ contracts }: { contracts: { functionName: string }[] }) => {
+      if (contracts[0]?.functionName === 'getPool') {
+        factoryReads++;
+        await discovery.promise;
+        return contracts.map(() => ({ status: 'success', result: zeroAddress }));
+      }
+      assert.ok(contracts.every(row => row.functionName === 'getLiquidity'));
+      return contracts.map(() => ({ status: 'success', result: 0n }));
+    },
+  });
+  Object.assign(f.worker, { refreshAfter: 0, knownPools: new Map() });
+  f.twoSwapReads.resolve();
+  return { discovery, oracleBlocks, factoryReads: () => factoryReads };
+}
+
+test('a fast path rejection survives the periodic pool refresh and the two-swap scan shares the oracle read', async t => {
+  let now = 1_000;
+  t.mock.method(performance, 'now', () => now);
+  const f = fixture(), gate = holdPoolRefresh(f);
+  f.client.getBlock = async () => ({ number: head + 60n, timestamp: BigInt(Math.floor(Date.now() / 1_000)) });
+  f.worker.summary.preparationRejections = { 'stale-quote': 5 };
+  f.foundPaths.resolve();
+  const scan = f.worker.scan();
+  await nextTurn();
+  assert.equal(gate.factoryReads(), 1);
+  assert.equal(f.observations(), 1);
+  assert.deepEqual(gate.oracleBlocks, [head]);
+  assert.equal(f.worker.summary.lastPoolRefresh, null);
+  assert.equal(f.worker.summary.pathBlock, Number(head));
+  assert.equal(f.worker.summary.preparationRejections['stale-quote'], 1);
+  now += 371;
+  gate.discovery.resolve();
+  await scan;
+  await nextTurn();
+  assert.equal(f.observations(), 1, 'the completed path must not start again for the same poll');
+  assert.equal(f.worker.summary.simulated, 1);
+  assert.equal(f.worker.summary.preparationRejections['stale-quote'], 1);
+  assert.equal(f.worker.summary.lastStaleQuote?.sourceBlock, Number(head));
+  assert.deepEqual(gate.oracleBlocks, [head]);
+  assert.deepEqual(f.worker.view().lastPoolRefresh, {
+    block: Number(head), durationMs: 371, pathStartedBeforeRefreshCompleted: true,
+  });
+});
+
+test('a previous path finishing during discovery leaves one chance for the new snapshot after refresh', async () => {
+  const f = fixture();
+  Object.assign(f.worker, { markets: [] });
+  f.client.getBlock = async () => ({ number: 300n, timestamp: BigInt(Math.floor(Date.now() / 1_000)) });
+  f.twoSwapReads.resolve();
+  await f.worker.scan();
+  assert.equal(f.observations(), 1);
+  const gate = holdPoolRefresh(f);
+  f.client.getBlockNumber = async () => head + 1n;
+  const next = f.worker.scan();
+  await nextTurn();
+  assert.equal(gate.factoryReads(), 1);
+  assert.equal(f.observations(), 1);
+  assert.deepEqual(gate.oracleBlocks, []);
+  f.foundPaths.resolve();
+  await nextTurn();
+  gate.discovery.resolve();
+  await next;
+  await nextTurn();
+  assert.equal(f.observations(), 2);
+  assert.equal(f.worker.summary.pathBlock, Number(head + 1n));
+  assert.equal(f.worker.summary.lastPoolRefresh?.pathStartedBeforeRefreshCompleted, false);
+  assert.deepEqual(gate.oracleBlocks, [head + 1n]);
+});
+
+test('manual requests and pending transactions take precedence before and during a refresh', async () => {
+  for (const timing of ['before', 'during']) for (const state of ['manual', 'pending']) {
+    const f = fixture(), gate = holdPoolRefresh(f);
+    Object.assign(f.worker, { reconcile: async () => {} });
+    const setState = () => {
+      if (state === 'pending') f.journal.pending = { hash: '0x1234' };
+      else f.journal.test = { id: 'manual-test', status: 'queued', expiresAt: Date.now() + 60_000,
+        checked: 0, minimumNetUsd: 0.05 };
+    };
+    if (timing === 'before') setState();
+    const scan = f.worker.scan();
+    await nextTurn();
+    assert.equal(gate.factoryReads(), 1);
+    assert.equal(f.observations(), timing === 'before' ? 0 : 1);
+    if (timing === 'during') setState();
+    f.foundPaths.resolve();
+    await nextTurn();
+    gate.discovery.resolve();
+    await scan;
+    await nextTurn();
+    assert.equal(f.observations(), timing === 'before' ? 0 : 1);
+    assert.deepEqual(f.preparations, []);
+    assert.equal(f.worker.summary.simulated, 0);
+    assert.equal(f.worker.summary.lastPoolRefresh?.pathStartedBeforeRefreshCompleted, timing === 'during');
+    assert.deepEqual(gate.oracleBlocks, [head]);
+    if (state === 'manual') assert.equal(Reflect.get(f.worker, 'regularScans'), 0, 'manual selection preserves ordinary sizing rotation');
+  }
+});
+
+test('unreviewed paper observations keep their one-in-ten cadence through a due refresh', async () => {
+  for (const index of [0, 1, 2, 10, 11]) {
+    const f = fixture(), gate = holdPoolRefresh(f);
+    Object.assign(f.worker, { regularScans: index, journal: null });
+    Object.assign(f.deployment, { releaseHash: null, verified: false });
+    f.worker.summary.mode = 'paper';
+    f.foundPaths.resolve();
+    const scan = f.worker.scan();
+    await nextTurn();
+    const scheduled = index % 10 === 1;
+    assert.equal(f.observations(), Number(scheduled), 'regular scan index ' + index);
+    assert.deepEqual(gate.oracleBlocks, scheduled ? [head] : []);
+    gate.discovery.resolve();
+    await scan;
+    await nextTurn();
+    assert.equal(f.observations(), Number(scheduled));
+    assert.deepEqual(f.preparations, []);
+    assert.deepEqual(gate.oracleBlocks, [head]);
+    assert.equal(f.worker.summary.lastPoolRefresh?.pathStartedBeforeRefreshCompleted, scheduled);
+  }
+});
+
+test('a stopped generation cannot publish a delayed path or refresh after restart', async () => {
+  const f = fixture(), gate = holdPoolRefresh(f);
+  const scan = f.worker.scan();
+  await nextTurn();
+  assert.equal(f.observations(), 1);
+  f.worker.stop();
+  Object.assign(f.worker, { active: true });
+  f.foundPaths.resolve();
+  gate.discovery.resolve();
+  await scan;
+  await nextTurn();
+  assert.equal(f.worker.summary.pathBlock, 0);
+  assert.equal(f.worker.summary.lastPoolRefresh, null);
+  assert.equal(f.worker.summary.block, 0);
+  assert.deepEqual(f.preparations, []);
+});
+
+test('a rejected shared price is observed during discovery and remains the two-swap poll error', async () => {
+  const f = fixture(), gate = holdPoolRefresh(f, true);
+  f.foundPaths.resolve();
+  const rejection = assert.rejects(f.worker.scan(), /Oracle unavailable in fixture/);
+  await nextTurn();
+  assert.match(f.worker.summary.pathStatus, /quotes unavailable/);
+  assert.deepEqual(gate.oracleBlocks, [head]);
+  gate.discovery.resolve();
+  await rejection;
+  assert.deepEqual(gate.oracleBlocks, [head]);
+  assert.equal(f.observations(), 1);
+  assert.deepEqual(f.preparations, []);
+});

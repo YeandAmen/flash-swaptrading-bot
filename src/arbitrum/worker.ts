@@ -138,6 +138,7 @@ export class ArbitrumWorker {
     canArm: this.enabled && this.executionEnabled,
     status: this.enabled ? 'Starting' : 'Disabled',
     block: 0, pools: 0, routes: 0, simulated: 0, updatedAt: 0, netEstimateUsd: null as number | null,
+    lastPoolRefresh: null as { block: number; durationMs: number; pathStartedBeforeRefreshCompleted: boolean } | null,
     prunedRoutes: 0, prunedAfterBuy: 0, unavailableLegs: 0, quoteRecovery: emptyArbitrumQuoteRecovery(),
     quoteRecoveryTotals: { scans: 0, ...emptyArbitrumQuoteRecovery() },
     pathRoutes: 0, pathStatus: 'Awaiting implementation verification',
@@ -251,14 +252,17 @@ export class ArbitrumWorker {
 
   // Market observations do not delay two-swap quotes. Only the reviewed
   // release can hand its own recent observation to the live signing gate.
-  private observePaths(block: bigint, price: Promise<number>, generation: number) {
-    if (this.readingPaths) return;
-    this.readingPaths = true;
+  private observePaths(block: bigint, readPrice: () => Promise<number>, generation: number, regularScan: number) {
     const release = this.deployment.releaseHash;
     const executable = this.deployment.verified && arbitrumSupportsPaths(release);
+    const current = () => this.active && generation === this.sendGeneration && this.deployment.releaseHash === release;
+    if (!current() || this.readingPaths || this.journal?.pending || activeFlashTest(this.journal?.test)
+      || (!executable && regularScan % 10 !== 1)) return false;
+    this.readingPaths = true;
+    const price = readPrice();
     const mode = executable ? 'Multi-hop' : 'Multi-hop observation (upgrade required)';
     void Promise.all([price, this.scanPaths(this.client, block, price, MEV.maxLoanUsd, minNetUsd)]).then(async ([usd, result]) => {
-      if (!this.active || this.deployment.releaseHash !== release) return;
+      if (!current()) return;
       this.summary.pathBlock = Number(block);
       this.summary.pathRoutes = result.quotedRoutes;
       this.summary.pathPools = result.pools;
@@ -274,11 +278,13 @@ export class ArbitrumWorker {
           .catch(() => this.scanError('Arbitrum multi-hop order preparation failed'));
       }
     }).catch(() => {
+      if (!current()) return;
       this.summary.pathBlock = Number(block);
       this.summary.pathBest = null;
       this.summary.pathRefinement = null;
       this.summary.pathStatus = `${mode}: quotes unavailable`;
     }).finally(() => { this.readingPaths = false; });
+    return true;
   }
 
   async scan() {
@@ -303,8 +309,21 @@ export class ArbitrumWorker {
     const header = this.quoteReaders && !activeFlashTest(this.journal?.test) ? await this.client.getBlock().catch(() => null) : null;
     const block = header?.number ?? await this.client.getBlockNumber({ cacheTime: 0 });
     const recovery = header?.hash && this.quoteReaders ? { ...this.quoteReaders, blockHash: header.hash } : undefined;
+    if (!this.active || generation !== this.sendGeneration) return;
+    this.summary.simulated = 0;
+    this.summary.netEstimateUsd = null;
+    this.summary.preparationRejections = {};
+    let price: Promise<number> | undefined;
+    const readPrice = () => price ??= arbitrumEthUsd(this.client, block);
+    let earlyPathStarted = false;
     if (Date.now() >= this.refreshAfter) {
-      const discovery = await refreshArbitrumPools(this.client, block, this.knownPools);
+      const startedAt = performance.now();
+      const refreshing = refreshArbitrumPools(this.client, block, this.knownPools);
+      earlyPathStarted = this.observePaths(block, readPrice, generation, this.regularScans);
+      const discovery = await refreshing;
+      if (!this.active || generation !== this.sendGeneration) return;
+      this.summary.lastPoolRefresh = { block: Number(block), durationMs: Math.round(performance.now() - startedAt),
+        pathStartedBeforeRefreshCompleted: earlyPathStarted };
       this.knownPools = discovery.knownPools;
       this.markets = discovery.markets;
       this.refreshAfter = Date.now() + (discovery.complete && this.markets.length ? 5 * 60_000 : 30_000);
@@ -312,14 +331,11 @@ export class ArbitrumWorker {
     }
     const selectedTest = this.journal?.test;
     const test = this.summary.mode === 'live' && !this.journal?.pending && activeFlashTest(selectedTest) ? selectedTest : null;
-    this.summary.simulated = 0;
-    this.summary.netEstimateUsd = null;
-    this.summary.preparationRejections = {};
     if (test && test.minimumNetUsd === undefined && this.summary.executor) {
       const leads = arbitrumTestLeads(this.markets, block);
       if (leads.length) {
         test.checked += leads.length;
-        const ethUsd = await arbitrumEthUsd(this.client, block);
+        const ethUsd = await readPrice();
         if (await this.queueOrders(leads, ethUsd, test, generation, this.deployment.releaseHash, block)) return;
       }
     }
@@ -327,13 +343,10 @@ export class ArbitrumWorker {
     const extraSize = regularScan === undefined ? undefined : arbitrumProbeSize(regularScan, this.sizingLead, Date.now(), MEV.maxLoanUsd);
     // Audit a different slice each regular scan while always quoting possible or unknown-price routes.
     const screenRoundTrips = regularScan === undefined ? false : { auditScan: regularScan };
-    const price = arbitrumEthUsd(this.client, block);
-    const supportsPaths = this.deployment.verified && arbitrumSupportsPaths(this.deployment.releaseHash);
-    if (regularScan !== undefined && !this.journal?.pending && (supportsPaths || regularScan % 10 === 1)) {
-      this.observePaths(block, price, generation);
-    }
+    // A previous block's path scan may have finished while discovery was in flight.
+    if (!earlyPathStarted && regularScan !== undefined) this.observePaths(block, readPrice, generation, regularScan);
     const result = await scanArbitrum(this.client, block, this.markets,
-      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize, MEV.maxLoanUsd, screenRoundTrips, price, recovery);
+      test?.minimumNetUsd !== undefined ? test.minimumLoanUsd ?? 0 : !!test, extraSize, MEV.maxLoanUsd, screenRoundTrips, readPrice(), recovery);
     const candidates = result.opportunities;
     if (test) test.checked += result.quotedRoutes;
     else this.sizingLead = result.sizingAmount === undefined ? null : { amount: result.sizingAmount, at: quoteAt };
