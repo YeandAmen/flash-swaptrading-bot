@@ -48,6 +48,18 @@ func AmountOut(amount, in, out *big.Int, fee uint32) (*big.Int, error) {
 // AmountOut; no fictitious extra lender premium is charged.
 func Rank(pools []Pool, sizes []*big.Int, gasBudget, minimumNet *big.Int, bufferBPS uint32) []Candidate {
 	result := make([]Candidate, 0)
+	for _, quote := range Evaluate(pools, sizes, gasBudget, minimumNet, bufferBPS) {
+		if quote.Status == "quote_only" {
+			result = append(result, quote)
+		}
+	}
+	return result
+}
+
+// Evaluate includes rejected quotes so a zero-opportunity scan can explain its
+// economics. Rejected quotes must never be treated as execution candidates.
+func Evaluate(pools []Pool, sizes []*big.Int, gasBudget, minimumNet *big.Int, bufferBPS uint32) []Candidate {
+	result := make([]Candidate, 0)
 	if gasBudget == nil || minimumNet == nil || gasBudget.Sign() < 0 || minimumNet.Sign() <= 0 || bufferBPS >= 10_000 {
 		return result
 	}
@@ -68,10 +80,11 @@ func Rank(pools []Pool, sizes []*big.Int, gasBudget, minimumNet *big.Int, buffer
 				gross := new(big.Int).Sub(output, size)
 				guarded := new(big.Int).Div(new(big.Int).Mul(output, big.NewInt(int64(10_000-bufferBPS))), big.NewInt(10_000))
 				net := new(big.Int).Sub(new(big.Int).Sub(guarded, size), gasBudget)
+				status := "quote_only"
 				if net.Cmp(minimumNet) < 0 {
-					continue
+					status = "below_profit_floor"
 				}
-				result = append(result, Candidate{buy.Token, buy, sell, size.String(), output.String(), gross.String(), gasBudget.String(), net.String(), "quote_only"})
+				result = append(result, Candidate{buy.Token, buy, sell, size.String(), output.String(), gross.String(), gasBudget.String(), net.String(), status})
 			}
 		}
 	}

@@ -122,6 +122,10 @@ A real paid provider call requires your configured key and available credits.
 
 ## Verify
 
+For actual mainnet pool replay and measured live observation, see
+[REAL_STATE_TESTING.md](REAL_STATE_TESTING.md). These tests distinguish untouched
+mainnet quotes from a controlled spread created only on a local fork.
+
 ```sh
 python3 scripts/check-artifacts.py
 go vet ./...

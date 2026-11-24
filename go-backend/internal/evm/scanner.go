@@ -28,16 +28,23 @@ var venues = []venue{
 }
 
 type Report struct {
-	Mode        string             `json:"mode"`
-	ChainID     uint64             `json:"chain_id"`
-	Block       uint64             `json:"block"`
-	Hash        common.Hash        `json:"block_hash"`
-	BlockTime   time.Time          `json:"block_time"`
-	ScannedAt   time.Time          `json:"scanned_at"`
-	Pools       int                `json:"pools"`
-	Warnings    []string           `json:"warnings"`
-	Candidates  []market.Candidate `json:"candidates"`
-	Simulations []Simulation       `json:"simulations"`
+	ReadMode        string             `json:"read_mode"`
+	BatchRequests   int                `json:"batch_requests"`
+	Mode            string             `json:"mode"`
+	ChainID         uint64             `json:"chain_id"`
+	Block           uint64             `json:"block"`
+	Hash            common.Hash        `json:"block_hash"`
+	BlockTime       time.Time          `json:"block_time"`
+	ScannedAt       time.Time          `json:"scanned_at"`
+	Pools           int                `json:"pools"`
+	Warnings        []string           `json:"warnings"`
+	Candidates      []market.Candidate `json:"candidates"`
+	Simulations     []Simulation       `json:"simulations"`
+	QuotesEvaluated int                `json:"quotes_evaluated"`
+	BestQuote       *market.Candidate  `json:"best_quote,omitempty"`
+	BestGrossQuote  *market.Candidate  `json:"best_gross_quote,omitempty"`
+	ScanDurationMS  int64              `json:"scan_duration_ms"`
+	MinimumNetWei   string             `json:"minimum_net_wei"`
 }
 
 type Scanner struct {
@@ -61,33 +68,53 @@ func (s *Scanner) Scan(ctx context.Context) (Report, error) {
 	}
 	r = Report{Mode: "paper", ChainID: 1, Block: h.Number.Uint64(), Hash: h.Hash(), BlockTime: time.Unix(int64(h.Time), 0).UTC(), ScannedAt: now, Warnings: []string{}, Candidates: []market.Candidate{}, Simulations: []Simulation{}}
 	var pools []market.Pool
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 4)
-	for _, token := range s.Config.Tokens {
-		for _, v := range venues {
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				wg.Wait()
+	r.ReadMode = "bounded_individual"
+	batched := false
+	if provider, ok := s.Chain.(rpcProvider); ok {
+		p, warning, count, e := s.batchPools(ctx, provider.Client(), r.Hash)
+		r.BatchRequests = count
+		if e == nil {
+			pools = p
+			r.Warnings = warning
+			r.ReadMode = "batch"
+			batched = true
+		} else {
+			if ctx.Err() != nil {
 				return Report{}, ctx.Err()
 			}
-			wg.Add(1)
-			go func(token common.Address, v venue) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				p, exists, e := s.pool(ctx, token, v, r.Hash)
-				mu.Lock()
-				defer mu.Unlock()
-				if e != nil {
-					r.Warnings = append(r.Warnings, fmt.Sprintf("%s %s: pool unavailable or invalid", v.Name, token.Hex()))
-				} else if exists {
-					pools = append(pools, p)
-				}
-			}(token, v)
+			r.ReadMode = "bounded_individual_fallback"
+			r.Warnings = append(r.Warnings, "Batch transport unavailable; using bounded individual reads")
 		}
 	}
-	wg.Wait()
+	if !batched {
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 4)
+		for _, token := range s.Config.Tokens {
+			for _, v := range venues {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					wg.Wait()
+					return Report{}, ctx.Err()
+				}
+				wg.Add(1)
+				go func(token common.Address, v venue) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					p, exists, e := s.pool(ctx, token, v, r.Hash)
+					mu.Lock()
+					defer mu.Unlock()
+					if e != nil {
+						r.Warnings = append(r.Warnings, fmt.Sprintf("%s %s: pool unavailable or invalid", v.Name, token.Hex()))
+					} else if exists {
+						pools = append(pools, p)
+					}
+				}(token, v)
+			}
+		}
+		wg.Wait()
+	}
 	if ctx.Err() != nil {
 		return Report{}, ctx.Err()
 	}
@@ -99,7 +126,31 @@ func (s *Scanner) Scan(ctx context.Context) (Report, error) {
 	sort.Strings(r.Warnings)
 	feeCap := new(big.Int).Add(new(big.Int).Mul(h.BaseFee, big.NewInt(2)), s.Config.PriorityWei)
 	budget := new(big.Int).Mul(feeCap, new(big.Int).SetUint64(s.Config.GasUnits))
-	r.Candidates = market.Rank(pools, s.Config.Sizes, budget, s.Config.MinimumNet, s.Config.BufferBPS)
+	quotes := market.Evaluate(pools, s.Config.Sizes, budget, s.Config.MinimumNet, s.Config.BufferBPS)
+	r.QuotesEvaluated = len(quotes)
+	r.MinimumNetWei = s.Config.MinimumNet.String()
+	if len(quotes) > 0 {
+		best := quotes[0]
+		r.BestQuote = &best
+	}
+	for _, quote := range quotes {
+		gross, _ := new(big.Int).SetString(quote.GrossWei, 10)
+		if r.BestGrossQuote == nil {
+			v := quote
+			r.BestGrossQuote = &v
+		} else {
+			best, _ := new(big.Int).SetString(r.BestGrossQuote.GrossWei, 10)
+			if gross.Cmp(best) > 0 {
+				v := quote
+				r.BestGrossQuote = &v
+			}
+		}
+	}
+	for _, quote := range quotes {
+		if quote.Status == "quote_only" {
+			r.Candidates = append(r.Candidates, quote)
+		}
+	}
 	if len(r.Candidates) > 10 {
 		r.Candidates = r.Candidates[:10]
 	}
@@ -122,6 +173,7 @@ func (s *Scanner) Scan(ctx context.Context) (Report, error) {
 		return Report{}, errors.New("snapshot block changed during scan; discarding results")
 	}
 	r.ScannedAt = time.Now().UTC()
+	r.ScanDurationMS = time.Since(now).Milliseconds()
 	return r, nil
 }
 

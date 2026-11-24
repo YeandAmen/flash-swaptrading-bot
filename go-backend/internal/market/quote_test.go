@@ -68,3 +68,15 @@ func FuzzAmountOutInvariant(f *testing.F) {
 		}
 	})
 }
+
+func TestRejectedQuoteDiagnosticsCannotEnterRank(t *testing.T) {
+	token := common.HexToAddress("0x10")
+	p := []Pool{{Address: common.HexToAddress("0x20"), Token: token, Fee: 3000, WETH: big.NewInt(1000000), Tokens: big.NewInt(2000000)}, {Address: common.HexToAddress("0x30"), Token: token, Fee: 3000, WETH: big.NewInt(1000000), Tokens: big.NewInt(2000000)}}
+	quotes := Evaluate(p, []*big.Int{big.NewInt(10000)}, big.NewInt(100), big.NewInt(1), 50)
+	if len(quotes) != 2 || quotes[0].Status != "below_profit_floor" {
+		t.Fatal("rejection economics missing")
+	}
+	if len(Rank(p, []*big.Int{big.NewInt(10000)}, big.NewInt(100), big.NewInt(1), 50)) != 0 {
+		t.Fatal("diagnostic quote admitted for execution")
+	}
+}
