@@ -1,5 +1,13 @@
 # ETH Token Bot
 
+**Go migration:** This fork adds an independently runnable Go backend in
+[`go-backend/`](go-backend/README.md), with Ethereum V2 pool scanning, retained
+Solidity proxy simulation, guarded Ethereum V2 live execution, and an optional
+DeepSeek analyst through OpenRouter. Live mode is disabled by default and always
+starts disarmed. The original TypeScript application documented below remains
+available for other networks and venues. See the Go guide for explicit limits,
+wallet setup, execution controls and migration scope.
+
 This Node.js bot runs Ethereum spot strategies and scans for flash-loan arbitrage on Ethereum, Arbitrum and Solana. It runs on macOS, Linux and Windows. The Ethereum spot engine supports momentum rules or a calibrated ML model. Each arbitrage worker checks loan repayment, fees and expected proceeds before submitting a trade.
 
 Each network on the dashboard shows its last confirmed profitable automatic trade and links to the transaction. This record starts with automatic orders submitted by a release that tracks their origin and survives restarts. Manual tests appear in the activity history and count toward the Ethereum submission totals. A failed simulation is an off-chain evaluation.

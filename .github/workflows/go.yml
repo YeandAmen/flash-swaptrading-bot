@@ -1,0 +1,38 @@
+name: Go backend
+on:
+  push:
+    branches: [main, 'feature/go-backend']
+    paths: ['go-backend/**', '.github/workflows/go.yml', 'src/mev/artifact-*.ts']
+  pull_request:
+    paths: ['go-backend/**', '.github/workflows/go.yml', 'src/mev/artifact-*.ts']
+permissions:
+  contents: read
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-backend/go.mod
+          cache-dependency-path: go-backend/go.sum
+      - run: python3 scripts/check-artifacts.py
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race -cover ./...
+      - run: go build ./cmd/bot
+      - run: go build -o bin/wallet ./cmd/wallet
+      - run: go run ./cmd/bot --demo --once
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf
+        with:
+          version: v1.5.1
+      - name: Install checksum-pinned Solidity compiler for mock fixtures
+        run: |
+          curl --fail --silent --show-error --location 'https://raw.githubusercontent.com/ethereum/solc-bin/gh-pages/linux-amd64/solc-linux-amd64-v0.8.30+commit.73712a01' --output "$RUNNER_TEMP/solc"
+          echo "f3e987dc6ecebd4bd350c48edcbc320b46cf9e3109bd3fc3d88f1acaf4c428f7  $RUNNER_TEMP/solc" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/solc"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: python3 scripts/integration.py
