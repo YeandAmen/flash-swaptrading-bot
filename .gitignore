@@ -11,3 +11,5 @@ go-backend/bot
 go-backend/coverage.out
 *.test
 .secrets/
+*.password
+*.keystore

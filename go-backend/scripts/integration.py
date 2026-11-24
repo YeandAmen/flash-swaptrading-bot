@@ -52,6 +52,9 @@ with tempfile.TemporaryDirectory(prefix="flash-go-integration-") as directory:
             subprocess.run([
                 "go", "test", "-race", "./internal/evm", "-run", "TestAnvil", "-count=1", "-v",
             ], cwd=root, env=env, check=True)
+            subprocess.run([
+                "go", "test", "-race", "./internal/live", "-run", "TestAnvil", "-count=1", "-v",
+            ], cwd=root, env=env, check=True)
         finally:
             process.terminate()
             try:

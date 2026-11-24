@@ -17,8 +17,10 @@ import (
 	"github.com/YeandAmen/flash-swaptrading-bot/go-backend/internal/config"
 	"github.com/YeandAmen/flash-swaptrading-bot/go-backend/internal/evm"
 	"github.com/YeandAmen/flash-swaptrading-bot/go-backend/internal/httpapi"
+	"github.com/YeandAmen/flash-swaptrading-bot/go-backend/internal/live"
 	"github.com/YeandAmen/flash-swaptrading-bot/go-backend/internal/market"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 func main() {
@@ -41,9 +43,13 @@ func run() error {
 	if e != nil {
 		return e
 	}
+	if *demo && cfg.Live.Allowed {
+		return fmt.Errorf("demo mode cannot enable live execution")
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	var scan func(context.Context) (evm.Report, error)
+	var reader *ethclient.Client
 	if *demo {
 		scan = func(context.Context) (evm.Report, error) { return demoReport(cfg), nil }
 	} else {
@@ -54,6 +60,7 @@ func run() error {
 			return e
 		}
 		defer client.Close()
+		reader = client
 		scanner := &evm.Scanner{Chain: client, Config: cfg}
 		scan = scanner.Scan
 	}
@@ -70,10 +77,35 @@ func run() error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(r)
 	}
+	var executor *live.Executor
+	var sendClient *ethclient.Client
+	if cfg.Live.Allowed {
+		signer, e := live.LoadSigner(cfg)
+		if e != nil {
+			return e
+		}
+		setup, stop := context.WithTimeout(ctx, 20*time.Second)
+		sendClient, e = ethclient.DialContext(setup, cfg.Live.SendRPC)
+		if e != nil {
+			stop()
+			return fmt.Errorf("cannot connect to submission RPC")
+		}
+		defer sendClient.Close()
+		executor, e = live.New(setup, reader, sendClient, signer, cfg)
+		stop()
+		if e != nil {
+			return e
+		}
+	}
 	ai := advisor.New(cfg.APIKey, cfg.Model)
-	server := &http.Server{Addr: cfg.Listen, Handler: httpapi.New(cfg.Listen, state, ai), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 55 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	server := &http.Server{Addr: cfg.Listen, Handler: httpapi.New(cfg.Listen, state, ai, executor), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 55 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	workerDone := make(chan struct{})
 	go func() {
+		defer close(workerDone)
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			r, e := cycle()
 			if e != nil {
 				state.Fail()
@@ -81,6 +113,17 @@ func run() error {
 			} else {
 				state.Publish(r)
 				log.Printf("%s block=%d pools=%d candidates=%d simulations=%d", r.Mode, r.Block, r.Pools, len(r.Candidates), len(r.Simulations))
+			}
+			if executor != nil {
+				liveCtx, stop := context.WithTimeout(ctx, 45*time.Second)
+				var report *evm.Report
+				if e == nil {
+					report = &r
+				}
+				if executor.Tick(liveCtx, report) != nil {
+					log.Print("live evaluation stopped or deferred; inspect execution status")
+				}
+				stop()
 			}
 			timer := time.NewTimer(cfg.Interval)
 			select {
@@ -91,13 +134,20 @@ func run() error {
 			}
 		}
 	}()
+	defer func() {
+		cancel()
+		<-workerDone
+		if executor != nil {
+			executor.Close()
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		shutdown, stop := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stop()
 		_ = server.Shutdown(shutdown)
 	}()
-	fmt.Printf("Go paper backend: http://%s (model enabled: %t)\n", cfg.Listen, ai.Enabled())
+	fmt.Printf("Go backend: http://%s (model enabled: %t; live configured: %t; starts disarmed)\n", cfg.Listen, ai.Enabled(), executor != nil)
 	if e := server.ListenAndServe(); e != nil && e != http.ErrServerClosed {
 		return e
 	}

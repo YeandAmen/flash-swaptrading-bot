@@ -1,15 +1,16 @@
-# Go paper backend
+# Go trading backend
 
-This fork's first Go migration stage scans Ethereum V2 pools, ranks paper
+This fork's Go backend scans Ethereum V2 pools, ranks paper
 arbitrage estimates, and optionally simulates the retained Solidity proxy.
 An optional DeepSeek analyst explains reports through OpenRouter. All Solidity
 files and the original TypeScript application are retained unchanged.
 
-**This is a tested foundation, not a complete replacement for the original bot.**
-There is no Go wallet, signer, mainnet transaction broadcast, deployment, contract
-upgrade, spot execution, Arbitrum worker or Solana worker in this release.
-`ALLOW_LIVE_TRADING=on` is rejected, including when inherited from an existing
-TypeScript service environment. No private trading key is needed.
+Optional live Ethereum V2 execution now includes encrypted-wallet signing,
+gas limits, pending-state simulation, a durable nonce journal and receipt-based
+settlement. **Live mode is off by default and always starts disarmed.** Read
+[LIVE_TRADING.md](LIVE_TRADING.md) before configuring it. Paper scans need no
+wallet or funds. Deployment, upgrades, spot execution, Arbitrum and Solana still
+use the original backend; this is not full feature parity with the original bot.
 
 ## Run without credentials
 
@@ -60,6 +61,9 @@ capture transfer-tax tokens and other unusual token behavior. Routes remain
 | `GET /api/ready` | Fresh successful mainnet scan; never enables signing |
 | `GET /api/state` | Latest immutable in-memory report and freshness |
 | `POST /api/analyze` | Optional paid, user-triggered model explanation |
+| `POST /api/live/arm` | Explicit arming, only when live settings and signer are configured |
+| `POST /api/live/disarm` | Stop future signing/submissions; continue pending reconciliation |
+| `POST /api/live/acknowledge` | Acknowledge a reviewed settled fault without resetting spend |
 
 The service binds only to a loopback IP and checks Host and mutation Origin
 headers. It is a local operator tool; do not expose it through a public proxy.
@@ -77,10 +81,11 @@ three shortlisted candidates the scanner verifies, at the snapshot block:
    tip and a minimum profit covering the entire gas budget plus `MIN_NET_WEI`.
 
 The order uses BuyPool funding and expires at the snapshot block, because this
-is a historical-state simulation. It is not signed or sent. A future live
-implementation will need fresh/pending-state checks, fee estimation, transaction
-journaling and settlement reconciliation before signing. Contracts using other
-logic releases are rejected by this release's simulator.
+is a historical-state simulation. It is not signed or sent by the scanner.
+The optional live executor separately repeats verification, estimates and pads
+gas, simulates final calldata at the snapshot and pending state, checks current
+head/nonce/balance and journals a signed next-block order before submission.
+Contracts using other logic releases are rejected.
 
 ## Add DeepSeek through OpenRouter
 
@@ -135,22 +140,29 @@ It starts an isolated, unforked chain 31337 on a temporary loopback port, instal
 mock token/pool infrastructure, deploys the actual retained proxy and Logic V4
 bytecode, and compares a Go quote with a full Solidity flash-swap simulation.
 It also checks rejection of an excessive profit floor and that simulation does
-not persist pool changes. No mainnet RPC, saved wallet or real funds are used.
+not persist pool changes. A second test signs, submits and mines an actual local
+arbitrage transaction, compares the wallet's ETH increase to recorded net after
+gas, and checks disarmed restart recovery. No mainnet RPC, saved wallet or real
+funds are used.
 Fixtures do not reproduce all mainnet token, pool, liquidity or MEV behavior.
 
 Tests cover quote rounding/invariants, fees, negative economics, configuration
 guards, block pinning, reorg rejection, stale data, ownership, runtime checks,
 model cooldown/errors and HTTP access controls. CI runs the standard Go checks
 and the isolated Anvil integration with a checksum-pinned Solidity compiler.
+Live tests cover durable pre-send reservations, duplicate prevention, uncertain
+send recovery, identical-byte retries, expired nonce holds, confirmations,
+reorganized receipts, unverified payouts, gas losses, limits, keystore policy
+and an emergency stop during an in-flight submission.
 
 ## Migration stages
 
 | Capability | This release | Further work |
 | --- | --- | --- |
 | Ethereum V2 paper scanning | Implemented | Broader tokens and benchmark against original |
-| Retained Solidity proxy simulation | Implemented for Logic V4 | Pending-state and more funding sources |
+| Retained Solidity proxy simulation | Implemented for Logic V4 | More funding sources |
 | DeepSeek report analyst | Implemented, optional | Evaluate usefulness against labelled outcomes |
-| Live signing and settlement | Unavailable | Isolated signer, journals, nonce handling, gas limits |
+| Ethereum V2 live signing and settlement | Implemented; off and disarmed by default | Relay inclusion measurement, operator cancellation tooling |
 | V3/V4, Curve, Aero pools | Original backend only | Port protocol math and quote/execution parity tests |
 | Spot strategy and statistical ML | Original backend only | Independent strategy migration and validation |
 | Arbitrum and Solana | Original backend only | Dedicated network adapters and integration tests |

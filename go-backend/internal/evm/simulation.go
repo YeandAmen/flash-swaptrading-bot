@@ -64,6 +64,35 @@ func EncodeOrder(c market.Candidate, minimumNet *big.Int, block uint64) ([]byte,
 // signs, broadcasts, deploys or upgrades a contract. Gas is capped to the budget.
 func Simulate(ctx context.Context, chain Chain, cfg config.Config, c market.Candidate, hash common.Hash, block uint64) (Simulation, error) {
 	var result Simulation
+	implHash, e := VerifyDeployment(ctx, chain, cfg, hash)
+	if e != nil {
+		return result, e
+	}
+	data, e := EncodePinned(c, cfg.MinimumNet, block)
+	if e != nil {
+		return result, e
+	}
+	out, e := chain.CallContractAtHash(ctx, ethereum.CallMsg{From: cfg.Owner, To: &cfg.Proxy, Data: data, Gas: cfg.GasUnits}, hash)
+	if e != nil {
+		return result, errors.New("full executor simulation reverted or RPC failed")
+	}
+	profit, e := DecodeProfit(out)
+	if e != nil {
+		return result, e
+	}
+	budget, ok := new(big.Int).SetString(c.GasBudgetWei, 10)
+	if !ok {
+		return result, errors.New("invalid budget")
+	}
+	floor := new(big.Int).Add(budget, cfg.MinimumNet)
+	if profit.Cmp(floor) < 0 {
+		return result, errors.New("simulation did not meet gas and profit floor")
+	}
+	return Simulation{Status: "simulation_passed", ProfitWei: profit.String(), NetFloorWei: cfg.MinimumNet.String(), ImplementationHash: implHash}, nil
+}
+
+func VerifyDeployment(ctx context.Context, chain Chain, cfg config.Config, hash common.Hash) (common.Hash, error) {
+	var result common.Hash
 	proxy, e := artifacts.Load("proxy")
 	if e != nil {
 		return result, e
@@ -94,31 +123,33 @@ func Simulate(ctx context.Context, chain Chain, cfg config.Config, c market.Cand
 	if e != nil || len(owner) != 32 || common.BytesToAddress(owner) != cfg.Owner {
 		return result, errors.New("proxy owner mismatch")
 	}
-	data, e := EncodeOrder(c, cfg.MinimumNet, block)
+	return crypto.Keccak256Hash(logic.Runtime), nil
+}
+
+func EncodePinned(c market.Candidate, minimumNet *big.Int, block uint64) ([]byte, error) {
+	proxy, e := artifacts.Load("proxy")
 	if e != nil {
-		return result, e
+		return nil, e
 	}
-	implHash := crypto.Keccak256Hash(logic.Runtime)
-	data, e = proxy.ABI.Pack("executePinned", implHash, data)
+	logic, e := artifacts.Load("logic-v4")
 	if e != nil {
-		return result, e
+		return nil, e
 	}
-	out, e := chain.CallContractAtHash(ctx, ethereum.CallMsg{From: cfg.Owner, To: &cfg.Proxy, Data: data, Gas: cfg.GasUnits}, hash)
+	data, e := EncodeOrder(c, minimumNet, block)
 	if e != nil {
-		return result, errors.New("full executor simulation reverted or RPC failed")
+		return nil, e
+	}
+	return proxy.ABI.Pack("executePinned", crypto.Keccak256Hash(logic.Runtime), data)
+}
+
+func DecodeProfit(out []byte) (*big.Int, error) {
+	proxy, e := artifacts.Load("proxy")
+	if e != nil {
+		return nil, e
 	}
 	values, e := proxy.ABI.Unpack("executePinned", out)
-	if e != nil {
-		return result, errors.New("invalid executor response")
+	if e != nil || len(values) != 1 {
+		return nil, errors.New("invalid executor response")
 	}
-	profit := values[0].(*big.Int)
-	budget, ok := new(big.Int).SetString(c.GasBudgetWei, 10)
-	if !ok {
-		return result, errors.New("invalid budget")
-	}
-	floor := new(big.Int).Add(budget, cfg.MinimumNet)
-	if profit.Cmp(floor) < 0 {
-		return result, errors.New("simulation did not meet gas and profit floor")
-	}
-	return Simulation{Status: "simulation_passed", ProfitWei: profit.String(), NetFloorWei: cfg.MinimumNet.String(), ImplementationHash: implHash}, nil
+	return values[0].(*big.Int), nil
 }

@@ -28,14 +28,12 @@ type Config struct {
 	Owner       common.Address
 	Model       string
 	APIKey      string
+	Live        Live
 }
 
 func Load() (Config, error) { return Parse(os.Getenv) }
 
 func Parse(env func(string) string) (c Config, err error) {
-	if v := env("ALLOW_LIVE_TRADING"); v != "" && v != "off" {
-		return c, errors.New("this Go release supports paper mode only; ALLOW_LIVE_TRADING must be off")
-	}
 	c.RPC = env("RPC_URL")
 	u, e := url.Parse(c.RPC)
 	if e != nil || u.Host == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "https" && !(u.Scheme == "http" && loopback(u.Hostname()))) {
@@ -106,6 +104,10 @@ func Parse(env func(string) string) (c Config, err error) {
 		}
 	} else if env("FLASH_ARB_OWNER") != "" {
 		return c, errors.New("FLASH_ARB_PROXY required with owner")
+	}
+	c.Live, e = parseLive(env, c.Proxy, c.Owner)
+	if e != nil {
+		return c, e
 	}
 	c.Model = value(env, "OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324")
 	if !strings.HasPrefix(c.Model, "deepseek/") || len(c.Model) > 120 {

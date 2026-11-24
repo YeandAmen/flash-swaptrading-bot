@@ -24,6 +24,7 @@ jobs:
       - run: go vet ./...
       - run: go test -race -cover ./...
       - run: go build ./cmd/bot
+      - run: go build -o bin/wallet ./cmd/wallet
       - run: go run ./cmd/bot --demo --once
       - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf
         with:

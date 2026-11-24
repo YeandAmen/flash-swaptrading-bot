@@ -49,3 +49,23 @@ func TestKeyFilePermissions(t *testing.T) {
 		t.Fatal("world-readable key accepted")
 	}
 }
+
+func TestLiveRequiresExplicitLimitsAndCredentials(t *testing.T) {
+	v := map[string]string{"ALLOW_LIVE_TRADING": "on", "FLASH_ARB_PROXY": "0x0000000000000000000000000000000000000010", "FLASH_ARB_OWNER": "0x0000000000000000000000000000000000000020", "WALLET_KEYSTORE_FILE": "private/wallet.json", "WALLET_PASSWORD_FILE": "private/password", "LIVE_MAX_GAS_WEI": "1000", "LIVE_DAILY_GAS_WEI": "2000", "LIVE_MAX_PRINCIPAL_WEI": "100000", "LIVE_MAX_FEE_PER_GAS_WEI": "100"}
+	c, e := Parse(env(v))
+	if e != nil || !c.Live.Allowed {
+		t.Fatal("complete live config rejected", e)
+	}
+	for _, name := range []string{"WALLET_PASSWORD_FILE", "LIVE_MAX_GAS_WEI", "LIVE_DAILY_GAS_WEI", "LIVE_MAX_PRINCIPAL_WEI", "LIVE_MAX_FEE_PER_GAS_WEI"} {
+		old := v[name]
+		delete(v, name)
+		if _, e := Parse(env(v)); e == nil {
+			t.Fatal("missing safety setting accepted", name)
+		}
+		v[name] = old
+	}
+	v["LIVE_CONFIRMATIONS"] = "1"
+	if _, e := Parse(env(v)); e == nil {
+		t.Fatal("insufficient confirmation depth accepted")
+	}
+}
