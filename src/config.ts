@@ -28,6 +28,7 @@ const num = (k: string, d: number) => {
 };
 const str = (k: string, d = '') => process.env[k] ?? d;
 const liveTradingSetting = str('ALLOW_LIVE_TRADING', 'off');
+const arbitrumFeeHeadroomSetting = str('ARBITRUM_BID_FEE_HEADROOM', 'off');
 const forkSetting = str('FORK_MODE', '0');
 
 function isLocalForkRpc(value: string): boolean {
@@ -55,6 +56,7 @@ export const CONFIG = {
   maxSwapNetworkFeeUsd: num('MAX_SWAP_NETWORK_FEE_USD', 5),
   /** Mainnet signing requires this opt-in in addition to an explicit arming action. */
   allowLiveTrading: liveTradingSetting === 'on',
+  arbitrumBidFeeHeadroom: arbitrumFeeHeadroomSetting === 'on',
   keychainService: str('KEYCHAIN_SERVICE', 'eth-token-bot'),
   keychainAccount: str('KEYCHAIN_ACCOUNT', 'bot-wallet'),
   /** Optional local import from an owner-only key file. Forks always use an isolated throwaway one. */
@@ -65,6 +67,7 @@ export const CONFIG = {
 
 if (!CONFIG.rpcUrl) throw new Error('RPC_URL missing. Put it in .env');
 if (liveTradingSetting !== 'off' && liveTradingSetting !== 'on') throw new Error('ALLOW_LIVE_TRADING must be on or off');
+if (arbitrumFeeHeadroomSetting !== 'off' && arbitrumFeeHeadroomSetting !== 'on') throw new Error('ARBITRUM_BID_FEE_HEADROOM must be on or off');
 if (forkSetting !== '0' && forkSetting !== '1') throw new Error('FORK_MODE must be 0 or 1');
 if (CONFIG.forkMode && (!isLocalForkRpc(CONFIG.rpcUrl) || !isLocalForkRpc(CONFIG.sendRpcUrl))) {
   throw new Error('FORK_MODE requires loopback HTTP RPC_URL and SEND_RPC_URL (127.0.0.1 or [::1])');

@@ -143,11 +143,113 @@ function fixture(options: { simulate?: boolean; unavailable?: boolean } = {}) {
   const markets = [{ symbol: 'A', token, pools: [token, contract].map((pool, i) =>
     ({ kind: 2, pool, fee: i === 0 ? 100 : 500, tickSpacing: 0, nativeEth: false })) }];
   Object.assign(worker, { client, contract, owner: token, journal, deployment, markets, quoteReaders: undefined,
+    signingAccount: () => { throw new Error('No signer in this offline fixture'); },
     verified: true, halted: false, refreshAfter: Infinity, executorCheckAt: Infinity });
   Object.assign(worker.summary, { executor: contract, mode: 'live' });
   return { worker, client, foundPaths, twoSwapReads, releasePreparation, preparations, journal, deployment,
     peak: () => peak, observations: () => observations };
 }
+
+test('ordinary Arbitrum orders finish wallet checks before validating latest and pending payouts and signing', async t => {
+  const scenarios = ['pending margin faded', 'latest margin faded', 'latest unavailable', 'head regressed',
+    'nonce occupied', 'balance insufficient', 'healthy'] as const;
+  for (const scenario of scenarios) await t.test(scenario, async () => {
+    const f = fixture({ simulate: true });
+    const releaseBalance = deferred();
+    const bytes: Hex = '0xfeed';
+    const hash = keccak256(bytes);
+    const calls: string[] = [];
+    const fees = { maxFeePerGas: 50_000_000n, maxPriorityFeePerGas: 1_000_000n };
+    type Tx = { to: Address; data: Hex; gas: bigint } & typeof fees;
+    const simulated: Partial<Record<'latest' | 'pending', Tx>> = {};
+    let pendingPayout = quote.payout, latestPayout = quote.payout;
+    let walletReady = false;
+    Object.assign(f.client, {
+      estimateFeesPerGas: async () => fees,
+      estimateGas: async ({ data, gas }: { data: Hex; gas?: bigint }) => {
+        const decoded = decodeFunctionData({ abi: ARBITRUM_FLASH_ARB_LOGIC_V2_ABI, data });
+        assert.equal(decoded.functionName, 'executePath');
+        if (decoded.functionName !== 'executePath') assert.fail();
+        assert.equal(decoded.args[0], arbitrumReleaseHash);
+        assert.equal(decoded.args[1].amountIn, quote.amountIn);
+        assert.equal(decoded.args[1].maxBlock, head + 10n);
+        assert.equal(decoded.args[1].minProfit, gas === undefined ? 1n : 62_500n);
+        calls.push(gas === undefined ? 'initial estimate' : 'exact estimate');
+        return 100_000n;
+      },
+      getTransactionCount: async ({ address, blockTag }: { address: Address; blockTag?: string }) => {
+        assert.equal(address, token);
+        calls.push('nonce ' + (blockTag ?? 'latest'));
+        return blockTag === 'pending' && scenario === 'nonce occupied' ? 8 : 7;
+      },
+      getBalance: async ({ address }: { address: Address }) => {
+        assert.equal(address, token);
+        calls.push('balance');
+        await releaseBalance.promise;
+        walletReady = true;
+        return scenario === 'balance insufficient' ? 0n : parseEther('1');
+      },
+      call: async ({ account, blockTag, ...tx }: Tx & { account: Address; blockTag: string }) => {
+        calls.push(blockTag + ' call');
+        assert.equal(account, token);
+        assert.ok(blockTag === 'latest' || blockTag === 'pending');
+        simulated[blockTag] = tx;
+        if (blockTag === 'latest' && scenario === 'latest unavailable') return { data: '0x' };
+        return { data: encodeAbiParameters([{ type: 'uint256' }], [blockTag === 'pending' ? pendingPayout : latestPayout]) };
+      },
+      getBlockNumber: async ({ cacheTime }: { cacheTime: number }) => {
+        calls.push('final head');
+        assert.equal(cacheTime, 0);
+        return scenario === 'head regressed' ? head - 1n : head + 1n;
+      },
+      sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
+        calls.push('broadcast');
+        assert.equal(serializedTransaction, bytes);
+        assert.ok(f.journal.pending && 'hash' in f.journal.pending && f.journal.pending.hash === hash);
+        return hash;
+      },
+    });
+    Object.assign(f.worker, {
+      active: true, alternateWriter: null,
+      save: (next: typeof f.journal) => Object.assign(f.journal, next),
+      signingAccount: () => ({ address: token, signTransaction: async (tx: Tx & { nonce: number; chainId: number; type: string }) => {
+        calls.push('sign');
+        assert.ok(walletReady && simulated.latest && simulated.pending);
+        assert.deepEqual(simulated.latest, simulated.pending);
+        assert.deepEqual(tx, { ...simulated.latest, type: 'eip1559', chainId: 42161, nonce: 7 });
+        assert.equal(tx.to, contract);
+        assert.equal(tx.gas, 125_000n);
+        assert.equal(tx.maxFeePerGas, fees.maxFeePerGas);
+        assert.equal(tx.maxPriorityFeePerGas, fees.maxPriorityFeePerGas);
+        return bytes;
+      } }),
+    });
+    const result = f.worker['queueOrders']([quote], 2000, null, 0, arbitrumReleaseHash, head);
+    await nextTurn();
+    assert.deepEqual([...calls].sort(), ['balance', 'exact estimate', 'initial estimate', 'nonce latest', 'nonce pending']);
+    // The RPC can still execute above the signed $0.0625 floor while the remaining 10% cushion has vanished.
+    if (scenario === 'pending margin faded') pendingPayout = 69_444n;
+    if (scenario === 'latest margin faded') latestPayout = 69_444n;
+    releaseBalance.resolve();
+    await result;
+    if (scenario === 'nonce occupied' || scenario === 'balance insufficient') {
+      assert.equal(calls.length, 5);
+      assert.equal(f.journal.pending, null);
+      assert.equal(f.worker.summary.preparationRejections[scenario === 'nonce occupied' ? 'wallet-nonce' : 'wallet-balance'], 1);
+      return;
+    }
+    assert.deepEqual(calls.slice(5, 8).sort(), ['final head', 'latest call', 'pending call']);
+    if (scenario === 'healthy') {
+      assert.deepEqual(calls.slice(8), ['sign', 'broadcast']);
+      assert.ok(f.journal.pending && 'signedAtBlock' in f.journal.pending && f.journal.pending.signedAtBlock === '101');
+    } else {
+      assert.equal(calls.length, 8);
+      assert.equal(f.journal.pending, null);
+      const reason = scenario === 'head regressed' ? 'head-regressed' : scenario === 'latest unavailable' ? 'simulation-unavailable' : 'net-floor';
+      assert.equal(f.worker.summary.preparationRejections[reason], 1);
+    }
+  });
+});
 
 test('pending and failed display balance reads allow receipt checks and market scans to continue', async t => {
   let now = Date.now();
@@ -418,6 +520,12 @@ test('a qualified path from an invalidated observation never starts preparation'
 
 test('paper worker simulates a path that arrives between polls and a later empty observation cannot erase it', async () => {
   const f = fixture({ simulate: true });
+  const tags: string[] = [];
+  const paperCall = f.client.call;
+  Object.assign(f.client, { call: async ({ blockTag }: { blockTag: string }) => {
+    tags.push(blockTag);
+    return paperCall();
+  } });
   Object.assign(f.worker, { markets: [], journal: null });
   f.worker.summary.mode = 'paper';
   f.twoSwapReads.resolve();
@@ -427,6 +535,7 @@ test('paper worker simulates a path that arrives between polls and a later empty
   f.releasePreparation.resolve();
   await nextTurn();
   assert.deepEqual(f.preparations, ['path', 'path']); // Initial and exact gas estimates for one preparation.
+  assert.deepEqual(tags, ['pending']);
   assert.ok(f.worker.summary.netEstimateUsd && f.worker.summary.netEstimateUsd > 0);
   await f.worker.scan();
   await nextTurn();

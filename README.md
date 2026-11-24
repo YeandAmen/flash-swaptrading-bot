@@ -267,6 +267,8 @@ During a periodic two-swap pool refresh, an eligible multi-hop scan can start fr
 
 When no fixed-size quote covers the profit floor after the 10% payout reserve, the scanner uses quotes from the same pools and block to estimate an intermediate loan size. It checks at most one extra size per borrowed asset. The dashboard compares the best quotes before gas. Live execution requires 90% of the payout to cover both padded gas and the $0.05 minimum, followed by a pending-state simulation.
 
+Before signing an automatic Arbitrum order, the worker checks the exact trade against both the latest and pending chain states after the wallet and gas checks finish. Both payouts must cover the padded network fee, minimum net profit and execution reserve. For a zero priority-fee recommendation, `ARBITRUM_BID_FEE_HEADROOM=on` offers half the difference between the existing maximum fee and the observed base fee as priority, up to 0.005 gwei. The default is `off`. The signed maximum fee still bounds the entire payment, and the priority fee can increase what the wallet actually pays if the transaction succeeds or reverts.
+
 If an automatic Arbitrum order fails its freshness check, the dashboard shows that order's route, loan size, quote block, and the RPC head used for the check. It distinguishes an old quote from a late or future-dated RPC header. The latest such rejection stays visible until the worker restarts.
 
 To test with fake funds, use an Arbitrum archive endpoint with state access at the selected L2 block.

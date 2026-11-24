@@ -4,6 +4,7 @@ import { decodeFunctionData, encodeFunctionResult, parseEther, type Address } fr
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
 import { ARBITRUM_FLASH_ARB_LOGIC_V2_ABI } from './artifact-logic-v2.js';
 import { arbitrumReleaseHash } from './proxy.js';
+import { bidArbitrumFeeHeadroom } from './profit.js';
 import type { ArbPathQuote } from './paths.js';
 import { prepareArbitrumOrder, type ArbitrumOrderRejection } from './execution.js';
 import type { ArbQuote, ArbitrumClient } from './market.js';
@@ -57,6 +58,41 @@ test('Arbitrum signing gate requires fresh execution to cover padded gas and the
     { ok: false, reason: 'net-floor' });
   assert.deepEqual(await prepareArbitrumOrder(clientFor({ feeCap: 2_000_000_000n }).client, contract, owner, profitable, 2_000, 0.05, 0.50),
     { ok: false, reason: 'fee-cap' });
+});
+
+test('automatic fallback priority fits the existing fee ceiling on the 527095270 quote', async () => {
+  const rawFees = { maxFeePerGas: 24_480_000n, maxPriorityFeePerGas: 0n };
+  const base = 20_400_000n;
+  const bid = bidArbitrumFeeHeadroom(rawFees, base);
+  assert.deepEqual(bid, { maxFeePerGas: 24_480_000n, maxPriorityFeePerGas: 2_040_000n });
+  assert.equal(bidArbitrumFeeHeadroom({ ...rawFees, maxPriorityFeePerGas: 1n }, base).maxPriorityFeePerGas, 1n);
+  for (const unavailable of [undefined, null, 0n, rawFees.maxFeePerGas, rawFees.maxFeePerGas + 1n]) {
+    assert.equal(bidArbitrumFeeHeadroom(rawFees, unavailable).maxPriorityFeePerGas, 0n);
+  }
+  assert.equal(bidArbitrumFeeHeadroom({ ...rawFees, maxFeePerGas: base + 3n }, base).maxPriorityFeePerGas, 1n);
+  assert.equal(bidArbitrumFeeHeadroom({ ...rawFees, maxFeePerGas: base + 100_000_000n }, base).maxPriorityFeePerGas, 5_000_000n);
+
+  const seen: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }[] = [];
+  const client = { ...clientFor().client,
+    getBlock: async () => ({ number: 100n, timestamp: BigInt(Math.floor(Date.now() / 1000)), baseFeePerGas: base }),
+    estimateFeesPerGas: async () => rawFees,
+    call: async (args: typeof rawFees) => {
+      seen.push({ maxFeePerGas: args.maxFeePerGas, maxPriorityFeePerGas: args.maxPriorityFeePerGas });
+      return { data: encodeFunctionResult({ abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', result: profitable.payout }) };
+    },
+  } as unknown as ArbitrumClient;
+  const live = { sourceBlock: 100n, bidFeeHeadroom: true, canSign: () => true,
+    readWallet: async () => ({ nonce: 6, pending: 6, balance: parseEther('1') }) };
+  const ordinary = await prepareArbitrumOrder(client, contract, owner, profitable, 2_000, 0.05, 0.5, false, undefined, live);
+  assert.ok(ordinary.ok);
+  assert.deepEqual(seen, [bid, bid]);
+  assert.equal(ordinary.tx.maxPriorityFeePerGas, bid.maxPriorityFeePerGas);
+  assert.equal(ordinary.gasBudget, ordinary.tx.gas * rawFees.maxFeePerGas);
+  seen.length = 0;
+  const standard = await prepareArbitrumOrder(client, contract, owner, profitable, 2_000, 0.05, 0.5);
+  assert.ok(standard.ok);
+  assert.deepEqual(seen, [rawFees]);
+  assert.equal(standard.gasBudget, ordinary.gasBudget);
 });
 
 test('an explicit Arbitrum test isolates the network fee exception', async () => {

@@ -38,11 +38,16 @@ const preparationStatus: Record<ArbitrumOrderRejection, string> = {
   'fee-cap': 'Estimated gas exceeded the approved fee cap',
   'deadline': 'Quoted route expired during pending simulation',
   'gas-estimate-changed': 'Estimated gas grew beyond the padded gas limit',
-  'simulation-unavailable': 'Arbitrum pending simulation returned no result',
+  'simulation-unavailable': 'Arbitrum execution simulation returned no result',
   'execution-reverted': 'Arbitrum route reverted before signing',
   'head-rpc': 'Arbitrum RPC failed while reading the chain head',
   'fee-rpc': 'Arbitrum RPC failed during fee estimation',
-  'simulation-rpc': 'Arbitrum RPC failed during pending simulation',
+  'simulation-rpc': 'Arbitrum RPC failed during execution simulation',
+  'head-regressed': 'Final Arbitrum head was behind the preparation head',
+  'wallet-rpc': 'Arbitrum wallet owner, nonce or gas balance could not be verified',
+  'wallet-nonce': 'Waiting for the wallet nonce to settle',
+  'wallet-balance': 'Quoted route exceeds the wallet ETH available for gas',
+  'signing-disabled': 'Arbitrum live signing is no longer available',
 };
 type Pending = ArbitrumIntent & { ethUsd: number; budgetUsd: number; executor?: Address; owner?: Address; automatic?: boolean;
   path?: { asset: Address; decimals: number; assetUsd: number; amount: string; hops: number } };
@@ -392,6 +397,20 @@ export class ArbitrumWorker {
     return result;
   }
 
+  private signingAccount() {
+    const { account } = loadOrCreateWallet();
+    if (!isAddressEqual(account.address, this.owner)) throw new Error('Wallet does not match the Arbitrum executor owner');
+    return account;
+  }
+
+  private async readWallet(address: Address) {
+    const [nonce, pending, balance] = await Promise.all([
+      this.client.getTransactionCount({ address }), this.client.getTransactionCount({ address, blockTag: 'pending' }),
+      this.client.getBalance({ address }),
+    ]);
+    return { nonce, pending, balance };
+  }
+
   private async tryOrders(candidates: (ArbQuote | ArbPathQuote)[], ethUsd: number, test: FlashTest | null, generation: number, release: Hex | null,
     sourceBlock: bigint): Promise<boolean> {
     const canContinue = () => this.active && generation === this.sendGeneration && !this.journal?.pending
@@ -413,13 +432,26 @@ export class ArbitrumWorker {
         if (cap === null || principal > cap / scale) continue;
       }
       this.summary.simulated += 1;
+      let account: ReturnType<typeof this.signingAccount> | undefined;
+      const live = !test && canSign() ? { sourceBlock, bidFeeHeadroom: CONFIG.arbitrumBidFeeHeadroom, canSign, readWallet: async () => {
+        account = this.signingAccount();
+        return this.readWallet(account.address);
+      } } : undefined;
       const prepared = await prepareArbitrumOrder(this.client, this.contract, this.owner, candidate, ethUsd, Math.max(minNetUsd, test?.minimumNetUsd ?? 0), available,
-        !!test && test.minimumNetUsd === undefined, release ?? undefined);
+        !!test && test.minimumNetUsd === undefined, release ?? undefined, live);
       if (!canContinue()) return false;
       if (!prepared.ok) {
         firstRejection ??= prepared.reason;
         const counts = this.summary.preparationRejections;
         counts[prepared.reason] = (counts[prepared.reason] ?? 0) + 1;
+        if (prepared.reason === 'wallet-nonce' || prepared.reason === 'wallet-rpc') {
+          this.summary.status = preparationStatus[prepared.reason];
+          return true;
+        }
+        if (prepared.reason === 'wallet-balance') {
+          reachedLiveChecks = true;
+          this.summary.status = preparationStatus[prepared.reason];
+        }
         if (prepared.reason === 'stale-quote' && !test && canSign()
           && (!this.summary.lastStaleQuote || prepared.stale.at >= this.summary.lastStaleQuote.at)) {
           this.summary.lastStaleQuote = { ...prepared.stale, sourceBlock: Number(path ? candidate.block : sourceBlock),
@@ -439,27 +471,28 @@ export class ArbitrumWorker {
       this.summary.status = test ? 'Test route passed repayment and gas checks' : 'Executable quote passed profit and gas checks';
       if (!this.journal || !canSign()) return true;
       reachedLiveChecks = true;
-      const { account } = loadOrCreateWallet();
-      if (!isAddressEqual(account.address, this.owner)) throw new Error('Wallet does not match the Arbitrum executor owner');
-      const [nonce, pending, balance, head] = await Promise.all([
-        this.client.getTransactionCount({ address: account.address }),
-        this.client.getTransactionCount({ address: account.address, blockTag: 'pending' }),
-        this.client.getBalance({ address: account.address }),
-        this.client.getBlockNumber({ cacheTime: 0 }),
-      ]);
-      if (!canSign()) return true;
-      if (nonce !== pending) {
-        this.summary.status = 'Waiting for the wallet nonce to settle';
-        return true;
+      let signing = prepared.wallet;
+      if (!signing) {
+        if (!test) return false;
+        account = this.signingAccount();
+        const [wallet, head] = await Promise.all([this.readWallet(account.address), this.client.getBlockNumber({ cacheTime: 0 })]);
+        if (!canSign()) return true;
+        if (wallet.nonce !== wallet.pending) {
+          this.summary.status = preparationStatus['wallet-nonce'];
+          return true;
+        }
+        if (wallet.balance < prepared.gasBudget) {
+          this.summary.status = preparationStatus['wallet-balance'];
+          continue;
+        }
+        if (head >= prepared.deadline) {
+          this.summary.status = 'Quoted route expired before signing';
+          continue;
+        }
+        signing = { nonce: wallet.nonce, head };
       }
-      if (balance < prepared.gasBudget) {
-        this.summary.status = 'Quoted route exceeds the wallet ETH available for gas';
-        continue;
-      }
-      if (head >= prepared.deadline) {
-        this.summary.status = 'Quoted route expired before signing';
-        continue;
-      }
+      if (!account) return false;
+      const { nonce, head } = signing;
       const serializedTransaction = await account.signTransaction({ ...prepared.tx, type: 'eip1559', chainId: arbitrumChainId, nonce });
       if (!canSign()) return true;
       const hash = keccak256(serializedTransaction);

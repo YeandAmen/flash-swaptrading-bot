@@ -2,13 +2,20 @@ import { BaseError, ExecutionRevertedError, formatEther, formatUnits, encodeFunc
 import { ARBITRUM_FLASH_ARB_ABI } from './artifact.js';
 import { ARBITRUM_FLASH_ARB_LOGIC_V2_ABI } from './artifact-logic-v2.js';
 import { arbitrumPinnedCall, arbitrumSupportsPaths } from './proxy.js';
-import { minimumNetInAsset, requiredGrossPayout } from './profit.js';
+import { bidArbitrumFeeHeadroom, minimumNetInAsset, requiredGrossPayout } from './profit.js';
 import type { ArbitrumClient, ArbQuote } from './market.js';
 import type { ArbPathQuote } from './paths.js';
 
 export type ArbitrumOrderRejection = 'daily-budget' | 'net-floor' | 'stale-quote' | 'fee-cap' | 'deadline'
   | 'gas-estimate-changed' | 'simulation-unavailable' | 'execution-reverted' | 'head-rpc' | 'fee-rpc' | 'simulation-rpc'
-  | 'unsupported-path';
+  | 'unsupported-path' | 'head-regressed' | 'wallet-rpc' | 'wallet-nonce' | 'wallet-balance' | 'signing-disabled';
+
+interface OrdinaryLiveChecks {
+  sourceBlock: bigint;
+  bidFeeHeadroom?: boolean;
+  canSign: () => boolean;
+  readWallet: () => Promise<{ nonce: number; pending: number; balance: bigint }>;
+}
 
 export interface ArbitrumStaleHead {
   at: number;
@@ -21,7 +28,7 @@ export interface ArbitrumStaleHead {
 const reject = (reason: Exclude<ArbitrumOrderRejection, 'stale-quote'>) => ({ ok: false as const, reason });
 
 export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Address, owner: Address, candidate: ArbQuote | ArbPathQuote,
-  ethUsd: number, minimumNetUsd: number, maximumFeeUsd: number, gasOnlyTest = false, release?: Hex) {
+  ethUsd: number, minimumNetUsd: number, maximumFeeUsd: number, gasOnlyTest = false, release?: Hex, live?: OrdinaryLiveChecks) {
   if (maximumFeeUsd <= 0) return reject('daily-budget');
   let rpcStage: 'head-rpc' | 'fee-rpc' | 'simulation-rpc' = 'head-rpc';
   try {
@@ -42,7 +49,7 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
     const headAgeMs = at - headTimestamp * 1000;
     const lastFreshBlock = ('legs' in candidate ? candidate.block : candidate.order.maxBlock) + 50n;
     let reason: ArbitrumStaleHead['reason'] | undefined;
-    if (path && head.number < path.block) reason = 'head-behind-source';
+    if ((path && head.number < path.block) || (live && head.number < live.sourceBlock)) reason = 'head-behind-source';
     else if (head.number > lastFreshBlock) reason = 'quote-too-old';
     else if (headAgeMs > 5_000) reason = 'head-clock-behind';
     else if (headAgeMs < -5_000) reason = 'head-clock-ahead';
@@ -62,9 +69,10 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
       return release ? arbitrumPinnedCall(data, release) : data;
     };
     rpcStage = 'fee-rpc';
-    const [estimated, fees] = await Promise.all([
+    const [estimated, rawFees] = await Promise.all([
       client.estimateGas({ account: owner, to: contract, data: encode(1n) }), client.estimateFeesPerGas(),
     ]);
+    const fees = live?.bidFeeHeadroom ? bidArbitrumFeeHeadroom(rawFees, head.baseFeePerGas) : rawFees;
     const gas = (estimated * 125n + 99n) / 100n;
     const gasBudget = gas * fees.maxFeePerGas;
     const worstGasUsd = Number(formatEther(gasBudget)) * ethUsd;
@@ -76,17 +84,40 @@ export async function prepareArbitrumOrder(client: ArbitrumClient, contract: Add
     const data = encode(minimum);
     const tx = { to: contract, data, gas, ...fees };
     rpcStage = 'simulation-rpc';
-    const [exact, finalState, currentHead] = await Promise.all([
-      client.estimateGas({ ...tx, account: owner }),
-      client.call({ ...tx, account: owner, blockTag: 'pending' }),
-      client.getBlockNumber({ cacheTime: 0 }),
+    const estimate = () => client.estimateGas({ ...tx, account: owner });
+    const simulate = (blockTag: 'latest' | 'pending') => client.call({ ...tx, account: owner, blockTag });
+    const freshHead = () => client.getBlockNumber({ cacheTime: 0 });
+    let nonce: number | undefined;
+    if (live) {
+      if (!live.canSign()) return reject('signing-disabled');
+      // Finish both checks before accepting a pending payout, even if one reader is slow.
+      const [exact, wallet] = await Promise.allSettled([estimate(), live.readWallet()]);
+      if (!live.canSign()) return reject('signing-disabled');
+      if (wallet.status === 'rejected') return reject('wallet-rpc');
+      if (wallet.value.nonce !== wallet.value.pending) return reject('wallet-nonce');
+      if (wallet.value.balance < gasBudget) return reject('wallet-balance');
+      if (exact.status === 'rejected') throw exact.reason;
+      if (exact.value > gas) return reject('gas-estimate-changed');
+      nonce = wallet.value.nonce;
+    }
+    // A provider's pending state can lag a completed market move. Both views must cover the same signed floor.
+    // Paper and operator-requested tests retain their parallel estimate and pending simulation.
+    const [pendingState, currentHead, latestState, exact] = await Promise.all([
+      simulate('pending'), freshHead(), live ? simulate('latest') : undefined, live ? undefined : estimate(),
     ]);
+    if (live && currentHead < head.number) return reject('head-regressed');
     if (currentHead >= deadline) return reject('deadline');
-    if (exact > gas) return reject('gas-estimate-changed');
-    if (!finalState.data || finalState.data === '0x') return reject('simulation-unavailable');
-    const payout = decodeFunctionResult({ abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', data: finalState.data });
+    if (exact !== undefined && exact > gas) return reject('gas-estimate-changed');
+    if (!pendingState.data || pendingState.data === '0x' || (live && (!latestState?.data || latestState.data === '0x'))) {
+      return reject('simulation-unavailable');
+    }
+    const decodePayout = (data: Hex) => decodeFunctionResult({ abi: ARBITRUM_FLASH_ARB_ABI, functionName: 'execute', data });
+    const pendingPayout = decodePayout(pendingState.data);
+    const latestPayout = latestState?.data ? decodePayout(latestState.data) : pendingPayout;
+    const payout = pendingPayout < latestPayout ? pendingPayout : latestPayout;
     if (payout < requiredPayout) return reject('net-floor');
-    return { ok: true as const, tx, deadline, worstGasUsd, gasBudget, netUsd: Number(formatUnits(payout, decimals)) * assetUsd - worstGasUsd };
+    return { ok: true as const, tx, deadline, worstGasUsd, gasBudget, netUsd: Number(formatUnits(payout, decimals)) * assetUsd - worstGasUsd,
+      wallet: nonce === undefined ? undefined : { nonce, head: currentHead } };
   } catch (error) {
     const reverted = error instanceof BaseError && error.walk((cause) => cause instanceof ExecutionRevertedError) instanceof ExecutionRevertedError;
     // Keep endpoint URLs, provider error messages, and request bodies out of dashboard data.
