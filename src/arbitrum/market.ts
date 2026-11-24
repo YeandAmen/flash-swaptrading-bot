@@ -57,7 +57,8 @@ const v3PoolAbi = parseAbi([
   'function liquidity() view returns (uint128)',
   'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16 observationIndex,uint16 observationCardinality,uint16 observationCardinalityNext,uint8 feeProtocol,bool unlocked)',
 ]);
-const aaveAbi = parseAbi(['function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)', 'function getConfiguration(address) view returns (uint256)']);
+const aaveAbi = parseAbi(['function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)', 'function getConfiguration(address) view returns (uint256)',
+  'function getVirtualUnderlyingBalance(address asset) view returns (uint128)']);
 const balanceAbi = parseAbi(['function balanceOf(address) view returns (uint256)']);
 const oracleAbi = parseAbi(['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)']);
 const quoteV3Abi = parseAbi(['function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160,uint32,uint256 gasEstimate)']);
@@ -360,10 +361,13 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
     pin = { blockNumber };
     return client.readContract({ ...premiumRead, blockNumber });
   });
-  const [premiumBps, config, available, ethUsd, spotRates] = await Promise.all([
+  const [premiumBps, config, custody, virtualCash, ethUsd, spotRates] = await Promise.all([
     premium,
     client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'getConfiguration', args: [weth], blockNumber }),
     client.readContract({ address: weth, abi: balanceAbi, functionName: 'balanceOf', args: [aaveWeth], blockNumber }),
+    typeof extraSize === 'object' && test === false
+      ? client.readContract({ address: aavePool, abi: aaveAbi, functionName: 'getVirtualUnderlyingBalance', args: [weth], blockNumber }).catch(() => undefined)
+      : undefined,
     price,
     screenRoundTrips && test === false
       ? readArbitrumSpotRates(client, blockNumber, markets).catch(() => undefined) : undefined,
@@ -380,12 +384,17 @@ export async function scanArbitrum(client: ArbitrumClient, blockNumber: bigint, 
         ? recovery.alternate : undefined).catch(() => undefined);
   };
   const usdLimit = loanLimitWei(maxLoanUsd, ethUsd) ?? 0n;
+  // Aave debits its virtual reserve before transferring WETH from the aToken.
+  const available = virtualCash !== undefined && virtualCash < custody ? virtualCash : custody;
   let probe: bigint | undefined;
   if (typeof extraSize === 'object') {
-    const funded = usdLimit < available ? usdLimit : available;
-    const depths = [funded];
-    for (let amount = parseEther('256'); amount < funded; amount *= 4n) depths.push(amount);
-    probe = depths[extraSize.fundedDepth % depths.length];
+    // If the getter is unavailable, keep the regular ladder and skip the optional reserve probe.
+    if (virtualCash !== undefined) {
+      const funded = usdLimit < available ? usdLimit : available;
+      const depths = [funded];
+      for (let amount = parseEther('256'); amount < funded; amount *= 4n) depths.push(amount);
+      probe = depths[extraSize.fundedDepth % depths.length];
+    }
   } else probe = extraSize;
   const ladder = typeof test === 'number' ? profitTestAmounts.filter((amount) => Number(formatEther(amount)) * ethUsd >= test)
     : test ? testAmounts : probe === undefined || amounts.includes(probe) ? amounts : [...amounts, probe];

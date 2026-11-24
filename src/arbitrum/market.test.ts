@@ -72,17 +72,25 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
   }];
   const requestedSizes: bigint[][] = [];
   let availableWeth = parseEther('500');
+  let virtualWeth: bigint | 'unavailable' | undefined;
+  let virtualReads = 0;
   let incompletePrices: boolean | 'error' = false;
   let gasLimited = false;
   const rpcError = (functionName: string, details: string) => ({ status: 'failure',
     error: new ContractFunctionExecutionError(new BaseError('RPC failed', { details }), { abi: [], functionName }) });
   const client = {
-    readContract: async ({ functionName, blockNumber }: { functionName: string; blockNumber: bigint }) => {
+    readContract: async ({ address, functionName, args, blockNumber }: { address: Address; functionName: string; args?: Address[]; blockNumber: bigint }) => {
       assert.equal(blockNumber, 100n);
       switch (functionName) {
         case 'FLASHLOAN_PREMIUM_TOTAL': return 5n;
         case 'getConfiguration': return (1n << 56n) | (1n << 63n);
         case 'balanceOf': return availableWeth;
+        case 'getVirtualUnderlyingBalance':
+          virtualReads++;
+          assert.equal(address, '0x794a61358d6845594f94dc1db02a252b5b4814ad');
+          assert.deepEqual(args, ['0x82af49447d8a07e3bd95bd0d56f35241523fbab1']);
+          if (virtualWeth === 'unavailable') throw new Error('unsupported or unavailable reserve getter');
+          return virtualWeth ?? availableWeth;
         case 'latestRoundData': return [0n, 200_000_000_000n, 0n, BigInt(Math.floor(Date.now() / 1000)), 0n];
         default: throw new Error('Unexpected read');
       }
@@ -126,6 +134,7 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
   assert.equal(result.largestQuote?.loanUsd, 500);
   assert.equal(result.largestQuote?.payoutUsd.toFixed(4), '-0.0500');
   assert.equal(result.sizingAmount, parseEther('0.25'));
+  assert.equal(virtualReads, 0, 'ordinary fixed-size scans reuse the existing reads');
 
   requestedSizes.length = 0;
   const limitedByAave = await scanArbitrum(client, 100n, markets, false, { fundedDepth: 0 }, 2_000_000);
@@ -141,6 +150,27 @@ test('Arbitrum uses pinned slot0 rates and fails open for missing prices', async
     assert.equal(unrestricted.largestQuote?.loanUsd, weth * 2000);
     assert.equal(unrestricted.quotedRoutes, 12);
   }
+  // Finalized Arbitrum block 526967626: the aToken held more WETH than Aave could debit.
+  availableWeth = 16_270_082_822_845_485_180_882n;
+  virtualWeth = 16_270_082_821_814_885_180_882n;
+  requestedSizes.length = 0;
+  await scanArbitrum(client, 100n, markets, false, { fundedDepth: 0 }, Infinity);
+  assert.ok(requestedSizes[0].includes(virtualWeth));
+  assert.ok(!requestedSizes[0].includes(availableWeth));
+  virtualWeth = availableWeth + 1n;
+  requestedSizes.length = 0;
+  await scanArbitrum(client, 100n, markets, false, { fundedDepth: 0 }, Infinity);
+  assert.ok(requestedSizes[0].includes(availableWeth), 'aToken custody is also binding');
+  virtualWeth = 0n;
+  requestedSizes.length = 0;
+  const empty = await scanArbitrum(client, 100n, markets, false, { fundedDepth: 0 }, Infinity);
+  assert.equal(empty.quotedRoutes, 0);
+  assert.equal(requestedSizes.length, 0);
+  virtualWeth = 'unavailable';
+  const fixedOnly = await scanArbitrum(client, 100n, markets, false, { fundedDepth: 0 }, Infinity);
+  assert.equal(fixedOnly.quotedRoutes, 10, 'the fixed ladder survives an unavailable optional getter');
+  assert.ok(requestedSizes[0].every(amount => amount <= parseEther('16')));
+  virtualWeth = undefined;
   availableWeth = parseEther('500');
 
   requestedSizes.length = 0;
