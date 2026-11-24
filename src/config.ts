@@ -230,6 +230,7 @@ export const MEV = {
   directMaxGasUsd: num('MEV_DIRECT_MAX_GAS_USD', 0),
   directPremiumMaxGasUsd: num('MEV_DIRECT_PREMIUM_MAX_GAS_USD', 0),
   directPremiumTipBumpPct: num('MEV_DIRECT_PREMIUM_TIP_BUMP_PCT', 0),
+  directProfitBidPct: num('MEV_DIRECT_PROFIT_BID_PCT', 0),
   directDailyGasUsd: num('MEV_DIRECT_DAILY_GAS_USD', 0),
   directMaxPriorityGwei: num('MEV_DIRECT_MAX_PRIORITY_GWEI', 0.25),
   directBroadcastRpcUrls: directBroadcastRpcUrls(),
@@ -301,6 +302,8 @@ check(MEV.directPremiumMaxGasUsd >= 0 && MEV.directPremiumMaxGasUsd <= 20
   'MEV_DIRECT_PREMIUM_MAX_GAS_USD must be zero or between the regular per-transaction gas cap and $20');
 check(Number.isInteger(MEV.directPremiumTipBumpPct) && MEV.directPremiumTipBumpPct >= 0 && MEV.directPremiumTipBumpPct <= 25,
   'MEV_DIRECT_PREMIUM_TIP_BUMP_PCT must be an integer from 0 to 25');
+check(Number.isInteger(MEV.directProfitBidPct) && MEV.directProfitBidPct >= 0 && MEV.directProfitBidPct <= 50,
+  'MEV_DIRECT_PROFIT_BID_PCT must be an integer from 0 to 50');
 check(MEV.directMaxPriorityGwei >= 1e-9 && MEV.directMaxPriorityGwei <= 10,
   'MEV_DIRECT_MAX_PRIORITY_GWEI must be between 0.000000001 and 10');
 check(MEV.minPoolWeth >= 0.1, 'MEV_MIN_POOL_WETH must be >= 0.1');

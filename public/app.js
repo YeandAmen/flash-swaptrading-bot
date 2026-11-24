@@ -721,6 +721,16 @@ function targetCloseDetails(replay) {
   return `<div>Replay at close of block ${networkNumber(replay.block)} · ${esc(result)}. Earlier execution conditions and relay decisions require separate evidence.</div>`;
 }
 
+function profitBidDetails(bid) {
+  if (!Number.isInteger(bid?.pct) || bid.pct < 1 || bid.pct > 50) return '';
+  const { baselinePriorityWei, signedPriorityWei } = bid;
+  if (![baselinePriorityWei, signedPriorityWei].every(value => typeof value === 'string' && /^\d{1,39}$/.test(value))
+    || BigInt(signedPriorityWei) <= BigInt(baselinePriorityWei)) return '';
+  const normal = networkTokenAmount(baselinePriorityWei, 9, 'gwei');
+  const signed = networkTokenAmount(signedPriorityWei, 9, 'gwei');
+  return `<div>Profit-funded priority bid · normal ${normal} → signed ${signed} · ${bid.pct}% of remaining premium gas budget</div>`;
+}
+
 function submissionDetails(submission, openSubmissions) {
   if (!submission) return '';
   const { kind, target, leadMs, netUsd, gasEth, tipEth, builders } = submission;
@@ -757,7 +767,7 @@ function submissionDetails(submission, openSubmissions) {
     const comparison = quotesDiffer
       ? `<div>Net estimates after padded gas · initial ${usd(sims.preparedNetUsd, 4)} · block ${usd(sims.blockNetUsd, 4)} · pending ${usd(sims.pendingNetUsd, 4)}</div>` : '';
     return `<details class="sub" data-target="${esc(key)}"${open}><summary>Direct transaction · route deadline block ${esc(target)}</summary>
-      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd, 4)}</div>${comparison}${signedGas}${lead}${timings}${relay}${targetCloseDetails(submission.targetCloseReplay)}</details>`;
+      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd, 4)}</div>${comparison}${signedGas}${profitBidDetails(submission.profitBid)}${lead}${timings}${relay}${targetCloseDetails(submission.targetCloseReplay)}</details>`;
   }
   const timing = `${(Math.abs(leadMs) / 1000).toFixed(2)}s ${leadMs >= 0 ? 'before' : 'after'} expected slot`;
   return `<details class="sub" data-target="${esc(key)}"${open}><summary>Bundle for block ${esc(target)}</summary>

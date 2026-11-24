@@ -3,11 +3,11 @@ import { MIN_PRIORITY_FEE_WEI, mevReadClient } from '../chain.js';
 
 const PRIORITY_CACHE_MS = 24_000;
 const DEFAULT_PRIORITY_FEE = parseGwei('0.1');
-let cachedTip: { fee: bigint; fasterFee: bigint; expiresAt: number } | undefined;
+let cachedTip: { fee: bigint; fasterFee: bigint; expiresAt: number; observed: boolean } | undefined;
 let readingTip: Promise<void> | undefined;
 
 /** Use recent Ethereum tips and cap the recommendation at the operator's limit. */
-export async function directPriorityFee(maximumWei: bigint, faster = false): Promise<bigint> {
+export async function directPriorityQuote(maximumWei: bigint, faster = false) {
   if (maximumWei <= 0n) throw new RangeError('Direct priority fee cap must be positive');
   if (!cachedTip || Date.now() >= cachedTip.expiresAt) {
     readingTip ??= mevReadClient.getFeeHistory({ blockCount: 10, rewardPercentiles: [50, 90] })
@@ -19,10 +19,11 @@ export async function directPriorityFee(maximumWei: bigint, faster = false): Pro
         });
         const fee = ordinary ?? DEFAULT_PRIORITY_FEE;
         const fasterFee = expedited !== undefined && expedited > fee ? expedited : fee;
-        cachedTip = { fee, fasterFee, expiresAt: Date.now() + PRIORITY_CACHE_MS };
+        cachedTip = { fee, fasterFee, expiresAt: Date.now() + PRIORITY_CACHE_MS,
+          observed: ordinary !== undefined && expedited !== undefined && ordinary >= 0n && expedited >= 0n };
       })
       .catch(() => {
-        cachedTip = { fee: DEFAULT_PRIORITY_FEE, fasterFee: DEFAULT_PRIORITY_FEE, expiresAt: Date.now() + PRIORITY_CACHE_MS };
+        cachedTip = { fee: DEFAULT_PRIORITY_FEE, fasterFee: DEFAULT_PRIORITY_FEE, expiresAt: Date.now() + PRIORITY_CACHE_MS, observed: false };
       })
       .finally(() => { readingTip = undefined; });
     await readingTip;
@@ -30,7 +31,11 @@ export async function directPriorityFee(maximumWei: bigint, faster = false): Pro
 
   const estimate = (faster ? cachedTip?.fasterFee : cachedTip?.fee) ?? DEFAULT_PRIORITY_FEE;
   const priority = estimate < MIN_PRIORITY_FEE_WEI ? MIN_PRIORITY_FEE_WEI : estimate;
-  return priority > maximumWei ? maximumWei : priority;
+  return { priority: priority > maximumWei ? maximumWei : priority, observedUntil: cachedTip?.observed ? cachedTip.expiresAt : undefined };
+}
+
+export async function directPriorityFee(maximumWei: bigint, faster = false): Promise<bigint> {
+  return (await directPriorityQuote(maximumWei, faster)).priority;
 }
 
 /** Bound the fee even if each intervening block uses its entire gas limit. */

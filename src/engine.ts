@@ -306,6 +306,7 @@ export class Engine {
           account: this.wallet.account,
           exec: this.liveExec,
           ethUsd: () => (this.snap && this.isCurrent(this.snap) ? this.snap.ethUsd : null),
+          walletEthBalance: () => this.snap && this.isCurrent(this.snap) ? this.snap.balances?.eth : undefined,
           baseFeeGwei: () => (this.snap && this.isCurrent(this.snap) ? this.snap.baseFeeGwei : null),
           tokens: () => this.market.tokens.map((t) => t.token),
           tradePending: () => !!this.state.pending || !!this.liveFault || this.stopping || this.panicActive,

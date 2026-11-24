@@ -25,6 +25,7 @@ Object.assign(process.env, {
   MEV_DIRECT_MAX_PRIORITY_GWEI: '0.25',
   MEV_DIRECT_PROTECTED_BLOCKS: '3',
   MEV_DIRECT_PREMIUM_TIP_BUMP_PCT: '0',
+  MEV_DIRECT_PROFIT_BID_PCT: '0',
   MEV_MAX_SIMS_PER_BLOCK: '3',
   MEV_DIRECT_CADENCE_MAX_ROUTES: '8',
   MEV_MAX_LOAN_USD: '1000000',
@@ -88,6 +89,16 @@ try {
       } else await assert.rejects(config, /MEV_DIRECT_PREMIUM_TIP_BUMP_PCT/);
     }
   } finally { process.env.MEV_DIRECT_PREMIUM_TIP_BUMP_PCT = '0'; }
+  try {
+    for (const raw of [undefined, '0', '25', '50', '-1', '51', '2.5', 'bad']) {
+      if (raw === undefined) delete process.env.MEV_DIRECT_PROFIT_BID_PCT;
+      else process.env.MEV_DIRECT_PROFIT_BID_PCT = raw;
+      const config = import('../dist/config.js?profit-bid=' + raw);
+      if (raw === undefined || ['0', '25', '50'].includes(raw)) {
+        assert.equal((await config).MEV.directProfitBidPct, Number(raw ?? 0));
+      } else await assert.rejects(config, /MEV_DIRECT_PROFIT_BID_PCT/);
+    }
+  } finally { process.env.MEV_DIRECT_PROFIT_BID_PCT = '0'; }
   const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
   const { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_RUNTIME } = await import('../dist/mev/artifact-proxy.js');
   const { FLASH_ARB_LOGIC_V3_RUNTIME } = await import('../dist/mev/artifact-logic-v3.js');
@@ -2315,6 +2326,185 @@ try {
       if (!late.journaled.some(p => p.opp.gasOnlyTestId === 'late-premium-control')) assert.equal(late.test.status, 'queued');
     } finally {
       Object.assign(MEV, originalMev);
+      Date.now = realNow;
+    }
+  }
+
+  {
+    // Reproduce #248's gross, signed gas limit and next-block base fee through the ordinary signing path.
+    const gross = 7_312_821_212_675_820n, gas = 394_684n, base = 165_098_144n, tip = 1_000_000_000n;
+    const price = 1_695, retained = BigInt(Math.ceil(5 / price * 1e18));
+    const realNow = Date.now, priorGlobal = CONFIG.maxSwapNetworkFeeUsd;
+    const saved = Object.fromEntries(['directProfitBidPct', 'directMaxPriorityGwei', 'directDailyGasUsd',
+      'directPremiumMaxGasUsd', 'directPremiumTipBumpPct'].map(key => [key, MEV[key]]));
+    let clock = now + 2 * 86_400_000;
+    const source = 26_482_010n;
+    async function replay(pct, { proceeds = gross, spent = 0, globalCap = 5, premiumDaily = 20,
+      live = true, feeHistoryFails = false, priorBump = 0, cachedWallet = oneEth, beforeBlock, ...scanOptions } = {}) {
+      clock += 30_000;
+      CONFIG.maxSwapNetworkFeeUsd = globalCap;
+      Object.assign(MEV, { directProfitBidPct: pct, directMaxPriorityGwei: 1, directDailyGasUsd: 4,
+        directPremiumMaxGasUsd: premiumDaily, directPremiumTipBumpPct: priorBump });
+      return scan({ age: minute, profit: proceeds, finalProfit: proceeds, protectedDirect: true,
+        protectedBlocks: 1, estimatedGas: 315_747n, maximumDirectGasUsd: 1.50, fastPriority: tip,
+        snapshotTiming: { blockNumber: source, hash: hash(source), timestamp: Math.floor(clock / 1000), nextBaseFee: base },
+        ...scanOptions, beforeBlock(worker) {
+          CONFIG.forkMode = !live;
+          CONFIG.allowLiveTrading = live;
+          worker.scanPaths = () => undefined;
+          worker.host.ethUsd = () => price;
+          worker.host.walletEthBalance = () => cachedWallet ?? undefined;
+          worker.file.directGas = spent ? [{ hour: Math.floor(clock / 3_600_000), usd: spent }] : [];
+          if (feeHistoryFails) mevReadClient.getFeeHistory = async () => { throw Error('fee history unavailable'); };
+          assert.equal(worker.view().settings.direct.profitBidPct, pct);
+          beforeBlock?.(worker);
+        } });
+    }
+    // All USD budget caps round down to microdollars. Per-gas and percentage interpolation each round down to wei.
+    function expectedTip(pct, proceeds, capUsd, baseline, cachedWallet = oneEth) {
+      const spendable = proceeds - (proceeds + 9n) / 10n;
+      const capWei = BigInt(Math.floor(capUsd * 1e6)) * oneEth / BigInt(price * 1e6);
+      const ceiling = [capWei, spendable - retained, spendable / 2n, cachedWallet].reduce((a, b) => a < b ? a : b);
+      return baseline + (ceiling / gas - base - baseline) * BigInt(pct) / 100n;
+    }
+    try {
+      Date.now = () => clock;
+      const original = await replay(0);
+      const boosted = await replay(25);
+      const [oldTx] = original.signed;
+      const [tx] = boosted.signed;
+      assert.equal(original.signed.length, 1);
+      assert.equal(boosted.signed.length, 1);
+      assert.equal(oldTx.gas, gas);
+      assert.equal(oldTx.maxFeePerGas, 1_165_098_144n);
+      assert.equal(oldTx.maxPriorityFeePerGas, tip);
+      assert.equal(original.journaled[0].opp.submission.profitBid, undefined);
+      assert.equal(tx.gas, gas);
+      assert.equal(tx.maxPriorityFeePerGas, 2_577_215_513n);
+      assert.equal(tx.maxPriorityFeePerGas, expectedTip(25, gross, 5, tip));
+      assert.equal(tx.maxFeePerGas, 2_742_313_657n);
+      const maxSpend = gas * tx.maxFeePerGas;
+      assert.equal(maxSpend, 1_082_347_323_399_388n);
+      assert.ok(maxSpend <= loanLimitWei(5, price));
+      const [args] = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: tx.data }).args;
+      assert.equal(args.maxBlock, source + 1n);
+      assert.equal(args.minProfit, maxSpend + retained);
+      assert.equal(gross - (gross + 9n) / 10n - maxSpend, 5_499_191_768_008_850n);
+      assert.ok(args.minProfit <= gross - (gross + 9n) / 10n);
+      assert.ok(args.minProfit - maxSpend >= maxSpend);
+      const faster = { fastPriority: 2n * tip, priorBump: 10 };
+      const priorPremium = await replay(0, faster);
+      const combined = await replay(25, faster);
+      const bumpedTip = 2_200_000_000n;
+      assert.equal(priorPremium.signed[0].maxPriorityFeePerGas, bumpedTip);
+      assert.equal(combined.signed[0].maxPriorityFeePerGas, expectedTip(25, gross, 5, bumpedTip));
+      assert.equal(combined.journaled[0].opp.submission.profitBid.baselinePriorityWei, String(bumpedTip));
+      const [order] = boosted.journaled;
+      assert.equal(order.autonomous, true);
+      assert.equal(order.target, String(source + 1n));
+      assert.deepEqual(order.opp.submission.profitBid, {
+        pct: 25, baselinePriorityWei: String(tip), signedPriorityWei: String(tx.maxPriorityFeePerGas),
+      });
+      assert.equal(order.opp.tipEth, 0);
+      assert.equal(boosted.finalStates.get('pending').data, tx.data);
+      assert.equal(boosted.finalStates.get('pinned').data, tx.data);
+      const lessAtPending = { pendingProfit: args.minProfit - 1n };
+      assert.equal((await replay(0, lessAtPending)).signed.length, 1);
+      assert.equal((await replay(25, lessAtPending)).signed.length, 0, 'the higher signed floor must pass the last pending-state call');
+      const tinyHeadroom = ((retained + (base + tip + 3n) * gas) * 10n + 8n) / 9n;
+      const roundDown = await replay(25, { proceeds: tinyHeadroom });
+      assert.equal(roundDown.signed[0].maxPriorityFeePerGas, tip, '25% of three wei/gas rounds down to no increase');
+      assert.equal(roundDown.journaled[0].opp.submission.profitBid, undefined);
+      const availableBalance = oldTx.gas * oldTx.maxFeePerGas + 113_971_513n * gas + gas - 1n;
+      const walletClipped = await replay(25, { cachedWallet: availableBalance });
+      assert.equal(walletClipped.signed[0].maxPriorityFeePerGas, expectedTip(25, gross, 5, tip, availableBalance));
+      assert.equal(walletClipped.signed[0].maxPriorityFeePerGas, tip + 28_492_878n);
+      assert.ok(gas * walletClipped.signed[0].maxFeePerGas <= availableBalance);
+      const wide = await replay(50, { proceeds: oneEth / 5n, beforeBlock(worker) { worker.host.ethUsd = () => 100; } });
+      assert.equal(wide.signed[0].maxPriorityFeePerGas, 50_500_000_000n, 'interpolation respects the existing 100 gwei premium ceiling');
+
+      for (const [settings, allowance] of [[{ globalCap: 2.1234569 }, 2.1234569], [{ spent: 17.5000004 }, 20 - 17.5000004],
+        [{ proceeds: 4_300_000_000_000_000n }, 5]]) {
+        const [bid] = (await replay(25, settings)).signed;
+        const proposed = expectedTip(25, settings.proceeds ?? gross, allowance, tip);
+        assert.equal(bid.maxPriorityFeePerGas, proposed);
+        assert.ok(proposed > tip && proposed < tx.maxPriorityFeePerGas);
+        assert.ok(bid.maxFeePerGas * gas <= loanLimitWei(allowance, price));
+      }
+      for (const settings of [{ globalCap: 0.10 }, { spent: 20 }, { profit: 0n, finalProfit: 0n }]) {
+        assert.equal((await replay(25, settings)).signed.length, 0);
+      }
+      for (const settings of [
+        { proceeds: oneEth / 1000n }, { premiumDaily: 0 }, { globalCap: 0.779438 },
+        { protectedDirect: false }, { protectedBlocks: 2 }, { live: false }, { feeHistoryFails: true },
+        { cachedWallet: null }, { cachedWallet: gas * oldTx.maxFeePerGas - 1n },
+        { beforeBlock() { mevReadClient.getFeeHistory = async () => ({ reward: [[100_000_000n]] }); } },
+        { maximumTestGasUsd: 1.50 }, { submission: 'bundle' },
+        { beforeBlock(worker) {
+          worker.file.proxyContract = address(2);
+          worker.queueGasOnlyTest('profit-bid-explicit-control', 5, true, true, false, 0.05);
+        } },
+      ]) {
+        const disabled = await replay(0, settings);
+        const configured = await replay(25, settings);
+        assert.deepEqual(configured.signed, disabled.signed);
+        assert.equal(configured.signed.length, 1, 'the control exercises a signed order');
+        assert.equal(configured.journaled[0].opp.submission.profitBid, undefined);
+      }
+      let tightened = false;
+      const tightenedBudget = await replay(25, { beforeBlock(worker) {
+        const prepare = worker.prepareLive.bind(worker);
+        worker.prepareLive = async (...args) => {
+          const offer = await prepare(...args);
+          if (offer?.fees.maxPriorityFeePerGas === tx.maxPriorityFeePerGas) {
+            tightened = true;
+            CONFIG.maxSwapNetworkFeeUsd = 0.10;
+          }
+          return offer;
+        };
+      } });
+      assert.equal(tightened, true);
+      assert.equal(tightenedBudget.signed.length, 0, 'a stricter global ceiling at signing vetoes the previously prepared bid');
+      let topUps = 0;
+      const limitedWallet = { beforeBlock(worker) {
+        mevReadClient.getBalance = async () => oldTx.gas * oldTx.maxFeePerGas;
+        worker.host.requestGasTopUp = () => { topUps++; };
+      } };
+      assert.equal((await replay(0, limitedWallet)).signed.length, 1);
+      assert.equal((await replay(25, limitedWallet)).signed.length, 0);
+      assert.equal(topUps, 0, 'optional bidding cannot send a wallet funding request');
+      const oldPremiumCost = priorPremium.signed[0].maxFeePerGas * gas;
+      for (const [actualBalance, snapshotBalance, needsOldFunding] of [
+        [oldPremiumCost, oneEth, false], [oldPremiumCost - 1n, oneEth, true], [oldPremiumCost - 1n, oldPremiumCost - 1n, true],
+      ]) {
+        const requests = [];
+        const unfunded = await replay(25, { ...faster, cachedWallet: snapshotBalance, beforeBlock(worker) {
+          mevReadClient.getBalance = async () => actualBalance;
+          worker.host.requestGasTopUp = amount => { requests.push(amount); };
+        } });
+        assert.equal(unfunded.signed.length, 0);
+        assert.equal(requests.length > 0, needsOldFunding);
+        assert.ok(requests.every(amount => amount === oldPremiumCost), 'legacy funding never requests the optional increase');
+      }
+      let queuedAtPrepare = false;
+      const lateManual = await replay(25, { beforeBlock(worker) {
+        worker.file.proxyContract = address(2);
+        const prepare = worker.prepareLive.bind(worker);
+        worker.prepareLive = async (...args) => {
+          const offer = await prepare(...args);
+          if (!queuedAtPrepare && offer?.profitBid) {
+            queuedAtPrepare = true;
+            worker.queueGasOnlyTest('profit-bid-late-manual-control', 1.5);
+          }
+          return offer;
+        };
+      } });
+      assert.ok(queuedAtPrepare);
+      assert.ok(lateManual.signed.every(order => order.maxPriorityFeePerGas <= tip));
+      assert.ok(lateManual.journaled.every(pending => pending.opp.submission.profitBid === undefined));
+    } finally {
+      Object.assign(MEV, saved);
+      CONFIG.maxSwapNetworkFeeUsd = priorGlobal;
       Date.now = realNow;
     }
   }
