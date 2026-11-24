@@ -160,6 +160,96 @@ try {
     });
   }
 
+  // An ordinary market head can arrive while the previous head's receipt check is still in flight.
+  {
+    const originals = { fork: CONFIG.forkMode, nonce: mevReadClient.getTransactionCount, block: publicClient.getBlock,
+      feeHistory: mevReadClient.getFeeHistory };
+    const target = 100n;
+    const head = blockNumber => ({ ...snapshot(now), blockNumber, hash: hash(blockNumber), tokens: [], at: [], results: [] });
+    try {
+      CONFIG.forkMode = false;
+      mevReadClient.getFeeHistory = async () => ({ reward: [[100_000_000n, 300_000_000n]] });
+      for (const scenario of ['crossing', 'no-explicit-height', 'no-crossing', 'regressed', 'replaced', 'stopped',
+        'already-settled', 'already-mature', 'second-unresolved']) {
+        const worker = newSearcher(() => assert.fail('receipt reconciliation must never sign'));
+        worker.scanPaths = () => undefined;
+        worker.traceMissedBundle = () => false;
+        worker.writeState = () => {};
+        const order = { hash: hash(1_999), nonce: 7, kind: 'direct', privateSubmission: true, autonomous: true,
+          target: String(target), contract: address(2), ethUsd: 2000,
+          opp: { hash: hash(1_999), block: Number(target - (scenario === 'already-settled' ? 3n : 1n)), status: 'sent' } };
+        worker.file.pending = order;
+        worker.file.recent = [order.opp];
+        let receipts = 0, activeReads = 0, release = 0, headReads = 0, resumeReceipt, resumeSecond;
+        const first = new Promise(resolve => { resumeReceipt = resolve; });
+        const second = new Promise(resolve => { resumeSecond = resolve; });
+        const receiptBlock = target - 1n;
+        let latest = target + 1n;
+        worker.head = async () => { headReads++; return { number: latest, hash: hash(latest) }; };
+        worker.receipt = async tx => {
+          assert.equal(tx, order.hash);
+          assert.equal(activeReads++, 0, 'the two receipt requests must be serialized');
+          if (++receipts === 1) await first;
+          else if (scenario === 'second-unresolved') await second;
+          activeReads--;
+          return scenario === 'already-settled' ? { transactionHash: tx, from: address(1), to: address(2), status: 'reverted',
+            blockNumber: receiptBlock, blockHash: hash(receiptBlock), gasUsed: 21_000n, effectiveGasPrice: 1n, logs: [] } : null;
+        };
+        publicClient.getBlock = async ({ blockNumber }) => ({ number: blockNumber, hash: hash(blockNumber), timestamp: 1000n, transactions: [] });
+        const nonceAt = [];
+        mevReadClient.getTransactionCount = async ({ blockNumber }) => {
+          nonceAt.push(blockNumber);
+          return scenario === 'second-unresolved' ? order.nonce + 1 : order.nonce;
+        };
+        worker.host.exec.releaseBundle = () => { release++; };
+        worker.host.exec.noteNonceUsed = () => assert.equal(scenario, 'already-settled');
+        const start = scenario === 'already-mature' ? target + 2n : target + 1n;
+        if (scenario === 'no-explicit-height') {
+          void worker.reconcileWallet();
+          await new Promise(resolve => setImmediate(resolve));
+        } else await worker.onBlock(head(start));
+        const previousRecovery = worker.recovery;
+        assert.ok(previousRecovery);
+        latest = scenario === 'no-crossing' ? target + 1n : target + 2n;
+        await worker.onBlock(head(latest));
+        const sameHead = worker.reconcileWallet(latest);
+        assert.equal(worker.recovery, previousRecovery);
+        assert.equal(receipts, 1);
+        assert.deepEqual(nonceAt, []);
+        if (scenario === 'regressed') latest = target + 1n;
+        if (scenario === 'replaced') worker.file.pending = { ...order, hash: hash(2000) };
+        if (scenario === 'stopped') worker.stop();
+        resumeReceipt();
+        if (scenario === 'second-unresolved') {
+          await new Promise(resolve => setImmediate(resolve));
+          assert.equal(receipts, 2);
+          await worker.onBlock(head(target + 3n));
+          resumeSecond();
+        }
+        await Promise.all([sameHead, previousRecovery]);
+        const catchup = ['crossing', 'no-explicit-height', 'second-unresolved'].includes(scenario);
+        const successful = scenario === 'crossing' || scenario === 'no-explicit-height' || scenario === 'already-mature';
+        assert.equal(receipts, catchup ? 2 : 1, scenario);
+        assert.equal(headReads, Number(catchup || scenario === 'regressed') + Number(scenario === 'no-explicit-height'), scenario);
+        assert.deepEqual(nonceAt, successful || scenario === 'second-unresolved' ? [target] : [], scenario);
+        assert.equal(release, Number(successful || scenario === 'already-settled'), scenario);
+        if (successful) {
+          assert.equal(worker.file.pending, null);
+          assert.equal(worker.file.recent[0].status, 'not included');
+          assert.equal(worker.file.recent[0].gasEth, 0);
+        } else if (scenario === 'already-settled') {
+          assert.equal(worker.file.pending, null);
+          assert.equal(worker.file.recent[0].status, 'failed');
+        } else assert.equal(worker.file.pending?.hash, scenario === 'replaced' ? hash(2000) : order.hash);
+      }
+    } finally {
+      CONFIG.forkMode = originals.fork;
+      mevReadClient.getTransactionCount = originals.nonce;
+      publicClient.getBlock = originals.block;
+      mevReadClient.getFeeHistory = originals.feeHistory;
+    }
+  }
+
   {
     const worker = newSearcher(() => assert.fail('sizing must not sign'));
     const block = snapshot(now);

@@ -448,6 +448,7 @@ export class MevSearcher {
   private refreshingPools: Promise<void> | null = null;
   private stateReadError: string | null = null;
   private recovery: Promise<void> | null = null;
+  private confirmationWait?: { order: PendingBundle; eligibleAt: bigint; requested: boolean };
   private settlementWaitHead?: Hex;
   private bundleReserved = false;
   private contractReady = false;
@@ -2017,20 +2018,38 @@ export class MevSearcher {
 
   /** Resolve persisted uncertainty even when the strategy is disarmed or scanning is disabled. */
   async reconcileWallet(current?: bigint): Promise<void> {
-    if (this.recovery) return this.recovery;
+    if (this.recovery) {
+      const wait = this.confirmationWait;
+      if (wait && this.pending === wait.order && current !== undefined && current >= wait.eligibleAt) wait.requested = true;
+      return this.recovery;
+    }
     if (this.stateReadError || !this.walletPending()) return;
     this.recovery = this.recover(current).catch(() => {
       this.lastError = 'Wallet reconciliation is waiting for reliable chain data and storage.';
     }).finally(() => {
+      this.confirmationWait = undefined;
       this.recovery = null;
     });
     return this.recovery;
   }
 
   private async recover(current?: bigint) {
-    if (this.pending) {
+    const order = this.pending;
+    if (order) {
       this.reserveBundle();
-      await this.checkPending(current ?? (await this.head()).number);
+      const eligibleAt = BigInt(order.target) + RECEIPT_CONFIRMATIONS;
+      // Latch only the first confirmation boundary crossed while this ordinary private order is being checked.
+      const wait = !CONFIG.forkMode && !this.stopping && order.kind === 'direct' && order.privateSubmission && order.autonomous === true
+        && !order.opp.gasOnlyTestId && (current === undefined || current < eligibleAt)
+        ? { order, eligibleAt, requested: false } : undefined;
+      this.confirmationWait = wait;
+      const height = current ?? (await this.head()).number;
+      await this.checkPending(height);
+      this.confirmationWait = undefined;
+      if (wait?.requested && height < eligibleAt && !this.stopping && this.pending === order) {
+        const latest = (await this.head()).number;
+        if (latest >= eligibleAt && !this.stopping && this.pending === order) await this.checkPending(latest);
+      }
     }
     if (this.file.deployTx && !this.deploying) await this.recoverDeployment();
   }
