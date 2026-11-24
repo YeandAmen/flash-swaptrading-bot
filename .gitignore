@@ -6,3 +6,8 @@ data/
 !.env.example
 *.key
 .test-dist/
+go-backend/bin/
+go-backend/bot
+go-backend/coverage.out
+*.test
+.secrets/
