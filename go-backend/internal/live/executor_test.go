@@ -431,6 +431,25 @@ func TestRetryUsesIdenticalSignatureAndNonce(t *testing.T) {
 		t.Fatal("recovery created a new transaction")
 	}
 }
+
+func TestReducedLimitsPreventRebroadcastWithoutFreeingNonce(t *testing.T) {
+	x, f, s, _, r := fixture(t)
+	arm(t, x)
+	f.sendError = true
+	_ = x.Tick(context.Background(), &r)
+	p := *x.j.Pending
+	p.LastAttempt = time.Now().Add(-time.Minute)
+	j := x.j
+	j.Pending = &p
+	if e := x.commit(j); e != nil {
+		t.Fatal(e)
+	}
+	x.cfg.Live.MaxGasWei = big.NewInt(1)
+	_ = x.Tick(context.Background(), nil)
+	if len(f.sent) != 1 || s.calls != 1 || x.View().PendingHash == (common.Hash{}) {
+		t.Fatal("stricter limits rebroadcast or freed a reserved nonce")
+	}
+}
 func TestZeroAttemptExpiryCanReleaseUnbroadcastRecord(t *testing.T) {
 	x, f, s, _, r := fixture(t)
 	arm(t, x)

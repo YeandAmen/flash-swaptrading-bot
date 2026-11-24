@@ -398,6 +398,31 @@ func (x *Executor) sendLocked(ctx context.Context) error {
 	if e != nil {
 		return x.stop("Invalid pending transaction")
 	}
+	order, e := decodeTransaction(tx, x.cfg.Proxy, x.chain)
+	if e != nil {
+		return e
+	}
+	reserve, _ := new(big.Int).SetString(p.ReserveWei, 10)
+	allowedToken := false
+	for _, token := range x.cfg.Tokens {
+		if token == order.Token {
+			allowedToken = true
+		}
+	}
+	if !allowedToken || tx.Gas() > x.cfg.GasUnits || tx.GasFeeCap().Cmp(x.cfg.Live.MaxFeeWei) > 0 || order.AmountIn.Cmp(x.cfg.Live.MaxPrincipalWei) > 0 || reserve.Cmp(x.cfg.Live.MaxGasWei) > 0 || new(big.Int).Add(x.spent(), reserve).Cmp(x.cfg.Live.DailyGasWei) > 0 || order.MinProfit.Cmp(new(big.Int).Add(reserve, x.cfg.MinimumNet)) < 0 {
+		return errors.New("reserved order exceeds current limits; tracking without rebroadcast")
+	}
+	for _, c := range []interface {
+		ChainID(context.Context) (*big.Int, error)
+	}{x.read, x.sender} {
+		id, e := c.ChainID(ctx)
+		if e != nil {
+			return errors.New("cannot verify broadcast chain")
+		}
+		if id.Cmp(x.chain) != 0 {
+			return x.stop("Broadcast RPC chain changed; execution stopped")
+		}
+	}
 	h, e := x.read.HeaderByNumber(ctx, nil)
 	if e != nil || h.Number.Uint64() >= p.MaxBlock {
 		return errors.New("target block passed before broadcast; awaiting recovery")

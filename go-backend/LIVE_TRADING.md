@@ -151,6 +151,9 @@ closed. **Keep one dedicated wallet with one persistent journal directory.** Do
 not share its nonce with another bot or wallet, delete the journal, copy it into
 an independent active deployment, or move to a fresh directory to reset limits.
 Changing a spending limit does not erase pending reserves or confirmed spend.
+Recovery does not rebroadcast an old signature that exceeds the newly configured
+limits or token universe. A transaction already accepted by a provider can still
+settle under its original signed limits.
 
 ## Validation boundaries
 
