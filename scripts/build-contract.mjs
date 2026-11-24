@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 process.chdir(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
 
-const targets = ['v2', 'v3', 'proxy', 'logic', 'logic-v2', 'logic-v3', 'arbitrum', 'arbitrum-logic', 'arbitrum-logic-v2'];
+const targets = ['v2', 'v3', 'proxy', 'logic', 'logic-v2', 'logic-v3', 'logic-v4', 'arbitrum', 'arbitrum-logic', 'arbitrum-logic-v2'];
 const target = process.argv[2] ?? 'all';
 if (target !== 'all' && !targets.includes(target)) throw new Error(`Use npm run build:contract -- ${targets.join('|')}|all`);
 const compiler = process.env.SOLC || 'solc';
@@ -16,13 +16,15 @@ if (!version?.startsWith(`${release}.`) && version !== release) throw new Error(
 
 for (const version of target === 'all' ? targets : [target]) {
   const suffix = version.toUpperCase().replace('-', '_');
-  const name = ({ proxy: 'FlashArbProxy', logic: 'FlashArbLogic', 'logic-v2': 'FlashArbLogicV2', 'logic-v3': 'FlashArbLogicV3', arbitrum: 'FlashArbArbitrum',
+  const name = ({ proxy: 'FlashArbProxy', logic: 'FlashArbLogic', 'logic-v2': 'FlashArbLogicV2', 'logic-v3': 'FlashArbLogicV3',
+    'logic-v4': 'FlashArbLogicV4', arbitrum: 'FlashArbArbitrum',
     'arbitrum-logic': 'FlashArbArbitrumLogic', 'arbitrum-logic-v2': 'FlashArbArbitrumLogicV2' })[version] ?? `FlashArb${suffix}`;
   const source = `contracts/${name}.sol`;
   const out = execFileSync(compiler, [
     '--via-ir', '--optimize', '--optimize-runs', '200', '--evm-version', 'cancun', '--combined-json', 'abi,bin,bin-runtime', source,
   ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
   const contract = JSON.parse(out).contracts[`${source}:${name}`];
+  if (contract['bin-runtime'].length / 2 > 24_576) throw new Error(`${name} exceeds the EIP-170 runtime limit`);
   const abi = typeof contract.abi === 'string' ? JSON.parse(contract.abi) : contract.abi;
   const arbitrum = {
     arbitrum: { file: 'src/arbitrum/artifact.ts', prefix: 'ARBITRUM_FLASH_ARB' },

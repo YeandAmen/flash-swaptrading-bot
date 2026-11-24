@@ -14,11 +14,14 @@ Object.assign(process.env, { FORK_MODE: '1', RPC_URL: rpc.href, SEND_RPC_URL: rp
   ALLOW_LIVE_TRADING: 'off', DATA_DIR: temporary, WALLET_KEY_FILE: join(temporary, 'disposable-wallet.json') });
 
 try {
-  const { ADDR, CORE_TOKENS } = await import('../dist/config.js');
+  const { ADDR, CORE_TOKENS, MEV } = await import('../dist/config.js');
   const { publicClient } = await import('../dist/chain.js');
   const { bestCycle, buildStateReads, curveBuyRefinement, discoverArbPools, MEV_EXTRA_TOKENS, poolVenue, reservesOf, toNextVenue } =
     await import('../dist/mev/pools.js');
   const { selectActiveTokens } = await import('../dist/mev/universe.js');
+  const { AERO_CL_FACTORY } = await import('../dist/mev/next-pools.js');
+  const { proxyReleaseHash } = await import('../dist/mev/proxy.js');
+  const { MevSearcher } = await import('../dist/mev/searcher.js');
 
   const token = CORE_TOKENS.find(({ symbol }) => symbol === 'WBTC');
   const wethIs0 = BigInt(ADDR.weth) < BigInt(token.address);
@@ -32,6 +35,102 @@ try {
   assert.deepEqual(selectActiveTokens([universeToken], 2)[0].pools, [first, otherVenue]);
   assert.deepEqual(selectActiveTokens([{ ...universeToken, pools: [first, sameVenue, shallow] }], 2)[0].pools,
     [first, sameVenue], 'keep the superior same-venue second leg when the alternative is shallow');
+
+  const stable = MEV_EXTRA_TOKENS.find(({ symbol }) => symbol === 'USDC');
+  const tether = MEV_EXTRA_TOKENS.find(({ symbol }) => symbol === 'USDT');
+  const aeroPool = { address: '0xd661623947ef2ead12d577b47021c167d163b0c5', venue: 'Aero Slipstream', kind: 8, v2: false, fee: 0 };
+  const success = result => ({ status: 'success', result });
+  const failed = { status: 'failure' };
+  const originalMulticall = publicClient.multicall;
+  let optionalFailure = false;
+  const aeroLookups = [];
+  try {
+    publicClient.multicall = async ({ contracts }) => contracts.map(call => {
+      if (call.address === AERO_CL_FACTORY) {
+        aeroLookups.push(call.args);
+        return optionalFailure ? failed : success(call.args[0] === stable.address ? aeroPool.address : address(20));
+      }
+      if (call.functionName === 'getPool') return success(call.address === ADDR.uniFactory && call.args[2] === 500 ? address(5) : address(0));
+      if (call.functionName === 'getPair') return success(address(0));
+      return success(100n * 10n ** 18n);
+    });
+    const tokens = [stable, tether, { ...token, symbol: 'USDC' }];
+    assert.deepEqual(await discoverArbPools(tokens, 1), []);
+    assert.deepEqual(aeroLookups, [], 'older releases spend no Aero discovery budget');
+    const markets = await discoverArbPools(tokens, 1, { includeAero: true });
+    assert.deepEqual(aeroLookups, [[stable.address, ADDR.weth, 50], [tether.address, ADDR.weth, 50]]);
+    assert.equal(markets.length, 2);
+    assert.ok(markets.every(t => t.pools.length === 2 && t.pools.some(p => p.kind === 8)));
+    optionalFailure = true;
+    assert.deepEqual(await discoverArbPools(tokens, 1, { includeAero: true }), []);
+  } finally { publicClient.multicall = originalMulticall; }
+
+  const pair = { token: stable, wethIs0: false, pools: [aeroPool, { ...first, kind: 2, fee: 0.0005 }] };
+  const reads = buildStateReads([pair]);
+  assert.deepEqual(reads.contracts.slice(2, 5).map(call => call.functionName), ['slot0', 'liquidity', 'fee']);
+  assert.equal(reads.contracts[2].abi.find(x => x.name === 'slot0').outputs.length, 6);
+  assert.deepEqual(toNextVenue(aeroPool), { kind: 8, pool: aeroPool.address, fee: 0, tickSpacing: 50, nativeEth: false });
+  // Ethereum 26481443, including the dynamic fee and canonical factory's two-swap market.
+  const slot = [1916362932470542656428128511983616n, 201882, 855, 900, 900, true];
+  const uniSlot = [1918658504726226871868652321296582n, 201906, 275, 723, 723, 68, true];
+  const liq = 761393202730698280n;
+  const aeroState = [success(slot), success(liq), success(218)];
+  const priced = reservesOf(pair, aeroPool, aeroState, 0);
+  assert.equal(priced.buyFee, 0.000218);
+  assert.equal(priced.sellFee, 0.000218);
+  assert.equal(reservesOf(pair, aeroPool, [success(slot), success(liq), success(3500)], 0).buyFee, 0.0035);
+  for (const bad of [failed, success(-1), success(1e6), success(10.5), success(null)]) {
+    assert.equal(reservesOf(pair, aeroPool, [success(slot), success(liq), bad], 0), null);
+  }
+  assert.equal(reservesOf(pair, aeroPool, [success(slot), success(0n), success(218)], 0), null);
+  assert.equal(reservesOf(pair, aeroPool, [success([...slot.slice(0, 5), false]), success(liq), success(218)], 0), null);
+
+  // Pinned Aero MetaQuoter + Uni QuoterV2 round-trip proceeds for the five ordinary scanner proposals.
+  const grossBySize = new Map([
+    [12882984512425461760n, 10801605221861263n], [7085641481834004480n, 8615287746923889n],
+    [1932447676863819264n, 2998426418994914n], [21901073671123283968n, 4732511094372272n],
+    [10306387609940369408n, 10369830805865116n],
+  ]);
+  const saved = { funding: MEV.funding, submission: MEV.submission, maxLoanUsd: MEV.maxLoanUsd };
+  async function scanAero({ funding = 'auto', release = proxyReleaseHash, reverse = false, limit = Infinity, manual = false } = {}) {
+    Object.assign(MEV, { funding, submission: 'bundle', maxLoanUsd: limit });
+    const searcher = new MevSearcher({ ethUsd: () => 1706.87581561, log() {}, tradePending: () => false }, false);
+    searcher.file.proxyContract = address(27);
+    searcher.file.proxyRelease = release;
+    if (manual) {
+      searcher.queuedTest = { id: 'manual', expiresAt: Date.now() + 60_000 };
+      searcher.scanGasOnlyTest = async () => {};
+    }
+    const calls = [];
+    searcher.simulate = async (_token, buy, sell, amount, _deadline, block, funding) => {
+      calls.push({ buy: buy.kind, sell: sell.kind, amount, block, funding });
+      const profit = reverse || Number.isFinite(limit) ? 10n ** 16n : grossBySize.get(amount);
+      assert.ok(profit, 'unknown size in the historical fixture');
+      return { ok: true, profit };
+    };
+    await searcher.onBlock({ blockNumber: 26481443n, hash: '0xd09ff935a70b798f0b468625f6b0bf3c6fc2531afff6583225d9170b7f64edf8',
+      timestamp: Math.floor(Date.now() / 1000), nextBaseFee: 2107315504n, tokens: [pair], at: reads.at,
+      results: [success(26481443n), success(0n), ...aeroState,
+        success(reverse ? [slot[0] * 999n / 1000n, ...uniSlot.slice(1)] : uniSlot), success(3832058717280284881n)],
+      readMs: 0, failedChunks: 0 });
+    return { calls, candidates: searcher.lastBlock.candidates, best: searcher.file.recent[0] };
+  }
+  try {
+    const natural = await scanAero();
+    assert.deepEqual(natural.calls.map(c => c.amount), [...grossBySize.keys()]);
+    assert.ok(natural.calls.every(c => c.funding === 2 && c.buy === 8 && c.sell === 2 && c.block === 26481443n));
+    assert.equal(natural.best.grossEth, Number(10801605221861263n) / 1e18);
+    assert.equal(natural.best.funding, 'Morpho Blue');
+    assert.equal(natural.best.sizeEth, Number(12882984512425461760n) / 1e18);
+    const reverse = await scanAero({ funding: 'morpho', reverse: true, limit: 1706.87581561 });
+    assert.ok(reverse.calls.length > 0 && reverse.calls.every(c => c.funding === 2 && c.sell === 8 && c.amount <= 10n ** 18n));
+    for (const excluded of [{ funding: 'pool' }, { funding: 'aave' }, { funding: 'spark' }, { funding: 'balancer' },
+      { release: '0x24eeea8287c4dcd7878691e0a7af3e945dc32cdf941309cb34f44c1523ab47d7' }, { manual: true }]) {
+      const result = await scanAero(excluded);
+      assert.equal(result.candidates, 0, JSON.stringify(excluded));
+      assert.equal(result.calls.length, 0);
+    }
+  } finally { Object.assign(MEV, saved); }
 
   const curve = { ...otherVenue, v2: false, fee: 0, venue: 'Curve Tricrypto-NG', kind: 7 };
   const quotes = { curve: {

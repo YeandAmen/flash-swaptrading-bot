@@ -260,6 +260,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     assert.equal(initial.mode, 'live', logs.join(' | '));
     const { bundles, directAttempts = 0, directLanded = 0 } = initial.stats;
     const initialGasUsd = initial.settings.direct.spentGasUsd;
+    assert.equal(initialGasUsd, 0, 'reverted fork receipts must not spend the next independent scenario’s daily gas allowance');
     const head = await searcher['head']();
     // Model a substantially higher base fee without changing other fixtures' fork state.
     const quoteBaseFee = privateProfit ? parseGwei('4') : nextBaseFee(head);
@@ -289,6 +290,7 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
       assert.ok(lowBudget);
       assert.equal(await searcher['prepareLive'](offer, point, policy, lowBudget), null,
         'a test must reject even a valid route when its padded gas quote exceeds the one-shot budget');
+      assert.equal(opp.note, 'direct route exceeds an approved gas limit');
       lowBudget.expiresAt = Date.now() - 1;
       assert.equal(searcher.view().gasOnlyTest?.status, 'expired');
       searcher.queueGasOnlyTest(testId, maximumTestGasUsd, false, privateGasOnly, publicFunctional);
@@ -396,8 +398,8 @@ async function sendWithSearcher(buy: ArbPool, sell: ArbPool, amount: bigint, pro
     }
     return receipt.transactionHash;
   } finally {
-    // The enclosing fixture will revert the local transaction and its gas charge.
-    if (privateProfit) searcher.file.directGas = previousDirectGas;
+    // The enclosing Anvil snapshot reverts this receipt and its gas charge. Restore the matching journal balance.
+    searcher.file.directGas = previousDirectGas;
     searcher.stop();
     Object.assign(MEV, saved);
   }

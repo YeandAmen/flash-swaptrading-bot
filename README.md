@@ -89,6 +89,8 @@ The FlashArb proxy supports Uniswap v2/v3, SushiSwap v2/v3, and PancakeSwap v2/v
 
 For an automatic Ethereum trade that buys on Curve, the scanner can also test a Morpho loan between two measured sizes. It tests that amount alongside the original sizes at the same block when the pool quotes suggest a higher payout there. Each size must pass the executor simulation and the selected trade must cover its gas and profit floor.
 
+Ethereum FlashArb Logic V4 adds Aero Slipstream to automatic two-swap routes funded by Morpho Blue. It supports the registered WETH/USDC and WETH/USDT pools at tick spacing 50, in either direction. Use `MEV_FUNDING=auto` or `morpho`. The scanner reads each pool's fee and state at the quote block. Before signing, it simulates the full swap through the verified proxy because Aero's execution fee can depend on the caller. Existing Logic V3 proxies continue to trade their supported routes until their owner upgrades. [Aero Ethereum deployments](https://github.com/Dromos-Labs/metadex-slipstream-public/blob/main/deployment-addresses/cl-ethereum.json)
+
 The searcher checks canonical factory or PoolManager state. It compares live pool depth, quotes candidate sizes at a consistent block, and rejects candidates that fail the profit floor after gas and any applicable flash-loan premium and builder tip. The V4 scanner restricts compatibility to pool types the contract can settle. Tokens from the public Ethereum token lists are indexed in paced batches. `MEV_UNIVERSE=spot` restricts the sweep to the spot and core universe, and `MEV_MAX_TRACKED_POOLS` limits active per-block reads.
 
 For a live bundle, expand the target block in the MEV activity table to see the submission lead time, quoted gas budget and builder payment, and each builder's response time. The table reserves space for the five most recent submissions. Titan and Quasar traces can show what happened to an acknowledged bundle after it missed its target block. A bundle is marked landed after the bot verifies its on-chain receipt. [Titan tracing](https://docs.titanbuilder.xyz/bundle-tracing) · [Quasar tracing](https://docs.quasar.win/bundle-tracing)
@@ -184,11 +186,12 @@ Profitable trades repay the lender and forward proceeds and relevant route lefto
 For maintainers, keep the trading owner in persistent slot zero, the execution lock in transient slot zero, and the existing execution and settlement interfaces compatible. Keep previously supported implementation runtimes in the bot's release list so existing proxies can still operate after a software update. Rebuild with solc 0.8.26, then verify the upgrade on a pinned Ethereum fork using fake funds.
 
 ```sh
-npm run build:contract -- logic-v3
+npm run build:contract -- logic-v4
 npm run build
 npm run wallet:local-test
 FORK_BLOCK_NUMBER=26451239 npm run mev-proxy-fork-test
 FORK_BLOCK_NUMBER=26468992 npm run mev-path-fork-test
+FORK_BLOCK_NUMBER=26481443 npm run mev:aero-fork-test
 ```
 
 The proxy uses standardized implementation and admin slots. [ERC-1967](https://eips.ethereum.org/EIPS/eip-1967) · [SparkLend Ethereum deployment verification](https://docs.spark.fi/assets/Chainsecurity-SparkLend-Deployment-Verification.pdf)

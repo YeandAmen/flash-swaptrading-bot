@@ -7,6 +7,15 @@ export const PANCAKE_V2_FACTORY = getAddress('0x1097053fd2ea711dad45caccc45eff75
 export const UNISWAP_V4_MANAGER = getAddress('0x000000000004444c5dc75cb358380d2e3de08a90');
 export const UNISWAP_V4_STATE_VIEW = getAddress('0x7ffe42c4a5deea5b0fec41c94c136cf115597227');
 export const PANCAKE_V3_FEES = [100, 500, 2500, 10_000];
+// Dromos Labs' Ethereum deployment-addresses/cl-ethereum.json.
+export const AERO_CL_FACTORY = getAddress('0xf4fd2e6c5b60c5b365cd1b96dd6245e6d60414c2');
+export const AERO_TICK_SPACING = 50;
+export const aeroFactoryAbi = parseAbi(['function getPool(address,address,int24) view returns (address)']);
+export const aeroPoolAbi = parseAbi([
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, bool unlocked)',
+  'function liquidity() view returns (uint128)',
+  'function fee() view returns (uint24)',
+]);
 
 /** Keep discriminants stable for both direct contracts and upgradeable logic. */
 export const enum NextVenueKind {
@@ -18,6 +27,7 @@ export const enum NextVenueKind {
   UniswapV4 = 5,
   PancakeV2 = 6,
   CurveTricrypto = 7,
+  AeroSlipstream = 8,
 }
 
 // Curve's Ethereum Tricrypto-NG deployment registry. The executor uses the same fixed pool list.
@@ -25,6 +35,7 @@ export const CURVE_TRICRYPTO_FACTORY = getAddress('0x0c0e5f2ff0ff18a3be9b8356350
 const CURVE_USDC = getAddress('0x7f86bf177dd4f3494b841a37e810a34dd56c829b');
 const CURVE_USDT = getAddress('0xf5f5b97624542d72a9e06f04804bf81baa15e2b4');
 const USDT = getAddress('0xdac17f958d2ee523a2206206994597c13d831ec7');
+export const AERO_QUOTE_TOKENS = new Set([ADDR.usdc.toLowerCase(), USDT.toLowerCase()]);
 const WBTC = getAddress('0x2260fac5e5542a773aa44fbcfedf7c193bc2c599');
 
 export const curveTricryptoAbi = parseAbi([

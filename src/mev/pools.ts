@@ -3,6 +3,7 @@ import { ADDR, type TokenCfg } from '../config.js';
 import { erc20Abi, factoryAbi, multicall3Abi, poolAbi, v2FactoryAbi, v2PairAbi } from '../chain.js';
 import { bigMulticall, type McResult } from '../market.js';
 import {
+  AERO_CL_FACTORY, AERO_QUOTE_TOKENS, AERO_TICK_SPACING, aeroFactoryAbi, aeroPoolAbi,
   CURVE_BUY_PROBES, CURVE_TRICRYPTO_FACTORY, CURVE_WETH_INDEX, curveStateReads, curveTricryptoAbi, curveTricryptoCandidates,
   NextVenueKind, PANCAKE_V2_FACTORY, PANCAKE_V3_FACTORY, PANCAKE_V3_FEES, UNISWAP_V4_MANAGER, pancakeV3PoolAbi,
   v4Candidates, v4FeeFraction, v4LiquidityRead, v4SlotRead, v4StateReads,
@@ -69,6 +70,9 @@ export function poolIdentity(pool: ArbPool): string {
 
 export function toNextVenue(pool: ArbPool) {
   if (pool.kind === undefined) throw new Error('Unrecognized FlashArb venue');
+  if (pool.kind === NextVenueKind.AeroSlipstream) {
+    return { kind: pool.kind, pool: pool.address, fee: 0, tickSpacing: AERO_TICK_SPACING, nativeEth: false };
+  }
   return { kind: pool.kind, pool: pool.address, fee: pool.v4?.fee ?? Math.round(pool.fee * 1e6),
     tickSpacing: pool.v4?.tickSpacing ?? 0, nativeEth: pool.v4?.nativeEth ?? false };
 }
@@ -78,6 +82,7 @@ export interface DiscoverArbOptions {
   includePancakeV3?: boolean;
   includeUniswapV4?: boolean;
   includeCurve?: boolean;
+  includeAero?: boolean;
   v4PoolKeys?: readonly V4PoolSeed[];
 }
 
@@ -143,8 +148,15 @@ export async function discoverArbPools(tokens: TokenCfg[], minWeth: number, opti
       lookups.push({ ti, venue: v.venue, v2: true, fee: v.fee, kind: v.kind, call: { address: v.factory, abi: v2FactoryAbi, functionName: 'getPair', args: [t.address, ADDR.weth] } });
     }
   });
+  const baseLookups = lookups.length;
+  if (options.includeAero) for (const [ti, t] of list.entries()) {
+    if (!AERO_QUOTE_TOKENS.has(t.address.toLowerCase())) continue;
+    lookups.push({ ti, venue: 'Aero Slipstream', v2: false, fee: 0, kind: NextVenueKind.AeroSlipstream,
+      call: { address: AERO_CL_FACTORY, abi: aeroFactoryAbi, functionName: 'getPool', args: [t.address, ADDR.weth, AERO_TICK_SPACING] } });
+  }
   const found = await bigMulticall(lookups.map((l) => l.call), 800);
-  if (found.filter((r) => r.status !== 'success').length > lookups.length * 0.02) throw new Error('RPC error while looking up arbitrage pools');
+  // Optional Aero reads share these batches; they cannot invalidate discovery of the existing venues.
+  if (found.slice(0, baseLookups).filter(r => r.status !== 'success').length > baseLookups * 0.02) throw new Error('RPC error while looking up arbitrage pools');
   const pools = lookups
     .map((l, i) => ({ ...l, address: (found[i].status === 'success' ? found[i].result : zeroAddress) as Address }))
     .filter((p) => p.address !== zeroAddress);
@@ -152,9 +164,11 @@ export async function discoverArbPools(tokens: TokenCfg[], minWeth: number, opti
   // depth: WETH held by the pool; v3 pools also need in-range liquidity
   const depth = await bigMulticall(pools.flatMap((p) => [
     { address: ADDR.weth, abi: erc20Abi, functionName: 'balanceOf', args: [p.address] },
-    p.v2 ? { address: p.address, abi: v2PairAbi, functionName: 'getReserves' } : { address: p.address, abi: poolAbi, functionName: 'liquidity' },
+    p.v2 ? { address: p.address, abi: v2PairAbi, functionName: 'getReserves' }
+      : { address: p.address, abi: p.kind === NextVenueKind.AeroSlipstream ? aeroPoolAbi : poolAbi, functionName: 'liquidity' },
   ]));
-  if (depth.filter((r) => r.status !== 'success').length > depth.length * 0.02) throw new Error('RPC error while checking arbitrage pool depth');
+  const baseDepthReads = 2 * pools.filter(p => p.kind !== NextVenueKind.AeroSlipstream).length;
+  if (depth.slice(0, baseDepthReads).filter(r => r.status !== 'success').length > baseDepthReads * 0.02) throw new Error('RPC error while checking arbitrage pool depth');
   const byToken = new Map<number, ArbPool[]>();
   pools.forEach((p, i) => {
     const bal = depth[2 * i];
@@ -247,7 +261,9 @@ export function buildStateReads(tokens: ArbToken[]) {
     if (p.v2) contracts.push({ address: p.address, abi: v2PairAbi, functionName: 'getReserves' });
     else if (p.v4) contracts.push(...v4StateReads(p.v4));
     else if (p.curve) contracts.push(...curveStateReads(p.curve));
-    else {
+    else if (p.kind === NextVenueKind.AeroSlipstream) {
+      for (const functionName of ['slot0', 'liquidity', 'fee']) contracts.push({ address: p.address, abi: aeroPoolAbi, functionName });
+    } else {
       const abi = p.kind === NextVenueKind.PancakeV3 ? pancakeV3PoolAbi : poolAbi;
       contracts.push({ address: p.address, abi, functionName: 'slot0' }, { address: p.address, abi, functionName: 'liquidity' });
     }
@@ -320,8 +336,19 @@ export function reservesOf(t: ArbToken, p: ArbPool, r: McResult[], i: number): R
     return { w: Number(rw) / 1e18, t: Number(rt) / (10 ** t.token.decimals) };
   }
   if (r[i]?.status !== 'success' || r[i + 1]?.status !== 'success') return null;
-  const [sqrtPriceX96] = r[i].result as readonly [bigint, ...unknown[]];
+  const slot = r[i].result;
+  if (!Array.isArray(slot)) return null;
+  const [sqrtPriceX96] = slot;
   const liquidity = r[i + 1].result as bigint;
+  if (p.kind === NextVenueKind.AeroSlipstream) {
+    const fee = r[i + 2];
+    if (slot[5] !== true || typeof sqrtPriceX96 !== 'bigint'
+      || typeof liquidity !== 'bigint' || fee?.status !== 'success' || typeof fee.result !== 'number'
+      || !Number.isInteger(fee.result) || fee.result < 0 || fee.result >= 1_000_000) return null;
+    const reserves = virtualReserves(sqrtPriceX96, liquidity, t.wethIs0, t.token.decimals);
+    // fee() is a current pre-swap hint. The exact proxy call also applies the hook's actual transaction context.
+    return reserves && { ...reserves, buyFee: fee.result / 1e6, sellFee: fee.result / 1e6 };
+  }
   if (!p.v4) return virtualReserves(sqrtPriceX96, liquidity, t.wethIs0, t.token.decimals);
   const [, , protocolFee, lpFee] = r[i].result as V4Slot0;
   if (lpFee !== p.v4.fee) return null;

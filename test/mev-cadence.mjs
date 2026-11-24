@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, parseAbiParameters } from 'viem';
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, keccak256, parseAbiParameters } from 'viem';
 
 const temporary = mkdtempSync(join(tmpdir(), 'eth-mev-cadence-'));
 const loopback = 'http://127.0.0.1:18647';
@@ -91,7 +91,16 @@ try {
   const { FLASH_ARB_V3_ABI } = await import('../dist/mev/artifact-v3.js');
   const { FLASH_ARB_PROXY_ABI, FLASH_ARB_PROXY_RUNTIME } = await import('../dist/mev/artifact-proxy.js');
   const { FLASH_ARB_LOGIC_V3_RUNTIME } = await import('../dist/mev/artifact-logic-v3.js');
-  const { proxyReleaseHash } = await import('../dist/mev/proxy.js');
+  const { proxyReleaseHash, proxyReleaseRuntime, releaseRuntime, releaseSupportsPath, releaseSupportsAero } = await import('../dist/mev/proxy.js');
+  const deployedV3 = '0x24eeea8287c4dcd7878691e0a7af3e945dc32cdf941309cb34f44c1523ab47d7';
+  assert.equal(keccak256(FLASH_ARB_LOGIC_V3_RUNTIME), deployedV3);
+  assert.equal(releaseRuntime(deployedV3), FLASH_ARB_LOGIC_V3_RUNTIME);
+  assert.equal(releaseSupportsPath(deployedV3), true);
+  assert.equal(releaseSupportsAero(deployedV3), false);
+  assert.notEqual(proxyReleaseHash, deployedV3);
+  assert.equal(releaseSupportsAero(proxyReleaseHash), true);
+  assert.equal(releaseSupportsPath(proxyReleaseHash), true);
+  assert.equal(releaseSupportsAero(hash(70)), false);
   const { FLASH_ARB_LOGIC_V3_ABI } = await import('../dist/mev/artifact-logic-v3.js');
   const { fundingTrials } = await import('../dist/mev/flash-arb.js');
   const { MevSearcher } = await import('../dist/mev/searcher.js');
@@ -809,7 +818,7 @@ try {
         let unblock;
         const pendingVerification = new Promise(resolve => { unblock = resolve; });
         publicClient.getBlockNumber = async () => { await pendingVerification; return block.blockNumber; };
-        publicClient.getCode = async ({ address: addr }) => addr === address(2) ? FLASH_ARB_PROXY_RUNTIME : FLASH_ARB_LOGIC_V3_RUNTIME;
+        publicClient.getCode = async ({ address: addr }) => addr === address(2) ? FLASH_ARB_PROXY_RUNTIME : proxyReleaseRuntime;
         publicClient.getStorageAt = async ({ slot }) => hash(slot.startsWith('0xb531') ? 1 : 3);
         publicClient.readContract = async () => address(1);
         try {

@@ -20,7 +20,7 @@ import { directCadence, extraRoutes, loanLimitWei, MAX_FLASH_LOAN_WEI } from './
 import { EthereumPathPlanner, type EthereumPathCandidate, type EthereumPathResult } from './multihop.js';
 import { HeadBackfill } from './head-backfill.js';
 import { createHeadWake, type HeadHint, type HeadWakeResult } from './head-wake.js';
-import { encodePathArbitrage, releaseSupportsPath, pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
+import { encodePathArbitrage, releaseSupportsPath, pinnedArbitrage, proxyCreationData, proxyReleaseHash, proxyReleaseRuntime, proxyUpgradeData, releaseRuntime, releaseSupportsAero, releaseSupportsCurve, releaseSupportsPancakeV2, releaseSupportsSpark, verifyFlashProxy } from './proxy.js';
 import { comparableRouteQuote, rankRouteNet, routeInputSizes, type RouteQuoteSample } from './sizing.js';
 import { NextVenueKind, UNISWAP_V4_MANAGER } from './next-pools.js';
 import { arbGas, bestCycle, buildStateReads, curveBuyRefinement, inventoryCanCoverExitFloor, inventoryCanCoverV2Floor, MEV_EXTRA_TOKENS, poolIdentity, poolVenue, reservesOf, type ArbPool, type ArbToken } from './pools.js';
@@ -332,6 +332,10 @@ interface Candidate {
   curveTrialWei?: bigint;
 }
 
+function usesAero(candidate?: Candidate): boolean {
+  return candidate?.A.kind === NextVenueKind.AeroSlipstream || candidate?.B.kind === NextVenueKind.AeroSlipstream;
+}
+
 type Offer = ({ candidate: Candidate; path?: undefined } | { path: EthereumPathCandidate; candidate?: undefined; release: Hex }) & {
   amount: bigint;
   profit: bigint;
@@ -475,6 +479,7 @@ export class MevSearcher {
       includePancakeV3: true, includeUniswapV4: true,
       get includePancakeV2() { return searcher.supportsPancakeV2; },
       get includeCurve() { return searcher.supportsCurve; },
+      get includeAero() { return searcher.supportsAero; },
     });
   }
 
@@ -484,6 +489,11 @@ export class MevSearcher {
   private get supportsSpark() { return this.previewLatest || Boolean(this.file.proxyRelease && releaseSupportsSpark(this.file.proxyRelease)); }
   private get supportsPancakeV2() { return this.previewLatest || Boolean(this.file.proxyRelease && releaseSupportsPancakeV2(this.file.proxyRelease)); }
   private get supportsCurve() { return this.previewLatest || Boolean(this.file.proxyRelease && releaseSupportsCurve(this.file.proxyRelease)); }
+  private get supportsAero() {
+    if (MEV.funding !== 'auto' && MEV.funding !== 'morpho') return false;
+    if (this.file.proxyContract && this.file.proxyRelease) return releaseSupportsAero(this.file.proxyRelease);
+    return this.previewLatest && !this.selectedContract;
+  }
   private get contractLabel() { return this.file.proxyContract ? 'FlashArb Proxy' : this.isV3 ? 'FlashArbV3' : 'FlashArbV2'; }
   private get contractRuntime(): Hex {
     if (this.previewLatest) return proxyReleaseRuntime;
@@ -930,7 +940,8 @@ export class MevSearcher {
       && validPrice(ethUsd) ? r.v3Inventory : undefined;
     let est: { net: number; gross: number; gas: number; symbol: string } | null = null;
     for (const [ti, t] of r.tokens.entries()) {
-      const res = t.pools.map((p, pi) => reservesOf(t, p, r.results, r.at[ti][pi]));
+      const res = t.pools.map((p, pi) => p.kind === NextVenueKind.AeroSlipstream && (test || !this.supportsAero)
+        ? null : reservesOf(t, p, r.results, r.at[ti][pi]));
       for (const cycle of bestCycle(t.pools, res).cycles) {
         const A = t.pools[cycle.buy];
         const B = t.pools[cycle.sell];
@@ -1388,7 +1399,9 @@ export class MevSearcher {
     }
     if (!sizes.length) return null;
     const lenderOnlyTest = test?.requireGasCoverage === false && !test.privateSubmission && !test.publicFunctional;
-    const trials = fundingTrials(MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark, previous)
+    const aero = usesAero(c);
+    if (aero && (test || !this.supportsAero || this.activeGasOnlyTest())) return null;
+    const trials = fundingTrials(aero ? 'morpho' : MEV.funding, sizes, this.isV3 || this.previewLatest, this.supportsSpark, previous)
       .filter(({ funding }) => funding !== 0 || (!lenderOnlyTest && c.A.kind !== NextVenueKind.CurveTricrypto));
     const refined = c.curveTrialWei;
     if (!test && MEV.funding === 'auto' && c.A.kind === NextVenueKind.CurveTricrypto
@@ -1590,6 +1603,7 @@ export class MevSearcher {
     const contract = this.selectedContract;
     const { candidate: c, opp } = offer;
     const gasOnly = test?.requireGasCoverage === false;
+    if (usesAero(c) && (test || this.activeGasOnlyTest() || !this.supportsAero || offer.funding !== 2)) return null;
     if (offer.path && (test || MEV.submission !== 'direct' || offer.release !== this.pathRelease)) return null;
     if (test && (this.activeGasOnlyTest() !== test || MEV.submission !== 'direct'
       || (gasOnly && !test.privateSubmission && !test.publicFunctional && offer.funding === 0) || offer.profit < 1n)) return null;
@@ -1766,7 +1780,9 @@ export class MevSearcher {
     const direct = MEV.submission === 'direct';
     const { opp } = offer;
     const skip = (note: string) => { this.skipOpportunity(opp, note); };
+    const aero = usesAero(offer.candidate);
     const stillLive = () => this.liveArmed(generation) && this.contractReady && this.selectedContract === contract
+      && (!aero || (this.supportsAero && !this.activeGasOnlyTest()))
       && !this.deploying && !this.host.tradePending() && this.canMeetSendDeadline(r) && (!settlementEligible || settlementEligible());
     const canSend = () => stillLive() && (!settlementEligible || !this.walletPending()) && (!startup || !this.activeGasOnlyTest())
       && (prepared.requiredTestIntent === undefined || this.activeGasOnlyTest() === prepared.requiredTestIntent)

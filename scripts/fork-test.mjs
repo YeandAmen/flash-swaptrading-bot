@@ -11,11 +11,12 @@ const useArbitrum = requestedSuite === 'cli-arbitrum-contract-forktest' || reque
 const useProxy = requestedSuite === 'cli-mev-proxy-forktest';
 const useV3 = useProxy || requestedSuite === 'cli-mev-v3-forktest';
 const suite = requestedSuite === 'cli-mev-forktest' || useV3 ? 'cli-mev-v2-forktest' : requestedSuite;
-const suites = ['cli-forktest', 'cli-mev-v2-forktest', 'cli-mev-path-forktest', 'cli-wallet-forktest', 'cli-arbitrum-contract-forktest', 'cli-arbitrum-path-forktest'];
+const suites = ['cli-forktest', 'cli-mev-v2-forktest', 'cli-mev-path-forktest', 'cli-mev-aero-forktest', 'cli-wallet-forktest', 'cli-arbitrum-contract-forktest', 'cli-arbitrum-path-forktest'];
 const standalone = suite === 'cli-wallet-forktest' && mode === '--standalone';
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   ['PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE'].includes(key.toUpperCase())));
 const argv = ['--host', '127.0.0.1', '--port', '0', '--chain-id', useArbitrum ? '42161' : '1', '--accounts', '0', '--color', 'never'];
+if (suite === 'cli-mev-aero-forktest') argv.push('--order', 'fifo');
 
 function listeningPort(child) {
   return new Promise((resolve, reject) => {
@@ -72,7 +73,7 @@ try {
       throw new Error(`Set FORK_RPC_URL to an ${useArbitrum ? 'Arbitrum One' : 'Ethereum mainnet'} archive RPC URL for Anvil’s read-only upstream`);
     }
     argv.push('--fork-url', upstream.href, '--no-storage-caching');
-    const block = process.env.FORK_BLOCK_NUMBER;
+    const block = suite === 'cli-mev-aero-forktest' ? '26481443' : process.env.FORK_BLOCK_NUMBER;
     if (block) {
       if (!/^[1-9][0-9]*$/.test(block)) throw new Error('FORK_BLOCK_NUMBER must be a positive decimal block number');
       argv.push('--fork-block-number', block);

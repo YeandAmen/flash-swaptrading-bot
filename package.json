@@ -26,6 +26,7 @@
     "mev-v3-fork-test": "node scripts/fork-test.mjs cli-mev-v3-forktest",
     "arbitrum:path-fork-test": "node scripts/fork-test.mjs cli-arbitrum-path-forktest",
     "mev-path-fork-test": "node scripts/fork-test.mjs cli-mev-path-forktest",
+    "mev:aero-fork-test": "node scripts/fork-test.mjs cli-mev-aero-forktest",
     "mev-proxy-fork-test": "node scripts/fork-test.mjs cli-mev-proxy-forktest",
     "wallet:fork-test": "node scripts/fork-test.mjs cli-wallet-forktest",
     "wallet:local-test": "node scripts/fork-test.mjs cli-wallet-forktest --standalone",
