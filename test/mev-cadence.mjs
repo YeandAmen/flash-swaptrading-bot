@@ -881,7 +881,7 @@ try {
         }
         const inner = searcher.file.proxyRelease ? decodeFunctionData({ abi: FLASH_ARB_PROXY_ABI, data }).args[1] : data;
         const order = decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: inner }).args[0];
-        return { data: hash(pendingForToken ? pendingForToken(order.token, order.amountIn) : pendingProfit) };
+        return { data: hash(pendingForToken ? await pendingForToken(order.token, order.amountIn) : pendingProfit) };
       }
       assert.equal(blockNumber, block.blockNumber);
       finalStates.set('pinned', call);
@@ -1185,6 +1185,57 @@ try {
   } finally {
     clearTimeout(watchdog);
     slow.resolve();
+  }
+
+  // TEST1 outranks TEST0 initially. While TEST1 is in final validation, TEST2 becomes
+  // fully prepared with greater net proceeds than either. Only the pending check of TEST1 fails.
+  {
+    const startLateRoute = Promise.withResolvers(), lateRouteReady = Promise.withResolvers();
+    const prepared = new Set(), validated = [];
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      startLateRoute.resolve();
+      lateRouteReady.resolve();
+    }, 2_000);
+    try {
+      const result = await scan({
+        age: 24 * minute, protectedDirect: true,
+        profit: symbol => coversGas * BigInt(1 + Number(symbol.slice(4))),
+        beforeSimulate: symbol => symbol === 'TEST2' ? startLateRoute.promise : undefined,
+        beforeBlock(worker, block) {
+          Date.now = () => block.timestamp * 1000 + 100;
+          const prepare = worker.prepareLive.bind(worker);
+          worker.prepareLive = async (...args) => {
+            const offer = await prepare(...args);
+            if (offer) {
+              const symbol = offer.offer.opp.symbol;
+              prepared.add(symbol);
+              // Let preparePrimary insert its result in the real ready map before failing TEST1.
+              if (symbol === 'TEST2') setImmediate(lateRouteReady.resolve);
+            }
+            return offer;
+          };
+        },
+        pendingForToken: async token => {
+          validated.push(token.toLowerCase());
+          if (token.toLowerCase() !== address(101)) return coversGas;
+          assert.deepEqual([...prepared].sort(), ['TEST0', 'TEST1']);
+          startLateRoute.resolve();
+          await lateRouteReady.promise;
+          return underGas;
+        },
+      });
+      assert.equal(timedOut, false);
+      assert.deepEqual(validated, [address(101), address(102)],
+        'after a final validation failure, compare the newly prepared TEST2 against the still-ready TEST0');
+      assert.equal(result.signed.length, 1);
+      assert.equal(result.signed[0].nonce, 7);
+      assert.equal(decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: result.signed[0].data }).args[0].token.toLowerCase(), address(102));
+      assert.equal(result.journaled.length, 1);
+      assert.equal(result.submitted.length, 1);
+      assert.equal(result.submitted[0], result.journaled[0]);
+    } finally { clearTimeout(timeout); }
   }
 
   {

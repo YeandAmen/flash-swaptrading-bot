@@ -1196,12 +1196,12 @@ export class MevSearcher {
     };
     let signed = false;
     const sendReady = async () => {
-      const ranked = [...ready].sort(([i, a], [j, b]) => {
-        const difference = (a.net - b.net) || (a.tip - b.tip) || (a.offer.score - b.offer.score);
-        return difference > 0n ? -1 : difference < 0n ? 1 : i - j;
-      });
-      for (const [index, offer] of ranked) {
-        if (signed || !canTryLive()) break;
+      while (ready.size && !signed && canTryLive()) {
+        // Another offer may finish preparation during a previous offer's final checks.
+        const [index, offer] = [...ready].sort(([i, a], [j, b]) => {
+          const difference = (a.net - b.net) || (a.tip - b.tip) || (a.offer.score - b.offer.score);
+          return difference > 0n ? -1 : difference < 0n ? 1 : i - j;
+        })[0];
         ready.delete(index);
         await this.sendLive(offer, r, generation, Boolean(startup), waitedForSettlement ? ordinarySettlementScan : undefined);
         signed = Boolean(offer.offer.opp.hash);
