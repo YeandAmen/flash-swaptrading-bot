@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, keccak256, parseAbiParameters } from 'viem';
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, keccak256, parseAbiParameters, RpcRequestError } from 'viem';
 
 const temporary = mkdtempSync(join(tmpdir(), 'eth-mev-cadence-'));
 const loopback = 'http://127.0.0.1:18647';
@@ -66,7 +66,7 @@ function snapshot(now) {
 
 try {
   const { directCadence, extraRoutes, loanLimitWei } = await import('../dist/mev/cadence.js');
-  const { mevReadClient, publicClient } = await import('../dist/chain.js');
+  const { mevPoolClient, mevReadClient, publicClient } = await import('../dist/chain.js');
   const { CONFIG, MEV } = await import('../dist/config.js');
   try {
     for (const raw of [undefined, '1', '2', '3', '0', '4', '-1', '1.5', 'bad']) {
@@ -1616,6 +1616,153 @@ try {
   assert.equal(ordinaryTest.test.status, 'submitted');
   assert.ok(decodeFunctionData({ abi: FLASH_ARB_V3_ABI, data: ordinaryTest.signed[0].data }).args[0].minProfit > 1n,
     'a normal-level profit opportunity consumes the request without lowering its profit floor');
+
+  // Run the real ordinary signing and unused-nonce expiry branches with a fake signer and read-only RPC.
+  {
+    const previous = { fork: CONFIG.forkMode, request: mevPoolClient.request, nonce: mevReadClient.getTransactionCount,
+      getBlock: mevReadClient.getBlock };
+    const hex = n => '0x' + n.toString(16);
+    const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+    const targetHash = hash(7_777);
+    const revertData = '0x08c379a0' + encodeAbiParameters([{ type: 'string' }], ['unprofitable']).slice(2);
+    try {
+      for (const scenario of ['usable', 'path', 'fee-cap', 'revert', 'transport', 'malformed', 'under-floor',
+        'wrong-height', 'evicted', 'disk-retry', 'replaced', 'public', 'manual', 'restored']) {
+        const options = scenario === 'path' ? pathOptions : { age: minute, profit: coversGas };
+        CONFIG.forkMode = previous.fork;
+        const execution = await scan({ ...options, protectedDirect: scenario !== 'public', protectedBlocks: 1,
+          maximumTestGasUsd: scenario === 'manual' ? 2 : undefined,
+          beforeBlock(worker, block) {
+            CONFIG.forkMode = false;
+            CONFIG.allowLiveTrading = true;
+            Date.now = () => block.timestamp * 1000 + 100;
+            if (scenario !== 'path') worker.scanPaths = () => undefined;
+          },
+        });
+        assert.equal(execution.signed.length, 1, scenario);
+        const [tx] = execution.signed;
+        const original = execution.submitted[0];
+        assert.equal(original.autonomous === true, scenario !== 'manual', scenario);
+        let worker = execution.searcher;
+        if (scenario === 'restored') {
+          worker = newSearcher(() => assert.fail('restoring an expired order cannot sign'));
+          worker.file.pending = structuredClone(original);
+          worker.file.recent = [worker.file.pending.opp];
+          worker.writeState = () => {};
+          worker.reserveBundle();
+        }
+        const pending = worker.file.pending;
+        const target = BigInt(pending.target);
+        const reads = [];
+        const journalContainsCall = () => {
+          const json = JSON.stringify(worker.file);
+          return json.includes(tx.data) || json.includes('"0xc0"');
+        };
+        assert.equal(journalContainsCall(), false);
+        CONFIG.forkMode = false;
+        worker.receipt = async () => null;
+        worker.traceMissedBundle = () => false;
+        worker.host.exec.noteNonceUsed = () => assert.equal(scenario, 'replaced');
+        let released = 0, finishRead;
+        worker.host.exec.releaseBundle = () => { released++; };
+        mevReadClient.getTransactionCount = async ({ blockNumber }) => {
+          if (scenario !== 'public') assert.equal(blockNumber, target);
+          return scenario === 'replaced' ? pending.nonce + 1 : pending.nonce;
+        };
+        if (scenario === 'replaced') mevReadClient.getBlock = async () => ({ hash: targetHash,
+          transactions: [{ nonce: pending.nonce, from: address(1), hash: hash(123) }] });
+        mevPoolClient.request = async (request, options) => {
+          reads.push({ request, options });
+          if (request.method === 'eth_getBlockByNumber') {
+            return { number: hex(scenario === 'wrong-height' ? target + 1n : target), hash: targetHash,
+              baseFeePerGas: hex(tx.maxFeePerGas + (scenario === 'fee-cap' ? 1n : 0n)) };
+          }
+          if (request.method !== 'eth_call') throw Error('unexpected replay method');
+          await new Promise(resolve => { finishRead = resolve; });
+          if (scenario === 'revert' || scenario === 'transport') {
+            const error = scenario === 'revert' ? { code: 3, message: 'execution reverted', data: revertData }
+              : { code: -32000, message: 'archive unavailable; execution reverted is an example', data: tx.data };
+            throw new RpcRequestError({ body: request, url: 'http://127.0.0.1', error });
+          }
+          return scenario === 'malformed' ? '0x01' : hash(scenario === 'under-floor' ? 1n : coversGas);
+        };
+        await worker.checkPending(target + 1n);
+        assert.equal(worker.file.pending, pending, scenario);
+        assert.deepEqual(reads, [], 'no replay before the confirmed unused-nonce check');
+        if (scenario === 'disk-retry') {
+          const save = worker.writeState;
+          worker.writeState = () => { throw Error('journal unavailable'); };
+          await assert.rejects(worker.checkPending(target + 2n), /journal unavailable/);
+          await nextTurn();
+          assert.deepEqual(reads, []);
+          assert.equal(released, 0);
+          assert.equal(worker.file.pending, pending);
+          worker.writeState = save;
+        }
+        let timeout;
+        try {
+          await Promise.race([worker.checkPending(target + 2n), new Promise((_, reject) => {
+            timeout = setTimeout(() => reject(Error('wallet settlement waited for historical RPC')), 500);
+          })]);
+        } finally { clearTimeout(timeout); }
+        await nextTurn();
+        if (scenario === 'public') {
+          assert.equal(worker.file.pending, pending, 'public transactions still reserve their nonce after the route deadline');
+          assert.deepEqual(reads, []);
+          continue;
+        }
+        assert.equal(released, 1, scenario);
+        assert.equal(worker.file.pending, null, 'wallet is released before waiting on historical RPC');
+        const row = worker.file.recent.find(item => item.hash === original.hash);
+        assert.equal(row.status, 'not included');
+        assert.equal(row.gasEth, 0);
+        assert.equal(row.netUsd, 0);
+        if (scenario === 'manual' || scenario === 'restored' || scenario === 'replaced') {
+          assert.deepEqual(reads, [], scenario);
+          assert.equal(row.submission.targetCloseReplay, undefined);
+          continue;
+        }
+        assert.deepEqual(reads[0]?.request, { method: 'eth_getBlockByNumber', params: [hex(target), false] });
+        if (scenario !== 'fee-cap' && scenario !== 'wrong-height') {
+          assert.deepEqual(reads[1]?.request, { method: 'eth_call', params: [{
+            from: address(1), to: tx.to, data: tx.data, gas: hex(tx.gas), value: '0x0',
+            maxFeePerGas: hex(tx.maxFeePerGas), maxPriorityFeePerGas: hex(tx.maxPriorityFeePerGas),
+          }, { blockHash: targetHash, requireCanonical: true }] });
+          assert.ok(reads[0].options.signal instanceof AbortSignal);
+          assert.equal(reads[1].options.signal, reads[0].options.signal);
+          if (scenario === 'evicted') worker.file.recent = [];
+          finishRead();
+          await nextTurn();
+        }
+        assert.ok(reads.every(({ options }) => options.retryCount === 0));
+        assert.equal(reads.length, ['fee-cap', 'wrong-height'].includes(scenario) ? 1 : 2);
+        const diag = row.submission.targetCloseReplay;
+        if (scenario === 'evicted') {
+          assert.equal(diag, undefined, 'a late reply cannot recreate discarded history');
+        } else {
+          const status = { usable: 'usable', path: 'usable', 'disk-retry': 'usable', 'fee-cap': 'fee-cap-below-base',
+            revert: 'reverted', transport: 'unavailable', malformed: 'unavailable', 'under-floor': 'unavailable', 'wrong-height': 'unavailable' }[scenario];
+          assert.equal(diag?.status, status, scenario);
+          assert.equal(diag.block, Number(target));
+          if (scenario !== 'wrong-height') assert.equal(diag.blockHash, targetHash);
+          assert.equal(diag.grossProfitWei, status === 'usable' ? coversGas.toString() : undefined);
+          if (scenario === 'revert') assert.equal(diag.reason, 'unprofitable');
+          if (scenario === 'under-floor') assert.equal(diag.reason, 'unexpected payout');
+          assert.equal(JSON.stringify(diag).includes('archive unavailable'), false);
+        }
+        await worker.checkPending(target + 3n);
+        assert.equal(execution.signed.length, 1);
+        assert.equal(execution.submitted.length, 1);
+        assert.equal(journalContainsCall(), false);
+        assert.equal(row.netUsd, 0);
+      }
+    } finally {
+      CONFIG.forkMode = previous.fork;
+      mevPoolClient.request = previous.request;
+      mevReadClient.getTransactionCount = previous.nonce;
+      mevReadClient.getBlock = previous.getBlock;
+    }
+  }
 
   const journal = newSearcher(async () => assert.fail('receipt settlement must not sign'));
   {

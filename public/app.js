@@ -703,6 +703,24 @@ function renderMevCadence(cadence) {
   element.textContent = parts.join(' · ');
 }
 
+function targetCloseDetails(replay) {
+  if (!Number.isSafeInteger(replay?.block) || replay.block <= 0) return '';
+  let result;
+  switch (replay.status) {
+    case 'usable': {
+      result = 'Signed call met its payout floor';
+      const gross = networkTokenAmount(replay.grossProfitWei, 18, 'ETH');
+      if (gross !== '–') result += ' · simulated payout ' + gross + ' before network fees';
+      break;
+    }
+    case 'reverted': result = 'Signed call reverted'; break;
+    case 'fee-cap-below-base': result = 'Block base fee exceeded the signed fee cap'; break;
+    case 'unavailable': result = 'RPC replay unavailable or inconclusive'; break;
+    default: return '';
+  }
+  return `<div>Replay at close of block ${networkNumber(replay.block)} · ${esc(result)}. Earlier execution conditions and relay decisions require separate evidence.</div>`;
+}
+
 function submissionDetails(submission, openSubmissions) {
   if (!submission) return '';
   const { kind, target, leadMs, netUsd, gasEth, tipEth, builders } = submission;
@@ -739,7 +757,7 @@ function submissionDetails(submission, openSubmissions) {
     const comparison = quotesDiffer
       ? `<div>Net estimates after padded gas · initial ${usd(sims.preparedNetUsd, 4)} · block ${usd(sims.blockNetUsd, 4)} · pending ${usd(sims.pendingNetUsd, 4)}</div>` : '';
     return `<details class="sub" data-target="${esc(key)}"${open}><summary>Direct transaction · route deadline block ${esc(target)}</summary>
-      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd, 4)}</div>${comparison}${signedGas}${lead}${timings}${relay}</details>`;
+      <div>Maximum network fee ${gasEth.toFixed(6)} ETH · simulated net ${usd(netUsd, 4)}</div>${comparison}${signedGas}${lead}${timings}${relay}${targetCloseDetails(submission.targetCloseReplay)}</details>`;
   }
   const timing = `${(Math.abs(leadMs) / 1000).toFixed(2)}s ${leadMs >= 0 ? 'before' : 'after'} expected slot`;
   return `<details class="sub" data-target="${esc(key)}"${open}><summary>Bundle for block ${esc(target)}</summary>

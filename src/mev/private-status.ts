@@ -13,6 +13,11 @@ for (const reason of ['expired', 'deadline or floor', 'unprofitable', 'loan repa
   reasons.set(encodeErrorResult({ abi: errorAbi, errorName: 'Error', args: [reason] }), reason);
 }
 
+export function knownArbitrageRevert(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || raw.length > 256) return;
+  return reasons.get(raw.startsWith('0x') ? raw.toLowerCase() : raw);
+}
+
 export interface PrivateRelayStatus {
   status: (typeof statuses)[number];
   maxBlockNumber?: number;
@@ -33,8 +38,8 @@ function readStatus(value: unknown, hash: Hex): PrivateRelayStatus | null {
   const error = simulationErrors.find(candidate => candidate === reply.simError);
   if (error) result.simError = error;
   const raw = reply.revertReason;
-  if (error === 'ExecutionReverted' && typeof raw === 'string' && raw.length <= 256) {
-    const reason = reasons.get(raw.startsWith('0x') ? raw.toLowerCase() : raw);
+  if (error === 'ExecutionReverted') {
+    const reason = knownArbitrageRevert(raw);
     if (reason) result.revertReason = reason;
   }
   return result;

@@ -12,6 +12,7 @@ import { FLASH_ARB_V2_ABI, FLASH_ARB_V2_RUNTIME } from './artifact-v2.js';
 import { FLASH_ARB_V3_RUNTIME } from './artifact-v3.js';
 import { bundleTraceRequests, requestBuilderTrace } from './builder-trace.js';
 import { PRIVATE_STATUS_RETENTION_MS, requestPrivateRelayStatus, type PrivateRelayStatus } from './private-status.js';
+import { readTargetClose, type TargetCloseCall, type TargetCloseReplay } from './target-close.js';
 import { decodeArbitrage, encodeArbitrage, EXECUTION_GAS_ADDON, FUNDING_NAMES, fundingTrials, type RouteFunding } from './flash-arb.js';
 import { sendBundle, submitPrivateDirect, type BuilderResult } from './bundles.js';
 import { affordableDirectFees, directExecutionReserve, directFees, directPriorityFee, findNonceConsumer } from './direct.js';
@@ -149,6 +150,7 @@ interface BundleSubmission {
   relayAtTargetHead?: RelayHeadSample;
   relayAtLaterTargetHeads?: RelayHeadSample[];
   relayAfterExpiry?: PrivateRelayStatus & { checkedAt: number };
+  targetCloseReplay?: TargetCloseReplay;
   pathQuote?: { routeId: Hex; grossProfitWei: string };
   directSimulation?: { preparedNetUsd: number; blockNetUsd: number; pendingNetUsd: number };
   directTiming?: { headAgeMs?: number; snapshotReadMs: number; quoteAndPrepareMs?: number; finalValidationMs: number;
@@ -430,6 +432,7 @@ export class MevSearcher {
   private readonly scheduledTraces = new WeakSet<BuilderResult>();
   private readonly requestedExpiryStatuses = new WeakSet<BundleSubmission>();
   private readonly closedRelayWindows = new WeakSet<PendingBundle>();
+  private readonly targetCloseCalls = new WeakMap<PendingBundle, TargetCloseCall>();
   file: MevFile;
   tokens: ArbToken[] = [];
   status = 'starting';
@@ -1923,6 +1926,9 @@ export class MevSearcher {
         throw error;
       }
       this.updateScanQuote(opp);
+      if (privateSubmission && pending.autonomous) {
+        this.targetCloseCalls.set(pending, { from: account.address, to: contract, data, gas, ...fees, minimumProfit });
+      }
       // A signed test is consumed on the durable nonce journal, even if the RPC times out.
       if (matched) this.queuedTest = null;
       const submissionTest = test ?? prepared.requiredTestIntent;
@@ -2110,8 +2116,14 @@ export class MevSearcher {
           netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
         this.host.log(`[mev] Direct transaction ${p.hash} was replaced at nonce ${p.nonce}.`);
       } else if (p.privateSubmission && nonce.status === 'unused') {
-        this.finishBundle({ ...p.opp, status: 'not included', note: PRIVATE_EXPIRY_NOTE,
-          netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 });
+        const outcome: MevOpp = { ...p.opp, status: 'not included', note: PRIVATE_EXPIRY_NOTE,
+          netEth: 0, netUsd: 0, gasEth: 0, tipEth: 0 };
+        this.finishBundle(outcome);
+        const call = this.targetCloseCalls.get(p);
+        if (call) {
+          this.targetCloseCalls.delete(p);
+          setImmediate(() => { void this.recordTargetCloseReplay(outcome, call); });
+        }
         this.host.log(`[mev] Private transaction ${p.hash} missed blocks ${first} through ${target}. Wallet nonce was unused.`);
       } else if (current > target && this.pending === p) {
         p.opp.note = nonce.status !== 'unused' ? 'nonce settlement awaiting a verified receipt'
@@ -2173,6 +2185,16 @@ export class MevSearcher {
     if (previous.pending && outcome.hash === previous.pending.hash) this.updateScanQuote(previous.pending.opp, outcome);
     this.releaseBundle();
     if (outcome.status === 'not included') this.traceMissedBundle(outcome);
+  }
+
+  private async recordTargetCloseReplay(outcome: MevOpp, call: TargetCloseCall) {
+    const submission = outcome.submission;
+    const retained = () => !this.stopping && this.file.recent.includes(outcome) && outcome.submission === submission;
+    if (!submission || submission.targetCloseReplay || !retained()) return;
+    const result = await readTargetClose(submission.target, call);
+    if (!retained()) return;
+    submission.targetCloseReplay = result;
+    this.save();
   }
 
   private schedulePrivateStatusAfterAck(pending: PendingBundle) {
