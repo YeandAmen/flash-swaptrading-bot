@@ -1,4 +1,4 @@
-import type { Address } from '@solana/kit';
+import { isAddress, type Address } from '@solana/kit';
 import { LIGHTHOUSE } from './guard.js';
 import { JUPITER, KAMINO } from './protocol.js';
 
@@ -48,7 +48,43 @@ export function describeSimulationFailure(error: unknown, logs: readonly string[
     && logs.indexOf(invoke) < exitStart;
   const returnSlippage = returnInstruction && entrySucceeded && isJupiterSlippageFailure(error, logs, programs);
   const reason = returnSlippage ? 'slippage 6001' : validCode ? `custom ${code}` : knownErrors.has(cause) ? cause : 'unclassified error';
-  return { detail: `Outer ix ${index} ${role}: ${reason}`, returnSlippage };
+  const origin = returnInstruction && entrySucceeded && validCode && !returnSlippage
+    ? returnErrorOrigin(logs, exitStart, Number(code)) : undefined;
+  return { detail: `Outer ix ${index} ${role}: ${reason}` + (origin ? ` (origin ${origin})` : ''),
+    returnSlippage, ...(origin && { origin }) };
+}
+
+// Diagnostic only. Attribute the first failing frame when every caller unwinds with the same code.
+function returnErrorOrigin(logs: readonly string[], exitStart: number, code: number): Address | undefined {
+  if (logs.some(line => typeof line !== 'string' || line === 'Log truncated' || /[\r\n]/.test(line))) return;
+  const start = logs.indexOf(`Program ${JUPITER} invoke [1]`);
+  const stack: Address[] = [];
+  let origin: Address | undefined;
+  for (let i = start; i < logs.length; i++) {
+    const line = logs[i];
+    const active = stack.at(-1);
+    const invocation = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[(\d+)\]$/.exec(line);
+    if (invocation) {
+      const [, program, depth] = invocation;
+      if (origin || !isAddress(program) || depth !== String(stack.length + 1)) return;
+      if (!active && (program !== JUPITER || (i !== start && i !== exitStart))) return;
+      stack.push(program);
+    } else if (!active) {
+      return;
+    } else if (line === `Program ${active} success`) {
+      if (origin || (stack.length === 1 && i !== exitStart - 1)) return;
+      stack.pop();
+    } else if (line === `Program ${active} failed: custom program error: 0x${code.toString(16)}`) {
+      if (i <= exitStart || (stack.length === 1 && i !== logs.length - 1)) return;
+      origin ??= active;
+      stack.pop();
+    } else if (/^Program (\S+) consumed \d+ of \d+ compute units$/.exec(line)?.[1] === active) {
+      continue;
+    } else if (origin || !/^Program (?:log:|data:|return:)/.test(line)) {
+      return;
+    }
+  }
+  return stack.length === 0 ? origin : undefined;
 }
 
 // A top-level Jupiter instruction can propagate a CPI's custom code. Accept 6001 only

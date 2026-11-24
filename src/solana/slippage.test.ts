@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { address } from '@solana/kit';
 import { LIGHTHOUSE } from './guard.js';
 import { JUPITER, KAMINO } from './protocol.js';
+import { describeSimulationFailure } from './simulation-error.js';
 import { isJupiterSlippageFailure } from './worker.js';
 
 const token = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -47,4 +48,65 @@ test('rejects propagated CPI errors, truncated, incomplete, spoofed or unknown r
     [`Program ${token} invoke [1]`, `Program ${token} failed: custom program error: 0x1771`],
     [`Program ${JUPITER} invoke [1]`, `Program ${JUPITER} failed: custom program error: 0x1772`]];
   for (const logs of badLogs) assert.equal(isJupiterSlippageFailure(failure, logs, programs), false);
+});
+
+const entrySuccess = [`Program ${JUPITER} invoke [1]`, `Program ${JUPITER} success`];
+const return6030 = { InstructionError: [4, { Custom: 6030 }] };
+const plain6030 = 'Outer ix 4 Jupiter return: custom 6030';
+const failed = (program: string, hex = '178e') => `Program ${program} failed: custom program error: 0x${hex}`;
+const failingReturn = (nested: string[] = []) => [
+  ...entrySuccess, `Program ${JUPITER} invoke [1]`, ...nested, failed(JUPITER),
+];
+
+test('attributes custom 6030 to the deepest program that failed and propagated it through the Jupiter return', () => {
+  const cases = [
+    { origin: JUPITER, logs: failingReturn([`Program ${ata} invoke [2]`, `Program ${ata} success`]) },
+    { origin: ata, logs: failingReturn([`Program ${ata} invoke [2]`, failed(ata)]) },
+    { origin: token, logs: failingReturn([
+      `Program ${ata} invoke [2]`, `Program ${token} invoke [3]`, 'Program log: Instruction: Transfer',
+      `Program ${token} consumed 4900 of 41000 compute units`, failed(token),
+      `Program ${ata} consumed 5100 of 42000 compute units`, failed(ata),
+    ]) },
+  ];
+  for (const { origin, logs } of cases) {
+    assert.deepEqual(describeSimulationFailure(return6030, logs, programs), {
+      detail: `${plain6030} (origin ${origin})`, returnSlippage: false, origin,
+    });
+  }
+});
+
+test('keeps the outer custom 6030 when runtime evidence is ambiguous or incomplete', () => {
+  const cases = {
+    missing: undefined,
+    missingEntry: [`Program ${JUPITER} invoke [1]`, failed(JUPITER)],
+    noInvoke: [...entrySuccess, failed(JUPITER)],
+    incompleteEntry: [entrySuccess[0], `Program ${ata} invoke [2]`, entrySuccess[1],
+      `Program ${JUPITER} invoke [1]`, failed(JUPITER)],
+    unmatchedChild: failingReturn([`Program ${ata} invoke [2]`]),
+    mismatchedProgram: failingReturn([`Program ${ata} invoke [2]`, failed(token)]),
+    mismatchedDepth: failingReturn([`Program ${token} invoke [3]`, failed(token)]),
+    spoofedChildFailure: failingReturn([`Program ${ata} invoke [2]`, `Program log: ${failed(ata)}`]),
+    spoofedOuterFailure: [...entrySuccess, `Program ${JUPITER} invoke [1]`, `Program log: ${failed(JUPITER)}`],
+    multilineSpoof: failingReturn([`Program log: Instruction: Transfer\n${failed(token)}`]),
+    invalidAddress: failingReturn([`Program ${'z'.repeat(44)} invoke [2]`, failed('z'.repeat(44))]),
+    truncated: failingReturn(['Log truncated']),
+    recoveredChild: failingReturn([
+      `Program ${ata} invoke [2]`, failed(ata), `Program ${token} invoke [2]`, `Program ${token} success`,
+    ]),
+    translatedChild: failingReturn([`Program ${ata} invoke [2]`, failed(ata, '1771')]),
+    wrongFinalCode: [...entrySuccess, `Program ${JUPITER} invoke [1]`, failed(JUPITER, '1771')],
+  };
+  for (const [label, logs] of Object.entries(cases)) {
+    assert.deepEqual(describeSimulationFailure(return6030, logs, programs),
+      { detail: plain6030, returnSlippage: false }, label);
+  }
+});
+
+test('preserves the verified 6001 return detail and requires an independent successful entry for return slippage', () => {
+  const return6001 = { InstructionError: [4n, { Custom: 6001n }] };
+  assert.deepEqual(describeSimulationFailure(return6001, [...entrySuccess, ...frame()], programs),
+    { detail: 'Outer ix 4 Jupiter return: slippage 6001', returnSlippage: true });
+  assert.equal(describeSimulationFailure(return6001, frame(), programs).returnSlippage, false);
+  assert.equal(describeSimulationFailure(return6001,
+    [...entrySuccess, ...frame([`Program ${token} invoke [2]`, failed(token, '1771')])], programs).returnSlippage, false);
 });

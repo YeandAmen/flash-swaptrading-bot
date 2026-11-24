@@ -85,6 +85,7 @@ test('Solana journals before raw send and restores one pending signature across 
   let balanceLamports = walletBalance;
   let finalizedReceipt: 'none' | 'failed' | 'success' = 'none';
   let simulationCount = 0;
+  let simulationFailure: { err: { InstructionError: [number, { Custom: number }] }; logs: string[] } | undefined;
   let rawSendCount = 0;
   let pendingSignature: string | null = null;
   let holdSimulation: Promise<void> | null = null;
@@ -119,7 +120,7 @@ test('Solana journals before raw send and restores one pending signature across 
         assert.deepEqual(Buffer.from(tx.messageBytes), Buffer.from(candidate.transaction.messageBytes));
         reachedSimulation?.();
         await holdSimulation;
-        return context(simulationMeta);
+        return context(simulationFailure ?? simulationMeta);
       }
       case 'sendTransaction': {
         rawSendCount++;
@@ -305,6 +306,25 @@ test('Solana journals before raw send and restores one pending signature across 
       }
     } finally {
       simulationMeta.postTokenBalances = previous;
+    }
+  });
+
+  await t.test('final return error reports a verified origin and leaves the candidate unsigned', async () => {
+    const kipseli = '3TK9D8aoBFYjYZtKCjciPrVrRStsnvo7KmpcJqDavpaU';
+    const logs = [`Program ${JUPITER} invoke [1]`, `Program ${JUPITER} success`, `Program ${JUPITER} invoke [1]`,
+      `Program ${kipseli} invoke [2]`, 'Program log: private payload',
+      `Program ${kipseli} failed: custom program error: 0x178e`, `Program ${JUPITER} failed: custom program error: 0x178e`];
+    const generic = 'Solana final simulation did not satisfy the profit and cost guards';
+    try {
+      for (const truncated of [false, true]) {
+        simulationFailure = { err: { InstructionError: [4, { Custom: 6030 }] }, logs: truncated ? [...logs, 'Log truncated'] : logs };
+        assert.equal(await original.submit(candidate), undefined);
+        assert.equal(original.summary.status, truncated ? generic : `${generic}. Outer ix 4 Jupiter return: custom 6030 (origin ${kipseli})`);
+        assert.equal(rawSendCount, 0);
+        assert.equal(original.summary.pending, null);
+      }
+    } finally {
+      simulationFailure = undefined;
     }
   });
 

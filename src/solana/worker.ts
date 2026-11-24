@@ -11,7 +11,7 @@ import { activeFlashTest, flashTestView, queueFlashTest, type FlashTest, type Fl
 import { writeJson } from '../persistence.js';
 import { readPrivateFile, writePrivateFile } from '../private-file.js';
 import { LIGHTHOUSE, lighthouseAtaFloor, lighthouseLamports, lighthouseTokenAmount, verifyLighthouseDeployment } from './guard.js';
-import { isJupiterSlippageFailure } from './simulation-error.js';
+import { describeSimulationFailure, isJupiterSlippageFailure } from './simulation-error.js';
 export { isJupiterSlippageFailure } from './simulation-error.js';
 import { DEFAULT_SOLANA_LOAN_USDC, isValidSolanaLoanLimit, MAX_SOLANA_LOAN_UNITS } from './market.js';
 import { createWalletAta, JUPITER, KAMINO, MAINNET_GENESIS, SOLANA_PUBLIC_RPC, USDC, WRAPPED_SOL } from './protocol.js';
@@ -568,6 +568,8 @@ export class SolanaLiveWorker {
         || (lossGuard && atas && !matchesSolanaSwapLossBalances(simulation, compiled.staticAccounts,
           this.wallet, ...atas, lossGuard, measured.fee))) {
         this.status = 'Solana final simulation did not satisfy the profit and cost guards';
+        const failure = simulation.err && describeSimulationFailure(simulation.err, simulation.logs, programs);
+        if (failure?.origin) this.status += `. ${failure.detail}`;
         return;
       }
       if (context.slot - candidate.simulationSlot > MAX_CANDIDATE_AGE_SLOTS || !meetsOutcomeFloor(measured, minimum, gasOnlyTest)) {
